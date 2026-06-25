@@ -1,0 +1,10 @@
+// Base build configuration for CastLedger (committed — no secrets here).
+//
+// Real Supabase values live in Secrets.xcconfig (gitignored). The line below
+// pulls them in if that file exists. `#include?` (with the trailing `?`) is the
+// optional form: a fresh clone without Secrets.xcconfig still builds — the app
+// just shows the "Setup needed" screen until you create it.
+//
+// Setup: copy Secrets.xcconfig.sample → Secrets.xcconfig and fill it in.
+
+#include? "Secrets.xcconfig"

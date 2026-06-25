@@ -1,0 +1,87 @@
+# XcodeGen spec for CastLedger.
+# Regenerate the .xcodeproj after adding/moving sources:
+#   cd ios && xcodegen generate
+# The generated .xcodeproj is gitignored — this file + the Sources tree are the
+# source of truth.
+
+name: CastLedger
+
+options:
+  bundleIdPrefix: com.castledger
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""           # set your Apple Developer team ID, or leave blank for simulator
+    CODE_SIGN_STYLE: Automatic
+
+# Supabase Swift SDK — declare the individual products we use (Auth, PostgREST,
+# Realtime). Storage/Functions are intentionally excluded for Phase 1.
+packages:
+  Supabase:
+    url: https://github.com/supabase/supabase-swift
+    from: "2.46.0"
+
+targets:
+  CastLedger:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.castledger.app
+        INFOPLIST_FILE: Sources/App/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"          # iPhone + iPad (universal)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    # Base config file (committed). It optionally includes the gitignored
+    # Secrets.xcconfig, which supplies SUPABASE_HOST / SUPABASE_ANON_KEY.
+    configFiles:
+      Debug: Config.xcconfig
+      Release: Config.xcconfig
+    dependencies:
+      # The unified SupabaseClient lives in the `Supabase` umbrella product, which
+      # re-exports Auth + PostgREST + Realtime (+ Storage/Functions, unused in Phase 1).
+      - package: Supabase
+        product: Supabase
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleDisplayName: CastLedger
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # Supabase config injected from build settings (Secrets.xcconfig).
+        # Host only (no scheme/slashes) — the https:// is added in Swift.
+        SUPABASE_HOST: "$(SUPABASE_HOST)"
+        SUPABASE_ANON_KEY: "$(SUPABASE_ANON_KEY)"
+
+  CastLedgerTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: CastLedger
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.castledger.app.tests
+
+schemes:
+  CastLedger:
+    build:
+      targets:
+        CastLedger: all
+        CastLedgerTests: [test]
+    test:
+      targets:
+        - CastLedgerTests
