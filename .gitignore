@@ -1,0 +1,25 @@
+# Secrets — never commit real credentials (security-no-secrets-in-repo)
+.env
+.env.local
+*.local
+
+# Supabase CLI
+supabase/.branches
+supabase/.temp
+supabase/.env
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Xcode / SwiftPM
+*.xcuserstate
+xcuserdata/
+.build/
+DerivedData/
+
+# XcodeGen output — the .xcodeproj is generated from ios/project.yml
+ios/*.xcodeproj
+
+# iOS build secrets — real Supabase keys (security-no-secrets-in-repo)
+ios/Secrets.xcconfig
