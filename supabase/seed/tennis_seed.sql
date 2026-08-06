@@ -19,11 +19,10 @@ insert into lookup_values (kind, value) values
   ('brand','K-Swiss')
 on conflict (kind, value) do nothing;
 
--- Clean up prior run: clear ledger + sale lines on these products variants,
--- then delete the products (which cascades their variants).
-delete from inventory_txns where variant_id in (
-    select v.id from variants v join products p on p.id = v.product_id
-    where (p.brand, p.name) in (
+-- Clean up prior run: clear ledger + sale lines on these products, then delete
+-- the products themselves (products are now the stock-tracked items directly).
+delete from inventory_txns where product_id in (
+  select id from products where (brand, name) in (
   ('Wilson','Pro Staff 97 v14'),
   ('Wilson','Blade 98 v9 (16x19)'),
   ('Babolat','Pure Aero (2023)'),
@@ -57,12 +56,11 @@ delete from inventory_txns where variant_id in (
   ('Wilson','Kaos Swift 1.5 (Men)'),
   ('K-Swiss','Hypercourt Express 2 (Men)'),
   ('K-Swiss','Ultrashot 3 (Men)')
-    )
-  );
+  )
+);
 
-delete from sale_lines where variant_id in (
-    select v.id from variants v join products p on p.id = v.product_id
-    where (p.brand, p.name) in (
+delete from sale_lines where product_id in (
+  select id from products where (brand, name) in (
   ('Wilson','Pro Staff 97 v14'),
   ('Wilson','Blade 98 v9 (16x19)'),
   ('Babolat','Pure Aero (2023)'),
@@ -96,8 +94,8 @@ delete from sale_lines where variant_id in (
   ('Wilson','Kaos Swift 1.5 (Men)'),
   ('K-Swiss','Hypercourt Express 2 (Men)'),
   ('K-Swiss','Ultrashot 3 (Men)')
-    )
-  );
+  )
+);
 
 delete from products where (brand, name) in (
   ('Wilson','Pro Staff 97 v14'),
