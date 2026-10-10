@@ -29,8 +29,12 @@ npx supabase@2.118.0 test db
 seed. `test db` runs every file in `tests/`. After changing a migration, rebuild the
 database with `npx supabase@2.118.0 db reset` before re-running the tests.
 
-The same tests run in CI (`.github/workflows/database-tests.yml`) on every push and
-pull request.
+`../scripts/test-concurrency.sh` checks what pgTAP can't: two connections racing for
+the same gift card, store credit, sale line, string job or last unit in stock. It
+creates and removes its own rows; run it against the local stack only.
+
+The same tests and the concurrency checks run in CI
+(`.github/workflows/database-tests.yml`) on every push and pull request.
 
 ## Writing a migration
 
