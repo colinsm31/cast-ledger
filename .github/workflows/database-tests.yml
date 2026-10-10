@@ -1,0 +1,27 @@
+# Apply every migration to a fresh local Supabase stack and run the pgTAP
+# suite in supabase/tests on every push and pull request.
+name: Database tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.118.0
+
+      # Database, auth and API only — the services the migrations and tests use.
+      - name: Start Supabase (applies migrations + seed)
+        run: >-
+          supabase start
+          -x studio,imgproxy,mailpit,realtime,storage-api,edge-runtime,logflare,vector,supavisor,postgres-meta
+
+      - name: Run database tests
+        run: supabase test db

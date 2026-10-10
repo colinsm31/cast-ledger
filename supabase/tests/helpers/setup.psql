@@ -1,0 +1,91 @@
+-- =============================================================================
+-- Shared pgTAP test helpers. Included by every test file with
+--   \ir helpers/setup.psql
+-- right after `begin;`, so everything here is rolled back with the test.
+--
+-- Not a test itself (the .psql extension keeps `supabase test db` from running
+-- it on its own).
+-- =============================================================================
+
+create extension if not exists pgtap with schema extensions;
+
+create schema if not exists tests;
+
+-- Create a staff account (auth user + profile via the handle_new_user trigger)
+-- with a fixed id, so test SQL can refer to it literally.
+create or replace function tests.create_staff(p_id uuid, p_email text, p_role text default 'staff')
+returns uuid
+language plpgsql
+as $$
+begin
+  insert into auth.users (id, email, aud, role)
+  values (p_id, p_email, 'authenticated', 'authenticated');
+  update public.profiles set role = p_role where id = p_id;
+  return p_id;
+end;
+$$;
+
+-- Act as a signed-in staff member: auth.uid() returns p_user_id and row-level
+-- security applies exactly as it does for the web app.
+create or replace function tests.authenticate_as(p_user_id uuid)
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('request.jwt.claim.sub', p_user_id::text, true);
+  perform set_config(
+    'request.jwt.claims',
+    json_build_object('sub', p_user_id, 'role', 'authenticated')::text,
+    true);
+  execute 'set local role authenticated';
+end;
+$$;
+
+-- Back to the test superuser (no auth.uid(), RLS bypassed) for fixture setup.
+create or replace function tests.clear_authentication()
+returns void
+language plpgsql
+as $$
+begin
+  execute 'reset role';
+  perform set_config('request.jwt.claim.sub', '', true);
+  perform set_config('request.jwt.claims', '', true);
+end;
+$$;
+
+grant usage on schema tests to authenticated;
+grant execute on all functions in schema tests to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Common fixtures. Fixed ids so tests can embed them in SQL strings:
+--   staff         ...0000a1   (staff role)
+--   admin         ...0000a2   (admin role)
+--   customer      ...0000c1
+--   categories    ...0000d1 (strings), ...0000d2 (racquets, serialized)
+--   string        ...0000b1   $20, fungible, UPC 012345678905, 10 on hand
+--   racquet       ...0000b2   $250, serialized, UPC 098765432109, none on hand
+--   tax rate 8.25%, stringing not taxed, overselling allowed
+-- -----------------------------------------------------------------------------
+select tests.create_staff('00000000-0000-0000-0000-0000000000a1', 'staff@test.local', 'staff');
+select tests.create_staff('00000000-0000-0000-0000-0000000000a2', 'admin@test.local', 'admin');
+
+update settings
+   set tax_rate = 8.25, tax_stringing = false, block_oversell = false, stringing_labor = 0
+ where id;
+
+insert into categories (id, name, sort_order, serialized_default) values
+  ('00000000-0000-0000-0000-0000000000d1', 'pgTAP Strings',  900, false),
+  ('00000000-0000-0000-0000-0000000000d2', 'pgTAP Racquets', 901, true);
+
+insert into products (id, category_id, brand, name, sell_price, cost, barcode) values
+  ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000d1',
+   'TestBrand', 'Test String 16', 20.00, 8.00, '012345678905'),
+  ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000d2',
+   'TestBrand', 'Test Racquet 100', 250.00, 150.00, '098765432109');
+
+insert into customers (id, first_name, last_name, phone_number, email) values
+  ('00000000-0000-0000-0000-0000000000c1', 'Pat', 'Tester', '(225)555-0100', 'pat@test.local');
+
+-- 10 strings on hand.
+insert into inventory_txns (txn_type, product_id, qty, unit_cost, note)
+values ('receive', '00000000-0000-0000-0000-0000000000b1', 10, 8.00, 'fixture');

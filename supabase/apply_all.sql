@@ -4337,3 +4337,361 @@ drop index if exists uq_product_units_barcode;
 create unique index if not exists uq_product_units_barcode
   on product_units (barcode) where barcode is not null;
 
+-- >>> supabase/migrations/0035_staff_attribution.sql
+-- =============================================================================
+-- 0035_staff_attribution.sql — record who did it (AceStock, Phase 1A)
+--
+-- Every money and stock record now carries the signed-in staff member who
+-- created it. Columns default to auth.uid(), so the existing server functions
+-- (record_sale, record_refund, receive_stock, ...) fill them in without being
+-- rewritten, and so does any future client insert.
+--
+--   sales.user_id, inventory_txns.user_id   existed but were never set → default
+--   refunds / gift_card_txns / store_credit_txns.user_id                → new
+--   product_units.created_by                (who received the unit)     → new
+--   string_jobs.entered_by / completed_by / delivered_by / cancelled_by → new
+--   string_jobs.cancelled_at                                            → new
+--
+-- All attribution columns reference profiles (one row per staff account) so
+-- the API can embed the staff member's email, and fall back to null if a staff
+-- account is ever deleted. advance_string_job and cancel_string_job are
+-- redefined to stamp the status-change columns. Behavior is otherwise unchanged.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. Attribution columns: add (where missing), default to the signed-in user,
+--    and point at profiles.
+-- ----------------------------------------------------------------------------
+alter table sales             add column if not exists user_id uuid;
+alter table inventory_txns    add column if not exists user_id uuid;
+alter table refunds           add column if not exists user_id uuid;
+alter table gift_card_txns    add column if not exists user_id uuid;
+alter table store_credit_txns add column if not exists user_id uuid;
+alter table product_units     add column if not exists created_by uuid;
+alter table string_jobs
+  add column if not exists entered_by   uuid,
+  add column if not exists completed_by uuid,
+  add column if not exists delivered_by uuid,
+  add column if not exists cancelled_by uuid,
+  add column if not exists cancelled_at timestamptz;
+
+do $$
+declare
+  -- {table, column, stamped on insert?}
+  attribution_columns text[][] := array[
+    array['sales',             'user_id',      'yes'],
+    array['inventory_txns',    'user_id',      'yes'],
+    array['refunds',           'user_id',      'yes'],
+    array['gift_card_txns',    'user_id',      'yes'],
+    array['store_credit_txns', 'user_id',      'yes'],
+    array['product_units',     'created_by',   'yes'],
+    array['string_jobs',       'entered_by',   'yes'],
+    array['string_jobs',       'completed_by', 'no'],
+    array['string_jobs',       'delivered_by', 'no'],
+    array['string_jobs',       'cancelled_by', 'no']
+  ];
+  entry text[];
+  table_name text;
+  column_name text;
+  constraint_name text;
+begin
+  foreach entry slice 1 in array attribution_columns loop
+    table_name := entry[1];
+    column_name := entry[2];
+    constraint_name := format('%s_%s_fkey', table_name, column_name);
+
+    if entry[3] = 'yes' then
+      execute format('alter table %I alter column %I set default auth.uid()', table_name, column_name);
+    end if;
+
+    -- Any stray value that isn't a staff profile can't satisfy the foreign key.
+    -- (Before this migration these columns were never written, so this is a
+    -- no-op on real data; it only guards hand-edited test databases.)
+    execute format(
+      'update %I set %I = null where %I is not null and not exists (select 1 from profiles p where p.id = %I.%I)',
+      table_name, column_name, column_name, table_name, column_name);
+
+    execute format('alter table %I drop constraint if exists %I', table_name, constraint_name);
+    execute format(
+      'alter table %I add constraint %I foreign key (%I) references profiles (id) on delete set null',
+      table_name, constraint_name, column_name);
+  end loop;
+end $$;
+
+create index if not exists idx_sales_user   on sales (user_id);
+create index if not exists idx_refunds_user on refunds (user_id);
+
+-- ----------------------------------------------------------------------------
+-- 2. advance_string_job — same rules as 0019, now records who completed /
+--    delivered the job.
+-- ----------------------------------------------------------------------------
+create or replace function advance_string_job(
+  p_job_id        uuid,
+  p_target_status text
+)
+returns text
+language plpgsql
+security invoker
+as $$
+declare
+  v_current text;
+  v_rank    integer;
+  v_target  integer;
+  v_main    uuid;
+  v_cross   uuid;
+begin
+  select status, main_product_id, cross_product_id
+    into v_current, v_main, v_cross
+    from string_jobs where id = p_job_id;
+  if v_current is null then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+
+  v_rank   := case v_current       when 'entered' then 0 when 'complete' then 1 when 'delivered' then 2 else -1 end;
+  v_target := case p_target_status when 'entered' then 0 when 'complete' then 1 when 'delivered' then 2 else -1 end;
+
+  if v_target < 0 then
+    raise exception 'Invalid status "%"', p_target_status;
+  end if;
+  if v_target <> v_rank + 1 then
+    raise exception 'Cannot move a string job from "%" to "%"', v_current, p_target_status;
+  end if;
+
+  update string_jobs
+    set status       = p_target_status,
+        completed_at = case when p_target_status = 'complete'  then now()      else completed_at end,
+        completed_by = case when p_target_status = 'complete'  then auth.uid() else completed_by end,
+        delivered_at = case when p_target_status = 'delivered' then now()      else delivered_at end,
+        delivered_by = case when p_target_status = 'delivered' then auth.uid() else delivered_by end
+  where id = p_job_id;
+
+  -- Consume one unit of each distinct catalog string the job used.
+  if p_target_status = 'complete' then
+    insert into inventory_txns (txn_type, product_id, qty, note)
+    select 'consume', pid, -1, 'String job completed'
+    from (
+      select distinct pid
+      from (values (v_main), (v_cross)) as t(pid)
+      where pid is not null
+    ) d;
+  end if;
+
+  return p_target_status;
+end;
+$$;
+
+grant execute on function advance_string_job(uuid, text) to authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 3. cancel_string_job — same rules as 0020, now records who cancelled and when.
+-- ----------------------------------------------------------------------------
+create or replace function cancel_string_job(p_job_id uuid)
+returns text
+language plpgsql
+security invoker
+as $$
+declare
+  v_current text;
+begin
+  select status into v_current from string_jobs where id = p_job_id;
+  if v_current is null then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+  if v_current <> 'entered' then
+    raise exception 'Only an entered job can be cancelled (this one is "%")', v_current;
+  end if;
+
+  update string_jobs
+     set status       = 'cancelled',
+         cancelled_at = now(),
+         cancelled_by = auth.uid()
+   where id = p_job_id;
+  return 'cancelled';
+end;
+$$;
+
+grant execute on function cancel_string_job(uuid) to authenticated;
+
+-- >>> supabase/migrations/0036_customer_racket_soft_delete.sql
+-- =============================================================================
+-- 0036_customer_racket_soft_delete.sql — keep stringing history (AceStock, 1A)
+--
+-- Removing a customer's racket used to DELETE the row, which cascaded to every
+-- string job on it (or failed outright once a job had been paid, because the
+-- sale line still referenced the job). Rackets are now retired by setting
+-- is_active = false, and the database refuses to delete a racket that has
+-- string jobs, so history can't be lost by accident.
+--
+-- A retired racket's tag barcode is freed for reuse: uniqueness and barcode
+-- lookup only consider active rackets.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. A racket with string jobs can no longer be deleted (was: on delete cascade).
+alter table string_jobs drop constraint if exists string_jobs_customer_racket_id_fkey;
+alter table string_jobs
+  add constraint string_jobs_customer_racket_id_fkey
+  foreign key (customer_racket_id) references customer_rackets (id) on delete restrict;
+
+-- 2. Tag barcodes are unique among active rackets only.
+drop index if exists uq_customer_rackets_barcode;
+create unique index if not exists uq_customer_rackets_barcode
+  on customer_rackets (barcode)
+  where barcode is not null and is_active;
+
+-- 3. resolve_barcode — same as 0032, except a retired racket's tag no longer
+--    resolves (so a reused tag finds the new racket, not the old one).
+create or replace function resolve_barcode(p_code text)
+returns table (
+  kind          text,
+  code          text,
+  id            uuid,      -- the matched thing's id (product / unit / racket / gift card)
+  product_id    uuid,      -- for a unit: its catalog product; else null
+  customer_id   uuid,
+  open_job_id   uuid,
+  brand         text,
+  name          text,
+  attributes    jsonb,
+  sell_price    numeric,
+  is_serialized boolean,
+  unit_status   text       -- for a unit: its status; else null
+)
+language plpgsql
+security invoker
+stable
+as $$
+declare
+  v_code       text := regexp_replace(coalesce(p_code, ''), '\s+', '', 'g');
+  v_candidates text[];
+  v_product    products%rowtype;
+  v_unit       product_units%rowtype;
+  v_racket     customer_rackets%rowtype;
+  v_gift_card  gift_cards%rowtype;
+begin
+  if v_code = '' then
+    return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- EAN-13 with a leading zero <-> UPC-A.
+  v_candidates := array[v_code];
+  if v_code ~ '^0[0-9]{12}$' then
+    v_candidates := v_candidates || substr(v_code, 2);
+  elsif v_code ~ '^[0-9]{12}$' then
+    v_candidates := v_candidates || ('0' || v_code);
+  end if;
+
+  -- Product UPC.
+  select * into v_product from products p where p.barcode = any (v_candidates) limit 1;
+  if found then
+    return query select 'product', v_product.barcode, v_product.id, null::uuid, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        v_product.is_serialized, null::text;
+    return;
+  end if;
+
+  -- Individual unit's personal barcode.
+  select * into v_unit from product_units u where u.barcode = any (v_candidates) limit 1;
+  if found then
+    select * into v_product from products p where p.id = v_unit.product_id;
+    return query select 'unit', v_unit.barcode, v_unit.id, v_unit.product_id, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        true, v_unit.status;
+    return;
+  end if;
+
+  -- Customer racket tag (active rackets only).
+  select * into v_racket
+  from customer_rackets r
+  where r.barcode = any (v_candidates) and r.is_active
+  limit 1;
+  if found then
+    return query select 'racket', v_racket.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                        (select j.id from string_jobs j
+                          where j.customer_racket_id = v_racket.id
+                            and j.status in ('entered', 'complete')
+                          order by j.entered_at desc limit 1),
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  select * into v_gift_card from gift_cards g where g.code = any (v_candidates) limit 1;
+  if found then
+    return query select 'gift_card', v_gift_card.code, v_gift_card.id, null::uuid, v_gift_card.customer_id, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                      null::text, null::text, null::jsonb, null::numeric, false, null::text;
+end;
+$$;
+
+grant execute on function resolve_barcode(text) to authenticated;
+
+-- >>> supabase/migrations/0037_search_customers.sql
+-- =============================================================================
+-- 0037_search_customers.sql — server-side customer search (AceStock, Phase 1A)
+--
+-- The home screen and the register used to build a PostgREST `or=(...)` filter
+-- by pasting the typed text into it, so a name containing a comma or a
+-- parenthesis broke the query, and only first/last name were searched. This
+-- function is the single definition of customer search:
+--
+--   • first name, last name, "first last", "last, first", or email — a
+--     case-insensitive substring match, with % _ \ in the input treated as
+--     literal characters
+--   • phone number — when the input looks like a phone number (only digits,
+--     spaces and ( ) - . +, with 3+ digits), matched against the phone's digits
+--     only, so "225-555", "(225) 555" and "225555" all find (225)555-1234
+--
+-- Ordered last name, first name; at most p_limit rows (1–50, default 8).
+-- Security invoker: reads customers under the caller's existing RLS.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function search_customers(p_term text, p_limit integer default 8)
+returns setof customers
+language sql
+security invoker
+stable
+as $$
+  with input as (
+    select
+      btrim(coalesce(p_term, ''))                              as term,
+      regexp_replace(coalesce(p_term, ''), '\D', '', 'g')      as digits
+  ),
+  pattern as (
+    select
+      term,
+      digits,
+      -- Escape LIKE wildcards so the typed text is matched literally.
+      '%' || replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_') || '%' as contains
+    from input
+  )
+  select c.*
+  from customers c, pattern p
+  where p.term <> ''
+    and (
+         c.first_name ilike p.contains
+      or c.last_name  ilike p.contains
+      or (c.first_name || ' '  || c.last_name)  ilike p.contains
+      or (c.last_name  || ', ' || c.first_name) ilike p.contains
+      or c.email ilike p.contains
+      or (
+           p.term ~ '^[0-9()+.\s-]+$'
+           and length(p.digits) >= 3
+           and regexp_replace(coalesce(c.phone_number, ''), '\D', '', 'g') like '%' || p.digits || '%'
+         )
+    )
+  order by lower(c.last_name), lower(c.first_name)
+  limit least(greatest(coalesce(p_limit, 8), 1), 50);
+$$;
+
+grant execute on function search_customers(text, integer) to authenticated;
+
