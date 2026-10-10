@@ -83,18 +83,28 @@ is applied and will try to re-run everything — including `0008`, which drops a
 rebuilds tables and **would wipe data**. Don't do that.
 
 Instead, mark the already-applied migrations as applied once, so push only ever
-runs *new* ones going forward:
+runs *new* ones going forward.
+
+First confirm which migrations production actually has. Every migration through
+`0034` was written before the CLI was adopted, so all of them were applied by hand
+in the SQL editor; check that the newest ones (`0030`–`0034`) really were. For example,
+`select to_regclass('public.product_units');` should return `product_units`
+(created by `0032`). Then mark exactly those as applied:
 
 ```
 supabase link --project-ref YOUR-PROD-ref
 supabase migration repair --status applied \
   0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 \
   0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 \
-  0021 0022 0023 0024 0025 0026 0027 0028 0029
+  0021 0022 0023 0024 0025 0026 0027 0028 0029 0030 \
+  0031 0032 0033 0034
+supabase migration list     # local and remote columns should now match through 0034
 ```
 
-After that, the normal deploy flow is: add a new migration file → `supabase db
-push`. (This repair step is only needed once, and only on the existing prod DB.)
+After that, the normal deploy flow is: add a new migration file → apply it to the
+**test** project and run the app there → `supabase db push` to production. (The
+repair step is only needed once, and only on the existing prod DB.) Migrations from
+`0035` on are never applied by hand, so they never need repairing.
 
 ---
 
@@ -113,14 +123,17 @@ Providers → Email → turn **off** "Confirm email" (already the default in
 
 ---
 
-## Local development (optional)
+## Local development and database tests
 
-Run the whole stack on your laptop — no hosted project needed:
+Run the whole stack on your laptop with Docker — no hosted project needed. The CLI
+works through npx if it isn't installed:
 
 ```
-supabase start        # boots Postgres + Auth + Studio in Docker
-supabase db reset     # applies migrations + supabase/seed.sql
+npx supabase@2.118.0 start      # boots Postgres + Auth + API, applies migrations + sample seed
+npx supabase@2.118.0 test db    # runs the pgTAP tests in supabase/tests
+npx supabase@2.118.0 db reset   # rebuild the local database after changing a migration
 ```
 
-`supabase start` prints a local `API URL` and `anon key`; put those in
-`web/.env.local` to develop entirely offline.
+`supabase start` prints a local `API URL` and `anon key`. To point the web app at the
+local stack without touching your normal `web/.env.local`, put them in
+`web/.env.localdb.local` and run `npm run dev -- --mode localdb`.

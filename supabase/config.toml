@@ -15,7 +15,7 @@ max_rows = 1000
 [db]
 port = 54322
 shadow_port = 54320
-major_version = 15
+major_version = 17
 
 [studio]
 enabled = true
@@ -36,3 +36,9 @@ enable_confirmations = false
 
 [analytics]
 enabled = false
+
+[db.seed]
+# Sample tennis-shop catalog for local dev/test (`supabase start` / `db reset`).
+# Points straight at the seed file: the CLI runs plain SQL, not psql commands.
+enabled = true
+sql_paths = ["./seed/tennis_seed.sql"]
