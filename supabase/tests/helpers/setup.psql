@@ -41,6 +41,18 @@ begin
 end;
 $$;
 
+-- Act as a signed-out visitor using only the public anon key.
+create or replace function tests.act_as_anon()
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('request.jwt.claim.sub', '', true);
+  perform set_config('request.jwt.claims', json_build_object('role', 'anon')::text, true);
+  execute 'set local role anon';
+end;
+$$;
+
 -- Back to the test superuser (no auth.uid(), RLS bypassed) for fixture setup.
 create or replace function tests.clear_authentication()
 returns void
@@ -53,8 +65,8 @@ begin
 end;
 $$;
 
-grant usage on schema tests to authenticated;
-grant execute on all functions in schema tests to authenticated;
+grant usage on schema tests to authenticated, anon;
+grant execute on all functions in schema tests to authenticated, anon;
 
 -- -----------------------------------------------------------------------------
 -- Common fixtures. Fixed ids so tests can embed them in SQL strings:

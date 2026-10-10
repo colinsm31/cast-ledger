@@ -60,6 +60,17 @@ Applying migrations to the hosted test and production projects is covered in
   (`customer_store_credit`).
 - **Money and stock move through server functions** (`record_sale`,
   `record_refund`, `receive_stock`, `adjust_stock`, `receive_units`,
-  `advance_string_job`, …) so every check runs in one transaction.
+  `advance_string_job`, …) so every check runs in one transaction. Clients
+  can only *read* the money and stock tables; these functions are
+  `SECURITY DEFINER` so they can write them. A new function that writes those
+  tables must be `security definer` too.
+- **Every function pins `search_path = public, pg_temp`** and is executable by
+  `authenticated` only (never `anon`); trigger functions aren't executable at all.
+- **Views use `security_invoker = true`**, so they apply the reader's
+  row-level security. A view without it would bypass RLS for everyone.
+- **Signed-out users (`anon`) have no access** to tables, views or functions.
+  The app requires sign-in for everything.
+- **Admin-only configuration** (settings, categories, attribute definitions) is
+  writable only when `is_admin()` is true; everyone signed in can read it.
 - **Attribution**: money and stock records carry the signed-in staff member
   (`user_id` / `*_by` columns default to `auth.uid()` and reference `profiles`).
