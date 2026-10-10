@@ -25,3 +25,7 @@ jobs:
 
       - name: Run database tests
         run: supabase test db
+
+      # Two real connections racing for the same balance, line, job or unit.
+      - name: Run concurrency checks
+        run: ./scripts/test-concurrency.sh

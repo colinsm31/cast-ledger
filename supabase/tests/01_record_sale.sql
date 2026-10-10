@@ -6,7 +6,7 @@ begin;
 select plan(36);
 
 -- Fixtures used only here: a gift card with $50 on it, $25 store credit, two
--- racquet units, and a string job.
+-- racquet units, and two string jobs.
 insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e1', 'GC-TEST-1');
 insert into gift_card_txns (gift_card_id, amount, reason) values ('00000000-0000-0000-0000-0000000000e1', 50, 'load');
 insert into store_credit_txns (customer_id, amount, reason) values ('00000000-0000-0000-0000-0000000000c1', 25, 'fixture');
@@ -14,6 +14,8 @@ insert into customer_rackets (id, customer_id, brand, model) values
   ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Old Frame');
 insert into string_jobs (id, customer_racket_id, main_product_id, main_tension, price) values
   ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1',
+   '00000000-0000-0000-0000-0000000000b1', 55, 30),
+  ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f1',
    '00000000-0000-0000-0000-0000000000b1', 55, 30);
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
@@ -161,7 +163,7 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 create temp table taxed_job_sale as
 select record_sale(
-  '[{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":30}]'::jsonb,
+  '[{"string_job_id":"00000000-0000-0000-0000-000000000f02","qty":1,"unit_price":30}]'::jsonb,
   null, '[{"method":"cash","amount":32.48}]'::jsonb, null) as id;
 select is((select tax from sales where id = (select id from taxed_job_sale)), 2.48::numeric(12,2),
           'stringing is taxed when tax_stringing is on');

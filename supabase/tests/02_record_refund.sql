@@ -1,9 +1,11 @@
 -- record_refund: partial returns, original tax rate, restocking, refund tenders,
 -- over-return protection, unsupported line types, and the sales summary.
+-- The original sale is paid by credit, so the cash / store credit / gift card
+-- refunds below are payment-type changes and carry a reason (0038).
 begin;
 \ir helpers/setup.psql
 
-select plan(17);
+select plan(18);
 
 insert into customer_rackets (id, customer_id, model) values
   ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Old Frame');
@@ -40,7 +42,7 @@ select record_refund(
   (select id from original_sale),
   jsonb_build_array(jsonb_build_object('sale_line_id', (select string_line from lines), 'qty', 1)),
   '[{"method":"cash","amount":21.65}]'::jsonb,
-  'wrong gauge', null) as id;
+  'wrong gauge', null, 'card reader down') as id;
 
 select results_eq(
   $$ select subtotal, tax, reason from refunds where id = (select id from first_refund) $$,
@@ -50,6 +52,8 @@ select is((select on_hand from product_stock where product_id = '00000000-0000-0
           8::numeric, 'returned string goes back on hand (10 − 3 + 1)');
 select is((select user_id from refunds where id = (select id from first_refund)),
           '00000000-0000-0000-0000-0000000000a1'::uuid, 'refund records the staff member');
+select is((select method_change_reason from refunds where id = (select id from first_refund)),
+          'card reader down', 'a payment-type change records its reason');
 select is((select user_id from inventory_txns where txn_type = 'return'),
           '00000000-0000-0000-0000-0000000000a1'::uuid, 'return stock entry records the staff member');
 
@@ -58,7 +62,7 @@ create temp table second_refund as
 select record_refund(
   (select id from original_sale),
   jsonb_build_array(jsonb_build_object('sale_line_id', (select string_line from lines), 'qty', 1)),
-  '[{"method":"store_credit","amount":21.65}]'::jsonb, null, null) as id;
+  '[{"method":"store_credit","amount":21.65}]'::jsonb, null, null, 'customer asked for credit') as id;
 select is((select balance from customer_store_credit where customer_id = '00000000-0000-0000-0000-0000000000c1'),
           21.65::numeric, 'refund to store credit issues credit to the sale customer');
 select is((select user_id from store_credit_txns where reason = 'refund'),
@@ -69,7 +73,7 @@ select lives_ok(
   format($$ select record_refund('%s',
        '[{"sale_line_id":"%s","qty":1}]'::jsonb,
        '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e3"}]'::jsonb,
-       null, null) $$,
+       null, null, 'gift for a friend') $$,
        (select id from original_sale), (select string_line from lines)),
   'refund onto a gift card');
 select is((select balance from gift_card_balance where gift_card_id = '00000000-0000-0000-0000-0000000000e3'),
