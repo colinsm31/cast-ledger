@@ -3,10 +3,11 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(19);
+select plan(20);
 
 insert into customer_rackets (id, customer_id, brand, model, barcode) values
-  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Frame A', 'TAG-A');
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Frame A', 'TAG-A'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Frame B', 'TAG-B');
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
@@ -14,10 +15,10 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price)
 values ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1',
         '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 55, 53, 30);
--- Job 2: will be cancelled.
-insert into string_jobs (id, customer_racket_id, main_product_id, price)
-values ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f1',
-        '00000000-0000-0000-0000-0000000000b1', 30);
+-- Job 2 (another racquet): will be cancelled.
+insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price)
+values ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f2',
+        '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 52, 52, 30);
 
 select is((select entered_by from string_jobs where id = '00000000-0000-0000-0000-000000000f01'),
           '00000000-0000-0000-0000-0000000000a1'::uuid, 'a new job records who entered it');
@@ -59,6 +60,10 @@ select results_eq(
 
 select tests.clear_authentication();
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+select lives_ok(
+  $$ select record_sale('[{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":30}]'::jsonb,
+                        '00000000-0000-0000-0000-0000000000c1', '[{"method":"cash","amount":30}]'::jsonb, null) $$,
+  'the customer pays for the job at pickup');
 select is(advance_string_job('00000000-0000-0000-0000-000000000f01', 'delivered'), 'delivered',
           'complete → delivered');
 select is((select delivered_by from string_jobs where id = '00000000-0000-0000-0000-000000000f01'),
