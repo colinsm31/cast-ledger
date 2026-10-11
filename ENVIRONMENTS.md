@@ -108,18 +108,32 @@ repair step is only needed once, and only on the existing prod DB.) Migrations f
 
 ---
 
-## First admin
+## Accounts: sign-up off, first admin, adding staff
 
-Roles default to `staff`. After the schema is applied and you've signed in once
-(so a profile row exists), promote yourself in the SQL editor:
+Only approved staff can use the shop's data (migration `0041`). New accounts start
+as `pending`, which has no access, and staff accounts are created by admins through
+the `create-staff` Edge Function. Set up every hosted project like this:
 
-```sql
-update profiles set role = 'admin' where email = 'you@yourshop.com';
-```
+1. **Turn off public sign-up:** Authentication → Sign In / Providers → turn **off**
+   "Allow new users to sign up". (Keep the Email provider itself on, so staff can
+   sign in.) Locally this is `enable_signup = false` under `[auth]` in
+   `supabase/config.toml`.
+2. **Deploy the Edge Function** (once, and again whenever it changes):
 
-Also, so "Add staff" works without hitting the email rate limit: Authentication →
-Providers → Email → turn **off** "Confirm email" (already the default in
-`supabase/config.toml` for local).
+   ```
+   supabase functions deploy create-staff --project-ref YOUR-PROJECT-ref
+   ```
+
+3. **First admin:** create your own account in the dashboard (Authentication →
+   Users → Add user, with "Auto Confirm User" on), then promote it in the SQL editor:
+
+   ```sql
+   update profiles set role = 'admin' where email = 'you@yourshop.com';
+   ```
+
+4. **Everyone else:** an admin adds them on the app's Users screen ("Add staff
+   account"). An account created any other way (e.g. in the dashboard) shows as
+   "no access" there until an admin approves it.
 
 ---
 
