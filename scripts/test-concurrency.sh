@@ -10,8 +10,10 @@
 # Scenarios: gift card double spend, store credit double spend, the same sale
 # line refunded twice, the same string job charged twice, the last unit of
 # stock sold twice with "block overselling" on, the same string job marked
-# complete twice (which would use up its string twice), and two string jobs
-# entered for the last unit of a string with "block overselling" on.
+# complete twice (which would use up its string twice), two string jobs
+# entered for the last unit of a string with "block overselling" on, the same
+# paid job's strings changed twice at once (charging the difference twice), and
+# a string change racing "Mark complete".
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -26,6 +28,7 @@ new_id() { psql_run -c "select gen_random_uuid()"; }
 CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(new_id)
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
+RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select block_oversell::text from settings where id")
 
@@ -39,16 +42,19 @@ cleanup() {
     delete from refunds         where sale_id in (select id from run_sales);
     delete from gift_card_txns  where gift_card_id = '${GIFT_CARD}' or sale_id in (select id from run_sales);
     delete from store_credit_txns where customer_id = '${CUSTOMER}';
-    delete from inventory_txns  where product_id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}');
+    delete from inventory_txns  where product_id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
+                                                     '${STRING_A}', '${STRING_B}');
     delete from sale_payments   where sale_id in (select id from run_sales);
     delete from sale_lines      where sale_id in (select id from run_sales);
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
-                                   or customer_racket_id in ('${RACKET_3}', '${RACKET_4}');
+                                   or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}');
     delete from sales           where id in (select id from run_sales);
-    delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}');
+    delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
+                                             '${RACKET_5}', '${RACKET_6}');
     delete from gift_cards      where id = '${GIFT_CARD}';
     delete from customers       where id = '${CUSTOMER}';
-    delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}');
+    delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
+                                             '${STRING_A}', '${STRING_B}');
     delete from categories      where id = '${CATEGORY}';
     delete from profiles        where id = '${STAFF}';
     delete from auth.users      where id = '${STAFF}';
@@ -90,6 +96,18 @@ psql_run <<SQL >/dev/null
   insert into auth.users (id, email, aud, role)
   values ('${STAFF}', '${RUN_TAG}@concurrency.test', 'authenticated', 'authenticated');
   update profiles set role = 'staff' where id = '${STAFF}';
+  -- Two paid jobs on 20-dollar strings, for the string-change races.
+  insert into products (id, category_id, brand, name, sell_price, attributes)
+  select v.id, c.id, 'Concurrency', v.name, v.price, '{"color":"Black","gauge":"17"}'
+    from categories c,
+         (values ('${STRING_A}'::uuid, '${RUN_TAG} A', 20), ('${STRING_B}'::uuid, '${RUN_TAG} B', 30)) v(id, name, price)
+   where c.name = 'Strings';
+  insert into inventory_txns (txn_type, product_id, qty) values ('receive', '${STRING_A}', 10), ('receive', '${STRING_B}', 10);
+  insert into customer_rackets (id, customer_id, model) values
+    ('${RACKET_5}', '${CUSTOMER}', 'Fifth frame'), ('${RACKET_6}', '${CUSTOMER}', 'Sixth frame');
+  insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price) values
+    ('${JOB_5}', '${RACKET_5}', '${STRING_A}', '${STRING_A}', 52, 52, 20),
+    ('${JOB_6}', '${RACKET_6}', '${STRING_A}', '${STRING_A}', 52, 52, 20);
 SQL
 
 # Run a statement in two sessions (or a second statement in session B): A holds
@@ -173,6 +191,39 @@ enter_job() {
 n=$(race "$(enter_job "${RACKET_3}")" "$(enter_job "${RACKET_4}")")
 check "last unit of a string set aside by two registers at once (block overselling on)" "$n" \
   "$(psql_run -c "select count(*) from string_jobs where main_product_id = '${LAST_STRING}'") job(s) entered"
+
+# 8. The same paid job's strings changed to dearer ones by two registers at once:
+#    the difference is charged once; the second sees the new strings and is refused.
+for job in "${JOB_5}" "${JOB_6}"; do
+  total=$(psql_run -c "select 20 + case when tax_stringing then round(20 * tax_rate / 100.0, 2) else 0 end from settings where id")
+  psql_run -c "select record_sale('[{\"string_job_id\":\"${job}\",\"qty\":1,\"unit_price\":20}]'::jsonb,
+    '${CUSTOMER}', '[{\"method\":\"cash\",\"amount\":${total}}]'::jsonb, '${RUN_TAG}')" >/dev/null
+done
+change_strings() {
+  local total
+  total=$(psql_run -c "select string_change_quote('$1', '${STRING_B}', '${STRING_B}')->>'total'")
+  echo "${AS_STAFF}; select change_paid_string_job('$1', '${STRING_B}', '${STRING_B}', 52, 52,
+    '[{\"method\":\"cash\",\"amount\":${total}}]'::jsonb)"
+}
+n=$(race "$(change_strings "${JOB_5}")")
+check "one paid job's strings changed by two registers at once" "$n" \
+  "$(psql_run -c "select count(*) from sale_lines where string_job_id = '${JOB_5}' and kind = 'string_change'") difference charge(s) recorded"
+
+# 9. A string change racing "Mark complete" on the same job: whichever goes
+#    first, the string used up must be the job's final string.
+( psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
+    -c "begin; $(change_strings "${JOB_6}"); select pg_sleep(${HOLD_SECONDS}); commit;" >/dev/null 2>&1 ) &
+sleep 0.5
+psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
+  -c "begin; ${AS_STAFF}; select advance_string_job('${JOB_6}', 'complete'); commit;" >/dev/null 2>&1 || true
+wait
+consistent=$(psql_run -c "select (select status from string_jobs where id = '${JOB_6}') = 'complete'
+  and (select array_agg(distinct product_id) from inventory_txns
+        where txn_type = 'consume' and product_id in ('${STRING_A}', '${STRING_B}')
+          and created_at > now() - interval '1 minute')
+      = array[(select main_product_id from string_jobs where id = '${JOB_6}')]")
+check "a string change racing \"Mark complete\"" "$([[ "$consistent" == "t" ]] && echo 1 || echo 0)" \
+  "job strung with $(psql_run -c "select p.name from string_jobs j join products p on p.id = j.main_product_id where j.id = '${JOB_6}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
