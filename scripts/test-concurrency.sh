@@ -12,8 +12,10 @@
 # stock sold twice with "block overselling" on, the same string job marked
 # complete twice (which would use up its string twice), two string jobs
 # entered for the last unit of a string with "block overselling" on, the same
-# paid job's strings changed twice at once (charging the difference twice), and
-# a string change racing "Mark complete".
+# paid job's strings changed twice at once (charging the difference twice),
+# a string change racing "Mark complete", a stock adjustment racing a sale of
+# the last unit (block overselling on), and two registers receiving units with
+# the same barcode at once.
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -29,6 +31,7 @@ CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(n
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
+ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select block_oversell::text from settings where id")
 
@@ -43,7 +46,8 @@ cleanup() {
     delete from gift_card_txns  where gift_card_id = '${GIFT_CARD}' or sale_id in (select id from run_sales);
     delete from store_credit_txns where customer_id = '${CUSTOMER}';
     delete from inventory_txns  where product_id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
-                                                     '${STRING_A}', '${STRING_B}');
+                                                     '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}');
+    delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from sale_payments   where sale_id in (select id from run_sales);
     delete from sale_lines      where sale_id in (select id from run_sales);
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
@@ -54,8 +58,8 @@ cleanup() {
     delete from gift_cards      where id = '${GIFT_CARD}';
     delete from customers       where id = '${CUSTOMER}';
     delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
-                                             '${STRING_A}', '${STRING_B}');
-    delete from categories      where id = '${CATEGORY}';
+                                             '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}', '${UNIT_PRODUCT}');
+    delete from categories      where id in ('${CATEGORY}', '${RACQUET_CATEGORY}');
     delete from profiles        where id = '${STAFF}';
     delete from auth.users      where id = '${STAFF}';
 SQL
@@ -108,6 +112,11 @@ psql_run <<SQL >/dev/null
   insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price) values
     ('${JOB_5}', '${RACKET_5}', '${STRING_A}', '${STRING_A}', 52, 52, 20),
     ('${JOB_6}', '${RACKET_6}', '${STRING_A}', '${STRING_A}', 52, 52, 20);
+  -- One unit of a counted product (adjust vs sale), and a unit-tracked product.
+  insert into products (id, category_id, name, sell_price) values ('${ADJUST_PRODUCT}', '${CATEGORY}', 'Adjust race', 20);
+  insert into inventory_txns (txn_type, product_id, qty) values ('receive', '${ADJUST_PRODUCT}', 1);
+  insert into categories (id, name, serialized_default) values ('${RACQUET_CATEGORY}', '${RUN_TAG} units', true);
+  insert into products (id, category_id, name, sell_price) values ('${UNIT_PRODUCT}', '${RACQUET_CATEGORY}', 'Unit race', 200);
 SQL
 
 # Run a statement in two sessions (or a second statement in session B): A holds
@@ -224,6 +233,27 @@ consistent=$(psql_run -c "select (select status from string_jobs where id = '${J
       = array[(select main_product_id from string_jobs where id = '${JOB_6}')]")
 check "a string change racing \"Mark complete\"" "$([[ "$consistent" == "t" ]] && echo 1 || echo 0)" \
   "job strung with $(psql_run -c "select p.name from string_jobs j join products p on p.id = j.main_product_id where j.id = '${JOB_6}'")"
+
+# 10. With overselling blocked, a sale of the only unit is in progress when a
+#     "−1" stock adjustment runs: one goes through, and stock never goes below
+#     zero. (Adjustment first is serialized by the product's foreign key anyway;
+#     this order needs adjust_stock's own lock.)
+psql_run -c "update settings set block_oversell = true where id" >/dev/null
+SALE_TOTAL=$(psql_run -c "select round(20 * (1 + tax_rate / 100.0), 2) from settings where id")
+n=$(race "${AS_STAFF}; select record_sale('[{\"product_id\":\"${ADJUST_PRODUCT}\",\"qty\":1,\"unit_price\":20}]'::jsonb,
+            null, '[{\"method\":\"cash\",\"amount\":${SALE_TOTAL}}]'::jsonb, '${RUN_TAG}')" \
+         "${AS_STAFF}; select adjust_stock('${ADJUST_PRODUCT}', -1, 'count')")
+check "a stock adjustment racing a sale of the last unit (block overselling on)" "$n" \
+  "on hand now $(psql_run -c "select on_hand from product_stock where product_id = '${ADJUST_PRODUCT}'")"
+
+# 11. Two registers receive a unit with the same new barcode at once, one as
+#     UPC-A (12 digits) and one as EAN-13 (a leading 0). The unique index alone
+#     can't see these are the same code; the barcode lock must.
+UPC=$(printf '9%011d' "$(( $(date +%s) % 100000000000 ))")
+n=$(race "select receive_units('${UNIT_PRODUCT}', '[\"${UPC}\"]'::jsonb)" \
+         "select receive_units('${UNIT_PRODUCT}', '[\"0${UPC}\"]'::jsonb)")
+check "one unit barcode (UPC-A vs EAN-13) received by two registers at once" "$n" \
+  "$(psql_run -c "select count(*) from product_units where barcode in ('${UPC}', '0${UPC}')") unit(s) with that code"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
