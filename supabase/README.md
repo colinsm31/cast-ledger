@@ -76,6 +76,11 @@ Applying migrations to the hosted test and production projects is covered in
   (`trg_enforce_staff_writer`) on every table refuses writes by a signed-in
   account that isn't staff, including writes inside server functions. **A new
   table needs a `using (is_staff())` policy and the same trigger.**
+- **`SECURITY DEFINER` functions skip row-level security**, so a function that
+  only *reads* must start with `perform require_staff();`, and a helper used
+  only inside other server functions isn't granted to `authenticated` at all.
+  `tests/13_function_access.sql` lists every one signed-in users can call; a new
+  one fails that test until it's checked and added to the list.
 - **Admin-only configuration** (settings, categories, attribute definitions) is
   writable only when `is_admin()` is true; staff can read it.
 - **Attribution**: money and stock records carry the signed-in staff member
