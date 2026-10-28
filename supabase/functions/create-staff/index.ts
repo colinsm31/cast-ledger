@@ -6,13 +6,18 @@
 //      body can claim admin rights.
 //   2. The account is created with the service role (which never leaves the
 //      server), already email-confirmed, and its profile is set to 'staff'.
+//      It's marked as using a temporary password (user_metadata), so the web
+//      app reminds the person to change it until they do.
 //
 // Request:  POST { "email": string, "password": string }
 // Response: 201 { "id", "email" } | 4xx/5xx { "error": message }
 
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 
+// Match the web app's lib/passwordRules.ts. Supabase Auth ignores anything
+// past 72 characters, so longer is refused rather than silently cut.
 const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_LENGTH = 72;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const corsHeaders = {
@@ -66,6 +71,9 @@ Deno.serve(async (req) => {
   if (password.length < MIN_PASSWORD_LENGTH) {
     return json({ error: `Use a password of at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
   }
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    return json({ error: `Use a password of at most ${MAX_PASSWORD_LENGTH} characters` }, 400);
+  }
 
   // 3. Create the account and make it staff.
   const serviceClient = createClient(supabaseUrl, serviceRoleKey, {
@@ -75,6 +83,7 @@ Deno.serve(async (req) => {
     email,
     password,
     email_confirm: true,
+    user_metadata: { temporary_password: true },
   });
   if (createError || !created.user) {
     const alreadyExists =

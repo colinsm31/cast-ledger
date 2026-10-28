@@ -30,6 +30,10 @@ jwt_expiry = 3600
 # create-staff Edge Function (code review #1). Match this in every hosted
 # project: Authentication → Sign In / Providers → "Allow new users to sign up" off.
 enable_signup = false
+# Passwords of 8 to 72 characters, matching the web app and create-staff.
+# Match this in every hosted project: Authentication → Policies (or Sign In /
+# Providers → Email) → "Minimum password length" 8.
+minimum_password_length = 8
 
 [auth.email]
 # Keeps the email/password provider on (so staff can sign in). Sign-ups are

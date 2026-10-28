@@ -118,21 +118,26 @@ the `create-staff` Edge Function. Set up every hosted project like this:
    "Allow new users to sign up". (Keep the Email provider itself on, so staff can
    sign in.) Locally this is `enable_signup = false` under `[auth]` in
    `supabase/config.toml`.
-2. **Deploy the Edge Function** (once, and again whenever it changes):
+2. **Minimum password length 8:** Authentication → Policies (or Sign In / Providers →
+   Email) → "Minimum password length" = 8, so the server refuses short passwords too,
+   not just the app's screens. Locally this is `minimum_password_length = 8` under
+   `[auth]`.
+3. **Deploy the Edge Function** (once, and again whenever it changes):
 
    ```
    supabase functions deploy create-staff --project-ref YOUR-PROJECT-ref
    ```
 
-3. **First admin:** create your own account in the dashboard (Authentication →
+4. **First admin:** create your own account in the dashboard (Authentication →
    Users → Add user, with "Auto Confirm User" on), then promote it in the SQL editor:
 
    ```sql
    update profiles set role = 'admin' where email = 'you@yourshop.com';
    ```
 
-4. **Everyone else:** an admin adds them on the app's Users screen ("Add staff
-   account"). An account created any other way (e.g. in the dashboard) shows as
+5. **Everyone else:** an admin adds them on the app's Users screen ("Add staff
+   account") with a temporary password. The app asks them to change it on the
+   My account page. An account created any other way (e.g. in the dashboard) shows as
    "no access" there until an admin approves it.
 
 ---
