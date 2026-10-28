@@ -72,7 +72,7 @@ select throws_ok(
   $$ insert into refunds (sale_id) select id from sales limit 1 $$, '42501', null, 'staff cannot insert a refund directly');
 select throws_ok(
   $$ insert into gift_card_txns (gift_card_id, amount) values ('00000000-0000-0000-0000-0000000000e1', 500) $$,
-  '42501', null, 'staff cannot load a gift card without a sale');
+  '42501', null, 'staff cannot write gift card history directly (only through the server functions)');
 select throws_ok(
   $$ update gift_cards set customer_id = '00000000-0000-0000-0000-0000000000c1' $$,
   '42501', null, 'staff cannot reassign gift cards directly');
