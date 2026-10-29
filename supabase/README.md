@@ -8,6 +8,7 @@ single transactions. The web app and the planned iOS app both talk to it directl
 
 | Path | Purpose |
 |------|---------|
+| `functions/create-staff/` | Edge Function: admins create staff accounts (public sign-up is off). Deploy with `supabase functions deploy create-staff`. |
 | `migrations/` | Numbered, re-runnable schema migrations. `0001`–`0007` are the original precast schema; `0008` converted it to retail, and everything after builds AceStock. |
 | `tests/` | pgTAP database tests, run with `supabase test db`. `tests/helpers/setup.psql` holds shared fixtures. |
 | `seed/tennis_seed.sql` | Sample tennis-shop catalog. Loaded automatically by `supabase start` / `supabase db reset` (see `[db.seed]` in `config.toml`). |
@@ -70,7 +71,17 @@ Applying migrations to the hosted test and production projects is covered in
   row-level security. A view without it would bypass RLS for everyone.
 - **Signed-out users (`anon`) have no access** to tables, views or functions.
   The app requires sign-in for everything.
+- **Only approved staff have access.** Accounts start as `pending`. Row-level
+  policies use `is_staff()` (never plain `true`), and a statement-level trigger
+  (`trg_enforce_staff_writer`) on every table refuses writes by a signed-in
+  account that isn't staff, including writes inside server functions. **A new
+  table needs a `using (is_staff())` policy and the same trigger.**
+- **`SECURITY DEFINER` functions skip row-level security**, so a function that
+  only *reads* must start with `perform require_staff();`, and a helper used
+  only inside other server functions isn't granted to `authenticated` at all.
+  `tests/13_function_access.sql` lists every one signed-in users can call; a new
+  one fails that test until it's checked and added to the list.
 - **Admin-only configuration** (settings, categories, attribute definitions) is
-  writable only when `is_admin()` is true; everyone signed in can read it.
+  writable only when `is_admin()` is true; staff can read it.
 - **Attribution**: money and stock records carry the signed-in staff member
   (`user_id` / `*_by` columns default to `auth.uid()` and reference `profiles`).

@@ -10,9 +10,11 @@ select plan(35);
 insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e1', 'GC-PERM');
 insert into gift_card_txns (gift_card_id, amount, reason) values ('00000000-0000-0000-0000-0000000000e1', 40, 'load');
 insert into customer_rackets (id, customer_id, model) values
-  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Frame A');
-insert into string_jobs (id, customer_racket_id, price) values
-  ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1', 30);
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Frame A'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c1', 'Frame B');
+insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price) values
+  ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1',
+   '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 52, 52, 30);
 insert into attribute_defs (category_id, name, value_type) values
   ('00000000-0000-0000-0000-0000000000d1', 'gauge', 'text');
 
@@ -70,7 +72,7 @@ select throws_ok(
   $$ insert into refunds (sale_id) select id from sales limit 1 $$, '42501', null, 'staff cannot insert a refund directly');
 select throws_ok(
   $$ insert into gift_card_txns (gift_card_id, amount) values ('00000000-0000-0000-0000-0000000000e1', 500) $$,
-  '42501', null, 'staff cannot load a gift card without a sale');
+  '42501', null, 'staff cannot write gift card history directly (only through the server functions)');
 select throws_ok(
   $$ update gift_cards set customer_id = '00000000-0000-0000-0000-0000000000c1' $$,
   '42501', null, 'staff cannot reassign gift cards directly');
@@ -96,8 +98,9 @@ select is((select balance from gift_card_balance where gift_card_id = '00000000-
 select throws_like(
   $$ insert into string_jobs (customer_racket_id, status) values ('00000000-0000-0000-0000-0000000000f1', 'complete') $$,
   '%starts as entered and unpaid%', 'a new job cannot start completed');
-insert into string_jobs (id, customer_racket_id, price, entered_by)
-values ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f1', 25,
+insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price, entered_by)
+values ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f2',
+        '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 52, 52, 25,
         '00000000-0000-0000-0000-0000000000a2');
 select is((select entered_by from string_jobs where id = '00000000-0000-0000-0000-000000000f02'),
           '00000000-0000-0000-0000-0000000000a1'::uuid,

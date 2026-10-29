@@ -1,8 +1,10 @@
 -- =============================================================================
--- tennis_seed.sql — AceStock sample catalog (PRODUCTS ONLY, no variants).
--- Real brands/models/prices; add items (variants) yourself with your fields.
+-- tennis_seed.sql — AceStock sample catalog.
+-- Real brands/models/prices. Strings carry a color and gauge (the default
+-- string attributes) and start with 6 of each on hand, so string jobs can be
+-- entered locally.
 -- Idempotent: first removes any prior run of these products AND any stock/
--- sales history on their variants, then re-inserts the products. Requires 0008+.
+-- sales history on them, then re-inserts the products. Requires 0042+.
 -- =============================================================================
 
 -- Brands (pick-or-add lookup)
@@ -234,3 +236,52 @@ insert into products (id, category_id, brand, name, sell_price, cost, reorder_po
 select '80d3f7f9-b452-4e3c-8066-fe34d3dd5850', c.id, 'K-Swiss', 'Ultrashot 3 (Men)', 130, 70, 2
 from categories c where c.name = 'Shoes';
 
+-- Strings: color and gauge for each, plus a second version of some.
+update products p set attributes = v.attrs
+  from (values
+    ('5930b962-578d-4978-a4ab-dbef3922d2be'::uuid, '{"color":"Black","gauge":"16"}'::jsonb),
+    ('c9773329-b93d-43dc-b52c-15caf96f3c02'::uuid, '{"color":"Anthracite","gauge":"17"}'::jsonb),
+    ('a9a50057-fe1f-42f8-bc1e-2041e6e52b00'::uuid, '{"color":"Natural","gauge":"16"}'::jsonb),
+    ('047d7274-584d-48dd-8a40-5d91eece20c3'::uuid, '{"color":"Black","gauge":"17"}'::jsonb),
+    ('e67752c3-1664-4b93-b458-c47de068f90c'::uuid, '{"color":"Natural","gauge":"16"}'::jsonb),
+    ('f54f798b-6088-4553-a6ea-c32e6edf5fd3'::uuid, '{"color":"Black","gauge":"17"}'::jsonb),
+    ('10ac4f97-b452-40e4-ae1a-db942bf4ae34'::uuid, '{"color":"Orange","gauge":"16"}'::jsonb),
+    ('6a02d63e-5d3b-45a2-a9cf-7721805436e7'::uuid, '{"color":"Silver","gauge":"16"}'::jsonb),
+    ('6ce8131e-21b6-4450-bfbd-e745b00c93f1'::uuid, '{"color":"Black","gauge":"16"}'::jsonb),
+    ('9eb0cffc-36b5-4b8d-9d23-0bd767de2dd0'::uuid, '{"color":"Natural","gauge":"16"}'::jsonb),
+    ('7deb7614-e219-4e2a-bcc7-c27358bf0f65'::uuid, '{"color":"Black","gauge":"17"}'::jsonb),
+    ('b70003fe-e9f4-488d-9fa3-2917c3727f6c'::uuid, '{"color":"Yellow","gauge":"16L"}'::jsonb)
+  ) as v(id, attrs)
+ where p.id = v.id;
+
+insert into products (id, category_id, brand, name, sell_price, cost, reorder_point, attributes)
+select v.id, c.id, v.brand, v.name, v.price, v.cost, 4, v.attrs
+  from categories c,
+       (values
+         ('265c63e3-778a-418e-b31e-f2ef5686e188'::uuid, 'Head',       'Lynx',          16, 7,   '{"color":"Black","gauge":"17"}'::jsonb),
+         ('5ca30cdd-7674-4130-a293-753836519a25'::uuid, 'Head',       'Lynx',          16, 7,   '{"color":"Yellow","gauge":"16"}'::jsonb),
+         ('ba5fe3a3-3ae3-4de7-8522-f84c5aabd198'::uuid, 'Tecnifibre', 'X-One Biphase', 22, 10,  '{"color":"Natural","gauge":"17"}'::jsonb),
+         ('9b0dfc59-1c79-4d22-8504-60138d5b7b26'::uuid, 'Wilson',     'NXT',           20, 9,   '{"color":"Natural","gauge":"17"}'::jsonb),
+         ('da94f8d2-92b5-424f-8cae-710f18624bb8'::uuid, 'Solinco',    'Tour Bite',     17, 7.5, '{"color":"Silver","gauge":"17"}'::jsonb),
+         ('0a020356-b678-40a2-b513-006daba67267'::uuid, 'Babolat',    'RPM Blast',     19, 8.5, '{"color":"Black","gauge":"17"}'::jsonb),
+         ('02436add-2df9-4f0d-a691-5adbc8ce3ce8'::uuid, 'Babolat',    'Xcel',          21, 9.5, '{"color":"Natural","gauge":"17"}'::jsonb),
+         ('74531f68-978e-489d-a904-ba00ea49a3cd'::uuid, 'Yonex',      'Poly Tour Pro', 18, 8,   '{"color":"Blue","gauge":"17"}'::jsonb)
+       ) as v(id, brand, name, price, cost, attrs)
+ where c.name = 'Strings';
+
+-- 6 of each string on hand.
+insert into inventory_txns (txn_type, product_id, qty, unit_cost, note)
+select 'receive', p.id, 6, p.cost, 'seed'
+  from products p
+  join categories c on c.id = p.category_id and c.name = 'Strings'
+ where p.id in (
+   '5930b962-578d-4978-a4ab-dbef3922d2be', 'c9773329-b93d-43dc-b52c-15caf96f3c02',
+   'a9a50057-fe1f-42f8-bc1e-2041e6e52b00', '047d7274-584d-48dd-8a40-5d91eece20c3',
+   'e67752c3-1664-4b93-b458-c47de068f90c', 'f54f798b-6088-4553-a6ea-c32e6edf5fd3',
+   '10ac4f97-b452-40e4-ae1a-db942bf4ae34', '6a02d63e-5d3b-45a2-a9cf-7721805436e7',
+   '6ce8131e-21b6-4450-bfbd-e745b00c93f1', '9eb0cffc-36b5-4b8d-9d23-0bd767de2dd0',
+   '7deb7614-e219-4e2a-bcc7-c27358bf0f65', 'b70003fe-e9f4-488d-9fa3-2917c3727f6c',
+   '265c63e3-778a-418e-b31e-f2ef5686e188', '5ca30cdd-7674-4130-a293-753836519a25',
+   'ba5fe3a3-3ae3-4de7-8522-f84c5aabd198', '9b0dfc59-1c79-4d22-8504-60138d5b7b26',
+   'da94f8d2-92b5-424f-8cae-710f18624bb8', '0a020356-b678-40a2-b513-006daba67267',
+   '02436add-2df9-4f0d-a691-5adbc8ce3ce8', '74531f68-978e-489d-a904-ba00ea49a3cd');

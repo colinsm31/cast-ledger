@@ -5,11 +5,12 @@
 -- (customer → sales → sale_lines → variants → products). Walk-in sales leave
 -- customer_id null.
 --
--- Re-runnable: drops and recreates the customers table + sales.customer_id, so
--- applying it again is safe (any existing customer_id links are reset).
+-- NOT safe to re-run on a database with data: it drops and recreates the
+-- customers table and sales.customer_id, deleting every customer and every
+-- sale's customer link (code review #22). For a fresh database only.
 -- =============================================================================
 
--- Idempotent reset (safe to re-run; removes the column's FK dependency first).
+-- Reset (removes the column's FK dependency first). Destructive on live data.
 alter table sales drop column if exists customer_id;
 drop table if exists customers cascade;
 

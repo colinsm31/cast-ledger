@@ -60,6 +60,11 @@ Open `supabase/apply_all.sql` (all migrations concatenated, in order), paste it
 into the test project's **SQL Editor**, and run it. Then paste
 `supabase/seed/tennis_seed.sql` for sample data.
 
+**Brand-new databases only.** Some early migrations drop tables and empty the sales
+history, so the file starts with a check that refuses any database that already has
+a `sales` table, and runs as one transaction: if it stops, nothing is applied. To
+update an existing database, apply new migrations one at a time.
+
 Regenerate that file after adding/editing migrations:
 
 ```
@@ -108,18 +113,37 @@ repair step is only needed once, and only on the existing prod DB.) Migrations f
 
 ---
 
-## First admin
+## Accounts: sign-up off, first admin, adding staff
 
-Roles default to `staff`. After the schema is applied and you've signed in once
-(so a profile row exists), promote yourself in the SQL editor:
+Only approved staff can use the shop's data (migration `0041`). New accounts start
+as `pending`, which has no access, and staff accounts are created by admins through
+the `create-staff` Edge Function. Set up every hosted project like this:
 
-```sql
-update profiles set role = 'admin' where email = 'you@yourshop.com';
-```
+1. **Turn off public sign-up:** Authentication → Sign In / Providers → turn **off**
+   "Allow new users to sign up". (Keep the Email provider itself on, so staff can
+   sign in.) Locally this is `enable_signup = false` under `[auth]` in
+   `supabase/config.toml`.
+2. **Minimum password length 8:** Authentication → Policies (or Sign In / Providers →
+   Email) → "Minimum password length" = 8, so the server refuses short passwords too,
+   not just the app's screens. Locally this is `minimum_password_length = 8` under
+   `[auth]`.
+3. **Deploy the Edge Function** (once, and again whenever it changes):
 
-Also, so "Add staff" works without hitting the email rate limit: Authentication →
-Providers → Email → turn **off** "Confirm email" (already the default in
-`supabase/config.toml` for local).
+   ```
+   supabase functions deploy create-staff --project-ref YOUR-PROJECT-ref
+   ```
+
+4. **First admin:** create your own account in the dashboard (Authentication →
+   Users → Add user, with "Auto Confirm User" on), then promote it in the SQL editor:
+
+   ```sql
+   update profiles set role = 'admin' where email = 'you@yourshop.com';
+   ```
+
+5. **Everyone else:** an admin adds them on the app's Users screen ("Add staff
+   account") with a temporary password. The app asks them to change it on the
+   My account page. An account created any other way (e.g. in the dashboard) shows as
+   "no access" there until an admin approves it.
 
 ---
 
@@ -133,6 +157,14 @@ npx supabase@2.118.0 start      # boots Postgres + Auth + API, applies migration
 npx supabase@2.118.0 test db    # runs the pgTAP tests in supabase/tests
 npx supabase@2.118.0 db reset   # rebuild the local database after changing a migration
 ```
+
+**Database function coverage:** `./scripts/db-coverage.sh` runs the pgTAP tests and
+lists every server function or trigger they never call. It fails if a function that
+was tested no longer is, or if the share of tested functions is below
+`coverage-baseline.json`. When a commit adds tests, or adds a function without tests
+on purpose, run `./scripts/db-coverage.sh --update` and commit the new baseline with
+it. It needs an empty local database, as the tests do (`db reset` first), and only
+counts whether each function ran, not which lines inside it. Not part of CI yet.
 
 `supabase start` prints a local `API URL` and `anon key`. To point the web app at the
 local stack without touching your normal `web/.env.local`, put them in

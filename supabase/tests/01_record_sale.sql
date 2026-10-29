@@ -14,11 +14,12 @@ insert into gift_cards (id, code) values
 insert into gift_card_txns (gift_card_id, amount, reason) values ('00000000-0000-0000-0000-0000000000e1', 50, 'load');
 insert into store_credit_txns (customer_id, amount, reason) values ('00000000-0000-0000-0000-0000000000c1', 25, 'fixture');
 insert into customer_rackets (id, customer_id, brand, model) values
-  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Old Frame');
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Old Frame'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c1', 'TestBrand', 'Spare Frame');
 insert into string_jobs (id, customer_racket_id, main_product_id, main_tension, price) values
   ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1',
    '00000000-0000-0000-0000-0000000000b1', 55, 30),
-  ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f1',
+  ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f2',
    '00000000-0000-0000-0000-0000000000b1', 55, 30);
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');

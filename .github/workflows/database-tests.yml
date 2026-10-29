@@ -7,6 +7,10 @@ on:
     branches: [main]
   pull_request:
 
+# The checks only read the code (code review #43).
+permissions:
+  contents: read
+
 jobs:
   database:
     runs-on: ubuntu-latest

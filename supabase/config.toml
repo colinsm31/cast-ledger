@@ -26,13 +26,27 @@ enabled = true
 site_url = "http://localhost:5173"
 additional_redirect_urls = ["http://localhost:5173"]
 jwt_expiry = 3600
-enable_signup = true
+# No public sign-up: staff accounts are created by admins through the
+# create-staff Edge Function (code review #1). Match this in every hosted
+# project: Authentication → Sign In / Providers → "Allow new users to sign up" off.
+enable_signup = false
+# Passwords of 8 to 72 characters, matching the web app and create-staff.
+# Match this in every hosted project: Authentication → Policies (or Sign In /
+# Providers → Email) → "Minimum password length" 8.
+minimum_password_length = 8
 
 [auth.email]
+# Keeps the email/password provider on (so staff can sign in). Sign-ups are
+# blocked by `enable_signup = false` under [auth] above, not here: this
+# setting turns the whole email provider off when false.
 enable_signup = true
-# Off so an admin can create staff logins without the confirmation-email step
-# (and avoids the built-in email rate limit). Turn on for real email flows.
+# Accounts made by create-staff are confirmed on creation, so no email step.
 enable_confirmations = false
+
+[functions.create-staff]
+# Supabase checks the caller's session before the function runs; the function
+# then checks the caller is an admin.
+verify_jwt = true
 
 [analytics]
 enabled = false

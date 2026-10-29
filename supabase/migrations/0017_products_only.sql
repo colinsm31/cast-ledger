@@ -8,7 +8,8 @@
 -- variant dimensions like gauge/color).
 --
 -- CLEAN CUTOVER: stock + sales history is wiped and rebuilt against products
--- (there is no real sales/stock data yet). Re-runnable.
+-- (there was no real sales/stock data yet). NOT safe to re-run on a database
+-- with data: it empties the sales and stock history (code review #22).
 -- =============================================================================
 
 -- 1. Drop variant-dependent RPCs (recreated below, keyed on product_id).

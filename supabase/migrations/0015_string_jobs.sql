@@ -6,7 +6,9 @@
 -- tension each) and a lifecycle: entered → complete → delivered. A job becomes
 -- part of a racket's re-stringing history once delivered.
 --
--- Re-runnable: drops the old table/fn and recreates string_jobs.
+-- NOT safe to re-run on a database with data: it drops and recreates
+-- string_jobs, deleting every string job (code review #22). For a fresh
+-- database only.
 -- =============================================================================
 
 drop function if exists record_stringing(uuid, uuid, text, numeric, numeric, numeric, text, boolean, text);

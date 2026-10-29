@@ -9,6 +9,10 @@
 
 create extension if not exists pgtap with schema extensions;
 
+-- Count calls per function for scripts/db-coverage.sh. Calls still count
+-- when the test's transaction is rolled back.
+set track_functions = 'all';
+
 create schema if not exists tests;
 
 -- Create a staff account (auth user + profile via the handle_new_user trigger)
@@ -73,8 +77,9 @@ grant execute on all functions in schema tests to authenticated, anon;
 --   staff         ...0000a1   (staff role)
 --   admin         ...0000a2   (admin role)
 --   customer      ...0000c1
---   categories    ...0000d1 (strings), ...0000d2 (racquets, serialized)
---   string        ...0000b1   $20, fungible, UPC 012345678905, 10 on hand
+--   categories    ...0000d1 ('pgTAP Strings', a plain test category), ...0000d2 (racquets, serialized)
+--   string        ...0000b1   $20, in the real Strings category, Natural 16,
+--                             fungible, UPC 012345678905, 10 on hand
 --   racquet       ...0000b2   $250, serialized, UPC 098765432109, none on hand
 --   tax rate 8.25%, stringing not taxed, overselling allowed
 -- -----------------------------------------------------------------------------
@@ -89,9 +94,13 @@ insert into categories (id, name, sort_order, serialized_default) values
   ('00000000-0000-0000-0000-0000000000d1', 'pgTAP Strings',  900, false),
   ('00000000-0000-0000-0000-0000000000d2', 'pgTAP Racquets', 901, true);
 
+-- The string is in the real Strings category: string jobs only accept strings
+-- from it, with every string attribute (color, gauge) set.
+insert into products (id, category_id, brand, name, sell_price, cost, barcode, attributes)
+select '00000000-0000-0000-0000-0000000000b1', id,
+       'TestBrand', 'Test String 16', 20.00, 8.00, '012345678905', '{"color":"Natural","gauge":"16"}'
+  from categories where name = 'Strings';
 insert into products (id, category_id, brand, name, sell_price, cost, barcode) values
-  ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000d1',
-   'TestBrand', 'Test String 16', 20.00, 8.00, '012345678905'),
   ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000d2',
    'TestBrand', 'Test Racquet 100', 250.00, 150.00, '098765432109');
 
