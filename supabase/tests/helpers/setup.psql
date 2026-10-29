@@ -9,6 +9,10 @@
 
 create extension if not exists pgtap with schema extensions;
 
+-- Count calls per function for scripts/db-coverage.sh. Calls still count
+-- when the test's transaction is rolled back.
+set track_functions = 'all';
+
 create schema if not exists tests;
 
 -- Create a staff account (auth user + profile via the handle_new_user trigger)
