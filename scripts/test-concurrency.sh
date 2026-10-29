@@ -19,10 +19,12 @@
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
-# Never point this at production: it creates and then deletes test rows.
+# It creates and then deletes test rows, so only the local database is accepted.
 set -euo pipefail
 
 DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:54322/postgres}"
+source "$(dirname "$0")/lib/require-local-db.sh"
+require_local_db "$DB_URL"
 HOLD_SECONDS=2
 psql_run() { psql "$DB_URL" -v ON_ERROR_STOP=1 -qAt "$@"; }
 
@@ -33,7 +35,9 @@ RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
 ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
-ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select block_oversell::text from settings where id")
+# "false" if the setting is somehow missing, so cleanup can always restore it.
+ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select coalesce((select block_oversell from settings where id), false)::text")
+RACE_DIR=$(mktemp -d)
 
 cleanup() {
   psql_run <<SQL >/dev/null
@@ -63,6 +67,7 @@ cleanup() {
     delete from profiles        where id = '${STAFF}';
     delete from auth.users      where id = '${STAFF}';
 SQL
+  rm -rf "$RACE_DIR"
 }
 trap cleanup EXIT
 
@@ -119,14 +124,34 @@ psql_run <<SQL >/dev/null
   insert into products (id, category_id, name, sell_price) values ('${UNIT_PRODUCT}', '${RACQUET_CATEGORY}', 'Unit race', 200);
 SQL
 
+# Wait until session A (started with PGAPPNAME=$1, process $2) has run its
+# statement and is holding its transaction open in pg_sleep, so B really
+# starts second. Gives up (returns 1) if A ends first or after 10 seconds,
+# rather than racing on a guess.
+wait_until_holding() {
+  for _ in $(seq 1 100); do
+    [[ "$(psql_run -c "select exists (select 1 from pg_stat_activity
+                                      where application_name = '$1' and wait_event = 'PgSleep')")" == "t" ]] && return 0
+    kill -0 "$2" 2>/dev/null || break
+    sleep 0.1
+  done
+  echo "Session A ($1) never reached its hold; this race wasn't run." >&2
+  return 1
+}
+
 # Run a statement in two sessions (or a second statement in session B): A holds
 # its transaction open while B starts. Prints how many of the two succeeded.
 race() {
-  local statement="$1" statement_b="${2:-$1}" successes=0
-  ( psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
+  local statement="$1" statement_b="${2:-$1}" successes=0 session_a="race-a-$$-$RANDOM"
+  ( PGAPPNAME="$session_a" psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
       -c "begin; ${statement}; select pg_sleep(${HOLD_SECONDS}); commit;" >/dev/null 2>&1 \
       && echo ok > "$RACE_DIR/a" ) &
-  sleep 0.5
+  if ! wait_until_holding "$session_a" $!; then
+    wait
+    rm -f "$RACE_DIR/a"
+    echo "not run"
+    return
+  fi
   psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 -c "begin; ${statement_b}; commit;" >/dev/null 2>&1 && echo ok > "$RACE_DIR/b"
   wait
   [[ -f "$RACE_DIR/a" ]] && successes=$((successes + 1))
@@ -134,7 +159,6 @@ race() {
   rm -f "$RACE_DIR/a" "$RACE_DIR/b"
   echo "$successes"
 }
-RACE_DIR=$(mktemp -d)
 
 failures=0
 check() {
@@ -220,9 +244,9 @@ check "one paid job's strings changed by two registers at once" "$n" \
 
 # 9. A string change racing "Mark complete" on the same job: whichever goes
 #    first, the string used up must be the job's final string.
-( psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
+( PGAPPNAME="race-change-$$" psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
     -c "begin; $(change_strings "${JOB_6}"); select pg_sleep(${HOLD_SECONDS}); commit;" >/dev/null 2>&1 ) &
-sleep 0.5
+wait_until_holding "race-change-$$" $! || failures=$((failures + 1))
 psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 \
   -c "begin; ${AS_STAFF}; select advance_string_job('${JOB_6}', 'complete'); commit;" >/dev/null 2>&1 || true
 wait

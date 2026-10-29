@@ -60,6 +60,11 @@ Open `supabase/apply_all.sql` (all migrations concatenated, in order), paste it
 into the test project's **SQL Editor**, and run it. Then paste
 `supabase/seed/tennis_seed.sql` for sample data.
 
+**Brand-new databases only.** Some early migrations drop tables and empty the sales
+history, so the file starts with a check that refuses any database that already has
+a `sales` table, and runs as one transaction: if it stops, nothing is applied. To
+update an existing database, apply new migrations one at a time.
+
 Regenerate that file after adding/editing migrations:
 
 ```

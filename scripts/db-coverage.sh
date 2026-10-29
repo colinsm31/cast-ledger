@@ -18,10 +18,8 @@
 set -euo pipefail
 
 DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:54322/postgres}"
-case "$DB_URL" in
-  *@127.0.0.1:*|*@localhost:*) ;;
-  *) echo "db-coverage.sh only runs against the local database (got a non-local DB_URL)." >&2; exit 1 ;;
-esac
+source "$(dirname "$0")/lib/require-local-db.sh"
+require_local_db "$DB_URL"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASELINE="$ROOT/coverage-baseline.json"
