@@ -30,6 +30,8 @@ values ('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000
 -- ---------------------------------------------------------------------------
 -- Completing: one step at a time, and only once (#3)
 -- ---------------------------------------------------------------------------
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f01';
 select is(advance_string_job('00000000-0000-0000-0000-000000000f01', 'complete'), 'complete',
           'an entered job can be completed');
 select throws_like(
@@ -115,6 +117,8 @@ select throws_like(
   $$ insert into string_jobs (customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price)
       values ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 52, 52, 30) $$,
   '%already has an open string job%', 'a racquet with an entered job cannot get a second one');
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f02';
 select lives_ok(
   $$ select advance_string_job('00000000-0000-0000-0000-000000000f02', 'complete') $$,
   'the prepaid job is strung');

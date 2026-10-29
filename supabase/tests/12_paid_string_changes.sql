@@ -244,6 +244,8 @@ select throws_like(
   $$ select string_change_quote('00000000-0000-0000-0000-000000000f06', '00000000-0000-0000-0000-0000000000b6',
        '00000000-0000-0000-0000-0000000000b6') $$,
   '%Only a paid job that hasn''t been strung%', 'an unpaid job changes strings directly, not through String change');
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f03';
 select lives_ok($$ select advance_string_job('00000000-0000-0000-0000-000000000f03', 'complete') $$, 'job 3 is strung');
 select throws_like(
   $$ select change_paid_string_job('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000000b1',

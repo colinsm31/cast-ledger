@@ -94,8 +94,9 @@ psql_run <<SQL >/dev/null
   insert into customer_rackets (id, customer_id, model) values ('${RACKET}', '${CUSTOMER}', 'Frame');
   insert into string_jobs (id, customer_racket_id, price) values ('${JOB}', '${RACKET}', 30);
   insert into customer_rackets (id, customer_id, model) values ('${RACKET_2}', '${CUSTOMER}', 'Second frame');
-  insert into string_jobs (id, customer_racket_id, main_product_id, price)
-  values ('${JOB_2}', '${RACKET_2}', '${PRODUCT}', 30);
+  -- Jobs that get marked complete need a stringer (0051).
+  insert into string_jobs (id, customer_racket_id, main_product_id, price, strung_by)
+  values ('${JOB_2}', '${RACKET_2}', '${PRODUCT}', 30, 'Concurrency');
   insert into customer_rackets (id, customer_id, model) values
     ('${RACKET_3}', '${CUSTOMER}', 'Third frame'), ('${RACKET_4}', '${CUSTOMER}', 'Fourth frame');
   insert into products (id, category_id, brand, name, sell_price, attributes)
@@ -114,9 +115,9 @@ psql_run <<SQL >/dev/null
   insert into inventory_txns (txn_type, product_id, qty) values ('receive', '${STRING_A}', 10), ('receive', '${STRING_B}', 10);
   insert into customer_rackets (id, customer_id, model) values
     ('${RACKET_5}', '${CUSTOMER}', 'Fifth frame'), ('${RACKET_6}', '${CUSTOMER}', 'Sixth frame');
-  insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price) values
-    ('${JOB_5}', '${RACKET_5}', '${STRING_A}', '${STRING_A}', 52, 52, 20),
-    ('${JOB_6}', '${RACKET_6}', '${STRING_A}', '${STRING_A}', 52, 52, 20);
+  insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price, strung_by) values
+    ('${JOB_5}', '${RACKET_5}', '${STRING_A}', '${STRING_A}', 52, 52, 20, null),
+    ('${JOB_6}', '${RACKET_6}', '${STRING_A}', '${STRING_A}', 52, 52, 20, 'Concurrency');
   -- One unit of a counted product (adjust vs sale), and a unit-tracked product.
   insert into products (id, category_id, name, sell_price) values ('${ADJUST_PRODUCT}', '${CATEGORY}', 'Adjust race', 20);
   insert into inventory_txns (txn_type, product_id, qty) values ('receive', '${ADJUST_PRODUCT}', 1);

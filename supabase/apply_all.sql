@@ -8634,4 +8634,325 @@ $$;
 revoke all on function sales_summary(timestamptz, timestamptz) from public, anon;
 grant execute on function sales_summary(timestamptz, timestamptz) to authenticated;
 
+-- >>> supabase/migrations/0049_stock_quantities.sql
+-- =============================================================================
+-- 0049_stock_quantities.sql — stock quantities in whole or half units
+--                              (AceStock, foundation code review #29)
+--
+-- Before:
+--   • Receive and Adjust took any quantity, so typos like 1.37 or 0.0001 were
+--     stored and the on-hand count stopped being a count.
+--
+-- Now:
+--   1. A received or adjusted quantity is a whole number or a half (2, 2.5).
+--      Halves are allowed because the stock imported from the old system
+--      already counts string in half sets; existing quantities are untouched.
+--   2. receive_stock and adjust_stock are the same as their latest versions
+--      (0046 and 0045) plus that check at the start.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. Internal helper: a quantity in whole or half units.
+-- ----------------------------------------------------------------------------
+create or replace function require_half_units(p_qty numeric, p_label text)
+returns void
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+begin
+  if p_qty is not null and p_qty * 2 <> trunc(p_qty * 2) then
+    raise exception '% % must be a whole number or a half, like 2 or 2.5', p_label, trim_scale(p_qty);
+  end if;
+end;
+$$;
+
+revoke all on function require_half_units(numeric, text) from public, anon, authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 2. The two functions that take a stock quantity.
+-- ----------------------------------------------------------------------------
+create or replace function receive_stock(
+  p_product_id uuid,
+  p_qty        numeric,
+  p_unit_cost  numeric,
+  p_location   text,
+  p_note       text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_id         uuid := gen_random_uuid();
+  v_serialized boolean;
+  v_name       text;
+begin
+  perform require_cents(p_unit_cost, 'Unit cost');
+  perform require_half_units(p_qty, 'Quantity');
+  if p_qty is null or p_qty <= 0 then
+    raise exception 'Receive quantity must be positive';
+  end if;
+  select is_serialized, trim(coalesce(brand || ' ', '') || name) into v_serialized, v_name
+    from products where id = p_product_id;
+  if not found then
+    raise exception 'Unknown product_id %', p_product_id;
+  end if;
+  if v_serialized then
+    raise exception '% is tracked by unit; receive each one with its own barcode', v_name;
+  end if;
+  insert into inventory_txns (id, txn_type, product_id, qty, unit_cost, location, note)
+  values (v_id, 'receive', p_product_id, p_qty, p_unit_cost, nullif(trim(p_location),''), nullif(trim(p_note),''));
+  return v_id;
+end;
+$$;
+
+create or replace function adjust_stock(p_product_id uuid, p_qty numeric, p_note text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_id         uuid := gen_random_uuid();
+  v_serialized boolean;
+  v_name       text;
+  v_on_hand    numeric;
+begin
+  perform require_half_units(p_qty, 'Quantity');
+  if p_qty is null or p_qty = 0 then
+    raise exception 'Adjustment quantity must be non-zero';
+  end if;
+  -- Lock the product, so a sale of the same item waits (and vice versa).
+  select is_serialized, trim(coalesce(brand || ' ', '') || name) into v_serialized, v_name
+    from products where id = p_product_id
+    for update;
+  if not found then
+    raise exception 'Unknown product_id %', p_product_id;
+  end if;
+  if v_serialized then
+    raise exception '% is tracked by unit; its stock is the units in stock, not an adjustable count', v_name;
+  end if;
+
+  if p_qty < 0 and coalesce((select block_oversell from settings where id), false) then
+    select coalesce(sum(qty), 0) into v_on_hand from inventory_txns where product_id = p_product_id;
+    if v_on_hand + p_qty < 0 then
+      raise exception 'Only % of % on hand; this would take it to %',
+        trim_scale(v_on_hand), v_name, trim_scale(v_on_hand + p_qty);
+    end if;
+  end if;
+
+  insert into inventory_txns (id, txn_type, product_id, qty, note)
+  values (v_id, 'adjust', p_product_id, p_qty, nullif(trim(p_note),''));
+  return v_id;
+end;
+$$;
+
+revoke all on function receive_stock(uuid, numeric, numeric, text, text) from public, anon;
+revoke all on function adjust_stock(uuid, numeric, text) from public, anon;
+grant execute on function receive_stock(uuid, numeric, numeric, text, text) to authenticated;
+grant execute on function adjust_stock(uuid, numeric, text) to authenticated;
+
+-- >>> supabase/migrations/0050_real_numbers.sql
+-- =============================================================================
+-- 0050_real_numbers.sql — amounts and quantities must be real numbers
+--                         (AceStock, polish review #1)
+--
+-- Before:
+--   • Postgres numbers can be NaN ("not a number"), and NaN = NaN, so the
+--     require_cents and require_half_units checks let it through. A NaN stock
+--     quantity or gift card amount was stored for good, and every total built
+--     on it (stock on hand, card balance) became NaN too.
+--   • Infinity also passed the checks (the columns then refused it with a
+--     raw error).
+--
+-- Now:
+--   1. require_cents and require_half_units refuse NaN and infinity with a
+--      message naming the field. Every function that takes an amount or a
+--      quantity already calls one of them (0046, 0049).
+--   2. Every stored number column refuses NaN, so direct table saves (a
+--      product's price, a string job's tension) are covered too. Infinity
+--      can't be stored in these columns at all.
+--
+-- AceStock-Test had no NaN values when this was written. Re-runnable.
+-- =============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. The amount and quantity checks.
+-- ----------------------------------------------------------------------------
+-- require_cents — same as 0046, plus: a real number.
+create or replace function require_cents(p_amount numeric, p_label text)
+returns void
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+begin
+  if p_amount in ('NaN', 'Infinity', '-Infinity') then
+    raise exception '% must be a number (got %)', p_label, p_amount;
+  end if;
+  if p_amount is not null and p_amount <> round(p_amount, 2) then
+    raise exception '% % has more than 2 decimal places', p_label, trim_scale(p_amount);
+  end if;
+end;
+$$;
+
+-- require_half_units — same as 0049, plus: a real number.
+create or replace function require_half_units(p_qty numeric, p_label text)
+returns void
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+begin
+  if p_qty in ('NaN', 'Infinity', '-Infinity') then
+    raise exception '% must be a number (got %)', p_label, p_qty;
+  end if;
+  if p_qty is not null and p_qty * 2 <> trunc(p_qty * 2) then
+    raise exception '% % must be a whole number or a half, like 2 or 2.5', p_label, trim_scale(p_qty);
+  end if;
+end;
+$$;
+
+revoke all on function require_cents(numeric, text) from public, anon, authenticated;
+revoke all on function require_half_units(numeric, text) from public, anon, authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 2. No NaN in any stored number.
+-- ----------------------------------------------------------------------------
+alter table gift_card_txns drop constraint if exists ck_gift_card_txns_amount_number;
+alter table gift_card_txns add constraint ck_gift_card_txns_amount_number check (amount <> 'NaN');
+alter table inventory_txns drop constraint if exists ck_inventory_txns_qty_number;
+alter table inventory_txns add constraint ck_inventory_txns_qty_number check (qty <> 'NaN');
+alter table inventory_txns drop constraint if exists ck_inventory_txns_unit_cost_number;
+alter table inventory_txns add constraint ck_inventory_txns_unit_cost_number check (unit_cost <> 'NaN');
+alter table products drop constraint if exists ck_products_cost_number;
+alter table products add constraint ck_products_cost_number check (cost <> 'NaN');
+alter table products drop constraint if exists ck_products_sell_price_number;
+alter table products add constraint ck_products_sell_price_number check (sell_price <> 'NaN');
+alter table refund_lines drop constraint if exists ck_refund_lines_unit_price_number;
+alter table refund_lines add constraint ck_refund_lines_unit_price_number check (unit_price <> 'NaN');
+alter table refund_payments drop constraint if exists ck_refund_payments_amount_number;
+alter table refund_payments add constraint ck_refund_payments_amount_number check (amount <> 'NaN');
+alter table refunds drop constraint if exists ck_refunds_subtotal_number;
+alter table refunds add constraint ck_refunds_subtotal_number check (subtotal <> 'NaN');
+alter table refunds drop constraint if exists ck_refunds_tax_number;
+alter table refunds add constraint ck_refunds_tax_number check (tax <> 'NaN');
+alter table sale_lines drop constraint if exists ck_sale_lines_unit_price_number;
+alter table sale_lines add constraint ck_sale_lines_unit_price_number check (unit_price <> 'NaN');
+alter table sale_payments drop constraint if exists ck_sale_payments_amount_number;
+alter table sale_payments add constraint ck_sale_payments_amount_number check (amount <> 'NaN');
+alter table sales drop constraint if exists ck_sales_subtotal_number;
+alter table sales add constraint ck_sales_subtotal_number check (subtotal <> 'NaN');
+alter table sales drop constraint if exists ck_sales_tax_number;
+alter table sales add constraint ck_sales_tax_number check (tax <> 'NaN');
+alter table sales drop constraint if exists ck_sales_tax_rate_number;
+alter table sales add constraint ck_sales_tax_rate_number check (tax_rate <> 'NaN');
+alter table settings drop constraint if exists ck_settings_stringing_labor_number;
+alter table settings add constraint ck_settings_stringing_labor_number check (stringing_labor <> 'NaN');
+alter table settings drop constraint if exists ck_settings_tax_rate_number;
+alter table settings add constraint ck_settings_tax_rate_number check (tax_rate <> 'NaN');
+alter table store_credit_txns drop constraint if exists ck_store_credit_txns_amount_number;
+alter table store_credit_txns add constraint ck_store_credit_txns_amount_number check (amount <> 'NaN');
+alter table string_jobs drop constraint if exists ck_string_jobs_cross_tension_number;
+alter table string_jobs add constraint ck_string_jobs_cross_tension_number check (cross_tension <> 'NaN');
+alter table string_jobs drop constraint if exists ck_string_jobs_main_tension_number;
+alter table string_jobs add constraint ck_string_jobs_main_tension_number check (main_tension <> 'NaN');
+alter table string_jobs drop constraint if exists ck_string_jobs_price_number;
+alter table string_jobs add constraint ck_string_jobs_price_number check (price <> 'NaN');
+alter table string_jobs drop constraint if exists ck_string_jobs_strings_price_number;
+alter table string_jobs add constraint ck_string_jobs_strings_price_number check (strings_price <> 'NaN');
+
+-- >>> supabase/migrations/0051_stringer_required.sql
+-- =============================================================================
+-- 0051_stringer_required.sql — a job needs a stringer to be marked complete
+--                              (AceStock, polish review #7)
+--
+-- Before:
+--   • The string job page only enabled "Mark complete" once a stringer was
+--     picked, but the server didn't check: a direct call, or a stringer save
+--     that failed or was overtaken, could complete a job with no stringer.
+--
+-- Now:
+--   1. advance_string_job refuses entered → complete until the job has a
+--      stringer (strung_by, not blank). Everything else is as 0042: explicit
+--      transitions, row lock, paid before delivery, owner rights, staff only.
+--
+-- Jobs already complete or delivered without a stringer are left as they are.
+-- Re-runnable.
+-- =============================================================================
+
+-- advance_string_job — same as 0042, plus: a stringer before 'complete'.
+create or replace function advance_string_job(
+  p_job_id        uuid,
+  p_target_status text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current text;
+  v_main    uuid;
+  v_cross   uuid;
+  v_paid    uuid;
+  v_strung  text;
+begin
+  perform require_staff();
+
+  if p_target_status is null
+     or p_target_status not in ('entered', 'complete', 'delivered', 'cancelled') then
+    raise exception 'Invalid status "%"', p_target_status;
+  end if;
+
+  -- Lock the job so a second click (or register) waits, then sees this one's result.
+  select status, main_product_id, cross_product_id, paid_sale_id, strung_by
+    into v_current, v_main, v_cross, v_paid, v_strung
+    from string_jobs where id = p_job_id
+    for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+
+  if (v_current, p_target_status) not in (('entered', 'complete'), ('complete', 'delivered')) then
+    raise exception 'Cannot move a string job from "%" to "%"', v_current, p_target_status;
+  end if;
+  if p_target_status = 'delivered' and v_paid is null then
+    raise exception 'Take payment for this string job before marking it delivered';
+  end if;
+  if p_target_status = 'complete' and coalesce(trim(v_strung), '') = '' then
+    raise exception 'Record who strung it before marking it complete';
+  end if;
+
+  update string_jobs
+    set status       = p_target_status,
+        completed_at = case when p_target_status = 'complete'  then now()      else completed_at end,
+        completed_by = case when p_target_status = 'complete'  then auth.uid() else completed_by end,
+        delivered_at = case when p_target_status = 'delivered' then now()      else delivered_at end,
+        delivered_by = case when p_target_status = 'delivered' then auth.uid() else delivered_by end
+  where id = p_job_id
+    and status = v_current;
+
+  -- Consume one unit of each distinct catalog string the job used.
+  if p_target_status = 'complete' then
+    insert into inventory_txns (txn_type, product_id, qty, note)
+    select 'consume', pid, -1, 'String job completed'
+    from (
+      select distinct pid
+      from (values (v_main), (v_cross)) as t(pid)
+      where pid is not null
+    ) d;
+  end if;
+
+  return p_target_status;
+end;
+$$;
+
+revoke all on function advance_string_job(uuid, text) from public, anon;
+grant execute on function advance_string_job(uuid, text) to authenticated;
+
 commit;
