@@ -57,6 +57,8 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select lives_ok(
   $$ update string_jobs set price = 35 where id = '00000000-0000-0000-0000-000000000f02' $$,
   'an unpaid job''s price can still be edited');
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f01';
 select lives_ok(
   $$ select advance_string_job('00000000-0000-0000-0000-000000000f01', 'complete') $$,
   'a paid job still moves through its statuses');

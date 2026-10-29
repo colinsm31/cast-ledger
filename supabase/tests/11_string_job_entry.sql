@@ -146,6 +146,8 @@ select results_eq(
       order by product_id $$,
   $$ values ('00000000-0000-0000-0000-0000000000b1'::uuid, 1), ('00000000-0000-0000-0000-0000000000b7'::uuid, 0) $$,
   'changing strings releases the old string and sets the new one aside');
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f01';
 select lives_ok(
   $$ select advance_string_job('00000000-0000-0000-0000-000000000f01', 'complete') $$,
   'completing a job is never blocked by availability');

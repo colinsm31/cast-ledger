@@ -41,6 +41,8 @@ select throws_like(
 -- Complete job 1 as the admin, so attribution is visibly per action.
 select tests.clear_authentication();
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
+-- A job needs a stringer before it's complete (0051).
+update string_jobs set strung_by = 'Test Stringer' where id = '00000000-0000-0000-0000-000000000f01';
 select is(advance_string_job('00000000-0000-0000-0000-000000000f01', 'complete'), 'complete',
           'entered → complete');
 select isnt((select completed_at from string_jobs where id = '00000000-0000-0000-0000-000000000f01'),
