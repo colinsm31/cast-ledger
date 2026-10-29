@@ -5,13 +5,14 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(20);
+select plan(21);
 
 insert into customer_rackets (id, customer_id, model) values
-  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Frame A');
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Frame A'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c1', 'Frame B');
 insert into string_jobs (id, customer_racket_id, price, status) values
   ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1', 30, 'entered'),
-  ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f1', 30, 'entered'),
+  ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f2', 30, 'entered'),
   ('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000000f1', 30, 'cancelled');
 insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e1', 'GC-GUARD');
 insert into gift_card_txns (gift_card_id, amount, reason) values ('00000000-0000-0000-0000-0000000000e1', 100, 'load');
@@ -45,9 +46,14 @@ select throws_like(
 select throws_like(
   $$ update string_jobs set price = 10 where id = '00000000-0000-0000-0000-000000000f01' $$,
   '%price of a paid string job%', 'a paid job''s price is locked');
+select throws_ok(
+  $$ update string_jobs set paid_sale_id = null where id = '00000000-0000-0000-0000-000000000f01' $$,
+  '42501', null, 'staff cannot change which sale paid a job (only record_sale sets it)');
+select tests.clear_authentication();
 select throws_like(
   $$ update string_jobs set paid_sale_id = null where id = '00000000-0000-0000-0000-000000000f01' $$,
-  '%already paid by sale%', 'a paid job stays linked to the sale that paid it');
+  '%already paid by sale%', 'even with full rights, a paid job stays linked to the sale that paid it');
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select lives_ok(
   $$ update string_jobs set price = 35 where id = '00000000-0000-0000-0000-000000000f02' $$,
   'an unpaid job''s price can still be edited');

@@ -11,6 +11,7 @@ insert into customer_rackets (id, customer_id, model) values
   ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Old Frame');
 insert into string_jobs (id, customer_racket_id, price) values
   ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000f1', 30);
+insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e3', 'GC-REFUND');
 insert into product_units (id, product_id, barcode) values
   ('00000000-0000-0000-0000-0000000000a9', '00000000-0000-0000-0000-0000000000b2', 'RQ-REFUND-1');
 
@@ -68,7 +69,6 @@ select is((select balance from customer_store_credit where customer_id = '000000
 select is((select user_id from store_credit_txns where reason = 'refund'),
           '00000000-0000-0000-0000-0000000000a1'::uuid, 'store credit refund records the staff member');
 
-insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e3', 'GC-REFUND');
 select lives_ok(
   format($$ select record_refund('%s',
        '[{"sale_line_id":"%s","qty":1}]'::jsonb,

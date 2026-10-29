@@ -3,6 +3,9 @@
 .env.local
 *.local
 
+# Coverage reports (scripts/db-coverage.sh)
+coverage/
+
 # Supabase CLI
 supabase/.branches
 supabase/.temp

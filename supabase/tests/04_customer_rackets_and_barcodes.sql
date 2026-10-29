@@ -67,10 +67,11 @@ select lives_ok(
   'a retired racket''s tag can be put on a new racket');
 select is((select id from resolve_barcode('TAG-A')),
           '00000000-0000-0000-0000-0000000000f3'::uuid, 'the reused tag resolves to the new racket');
-select throws_ok(
+select throws_like(
   $$ insert into customer_rackets (customer_id, model, barcode)
      values ('00000000-0000-0000-0000-0000000000c1', 'Frame D', 'TAG-B') $$,
-  '23505', null, 'two active rackets cannot share a tag');
+  '%Barcode TAG-B is already the tag on Pat Tester''s TestBrand Frame B%',
+  'two active rackets cannot share a tag (and the message says whose it is)');
 
 select lives_ok(
   $$ delete from customer_rackets where id = '00000000-0000-0000-0000-0000000000f2' $$,
