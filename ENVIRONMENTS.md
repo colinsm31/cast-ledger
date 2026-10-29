@@ -153,6 +153,14 @@ npx supabase@2.118.0 test db    # runs the pgTAP tests in supabase/tests
 npx supabase@2.118.0 db reset   # rebuild the local database after changing a migration
 ```
 
+**Database function coverage:** `./scripts/db-coverage.sh` runs the pgTAP tests and
+lists every server function or trigger they never call. It fails if a function that
+was tested no longer is, or if the share of tested functions is below
+`coverage-baseline.json`. When a commit adds tests, or adds a function without tests
+on purpose, run `./scripts/db-coverage.sh --update` and commit the new baseline with
+it. It needs an empty local database, as the tests do (`db reset` first), and only
+counts whether each function ran, not which lines inside it. Not part of CI yet.
+
 `supabase start` prints a local `API URL` and `anon key`. To point the web app at the
 local stack without touching your normal `web/.env.local`, put them in
 `web/.env.localdb.local` and run `npm run dev -- --mode localdb`.
