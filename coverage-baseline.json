@@ -35,6 +35,7 @@
             "refund_method_overages(uuid,uuid)",
             "require_cents_each(jsonb,text,text)",
             "require_cents(numeric,text)",
+            "require_half_units(numeric,text)",
             "require_staff()",
             "resolve_barcode(text)",
             "sale_refund_tax(uuid,numeric,uuid)",
@@ -50,7 +51,7 @@
         "percent": 100.00,
         "untested": [
         ],
-        "functionsTotal": 44,
-        "functionsTested": 44
+        "functionsTotal": 45,
+        "functionsTested": 45
     }
 }
