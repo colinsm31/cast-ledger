@@ -2,6 +2,7 @@
     "updated": "2026-10-28",
     "database": {
         "tested": [
+            "add_lookup_value(text,text)",
             "add_store_credit(uuid,numeric,text)",
             "adjust_gift_card(uuid,numeric,text)",
             "adjust_stock(uuid,numeric,text)",
@@ -46,11 +47,10 @@
             "string_job_side(uuid,uuid,boolean,text)",
             "string_job_strings_price(uuid,uuid)"
         ],
-        "percent": 97.73,
+        "percent": 100.00,
         "untested": [
-            "add_lookup_value(text,text)"
         ],
         "functionsTotal": 44,
-        "functionsTested": 43
+        "functionsTested": 44
     }
 }
