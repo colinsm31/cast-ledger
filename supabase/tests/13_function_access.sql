@@ -6,7 +6,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(13);
+select plan(14);
 
 select is(
   (select array_agg(p.proname::text order by p.proname)
@@ -20,6 +20,8 @@ select is(
     'cancel_string_job', 'change_paid_string_job', 'ensure_gift_card',
     -- answer only about the caller
     'is_admin', 'is_staff',
+    -- read-only: calls require_staff()
+    'quote_sale',
     'receive_stock', 'receive_units', 'record_refund', 'record_sale',
     'require_staff',
     -- checks is_admin() first
@@ -63,6 +65,9 @@ select throws_ok(
 select throws_ok(
   $$ select * from string_job_side('00000000-0000-0000-0000-0000000000b1', null, false, 'mains') $$,
   '42501', null, 'a pending account can''t call the string check');
+select throws_ok(
+  $$ select quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]'::jsonb, null) $$,
+  '42501', null, 'a pending account can''t get a sale quote');
 select is(is_staff(), false, 'a pending account can still ask whether it has staff access');
 
 -- ---------------------------------------------------------------------------
