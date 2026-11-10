@@ -42,7 +42,7 @@ select is((select strings_price from string_jobs where id = '00000000-0000-0000-
           'entering a job records its strings'' catalog price');
 
 create temp table sale_a as
-select record_sale('[{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":15}]'::jsonb,
+select record_sale('[{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":15,"price_reason":"Price match"}]'::jsonb,
                    '00000000-0000-0000-0000-0000000000c1', '[{"method":"cash","amount":15}]'::jsonb, null) as id;
 select results_eq(
   $$ select j.price, sl.taxable from string_jobs j join sale_lines sl on sl.string_job_id = j.id

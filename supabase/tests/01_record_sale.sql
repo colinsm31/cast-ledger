@@ -222,7 +222,7 @@ select throws_like(
 -- ---------------------------------------------------------------------------
 select lives_ok(
   $$ select record_sale(
-       '[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":50,"unit_price":0}]'::jsonb,
+       '[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":50,"unit_price":0,"price_reason":"Free sample"}]'::jsonb,
        null, '[]'::jsonb, null) $$,
   'overselling is allowed when block_oversell is off');
 

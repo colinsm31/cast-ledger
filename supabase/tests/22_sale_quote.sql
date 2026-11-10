@@ -40,7 +40,8 @@ select quote_sale(jsonb_build_array(
   '{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":30}'::jsonb,
   jsonb_build_object('gift_card_id', (select id from card), 'qty', 1, 'unit_price', 50)), null) as q;
 select is((select (q->>'tax')::numeric from q2), 0.00, 'stringing (not taxed here) and gift card loads carry no tax');
-select is((select q->'lines' from q2),
+select is((select jsonb_agg(jsonb_build_object('line_total', l->'line_total', 'taxable', l->'taxable'))
+             from q2, jsonb_array_elements(q->'lines') l),
           '[{"line_total": 30, "taxable": false}, {"line_total": 50, "taxable": false}]'::jsonb,
           'each line says whether it is taxed');
 
@@ -124,14 +125,14 @@ grant select on counts_before to authenticated;
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 create temp table q4 as
-select quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99}]'::jsonb, null) as q;
+select quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99,"price_reason":"Price match"}]'::jsonb, null) as q;
 select is((select count(*) from sales), (select sales from counts_before), 'quoting records no sale');
 select is((select count(*) from inventory_txns), (select txns from counts_before), 'quoting moves no stock');
 
 create temp table s4 as
-select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99}]'::jsonb, null,
+select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99,"price_reason":"Price match"}]'::jsonb, null,
                    jsonb_build_array(jsonb_build_object('method', 'cash', 'amount',
-                     (quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99}]'::jsonb, null)->>'total')::numeric)),
+                     (quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":3,"unit_price":19.99,"price_reason":"Price match"}]'::jsonb, null)->>'total')::numeric)),
                    null) as id;
 select results_eq(
   $$ select subtotal, tax, tax_rate from sales where id = (select id from s4) $$,
