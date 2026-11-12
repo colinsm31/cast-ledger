@@ -243,7 +243,7 @@ select results_eq(
 
 select ok(not has_function_privilege('authenticated', 'discount_each(numeric, numeric)', 'execute')
           and not has_function_privilege('authenticated', 'discount_approval_problem(jsonb, uuid)', 'execute')
-          and not has_function_privilege('authenticated', 'sale_totals(jsonb, jsonb)', 'execute'),
+          and not has_function_privilege('authenticated', 'sale_totals(jsonb, jsonb, boolean)', 'execute'),
           'the discount helpers are internal');
 select ok(not has_function_privilege('anon', 'approve_discount(numeric)', 'execute')
           and not has_function_privilege('anon', 'record_sale(jsonb, uuid, jsonb, text, jsonb, uuid)', 'execute')
