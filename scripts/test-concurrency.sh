@@ -33,15 +33,16 @@ CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(n
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
-ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id)
+ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
 ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select coalesce((select block_oversell from settings where id), false)::text")
+ORIGINAL_DISCOUNT_CAP=$(psql_run -c "select coalesce((select staff_discount_cap from settings where id), 20)")
 RACE_DIR=$(mktemp -d)
 
 cleanup() {
   psql_run <<SQL >/dev/null
-    update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL} where id;
+    update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP} where id;
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
@@ -52,6 +53,7 @@ cleanup() {
     delete from inventory_txns  where product_id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
                                                      '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}');
     delete from product_units   where product_id = '${UNIT_PRODUCT}';
+    delete from discount_approvals where id = '${APPROVAL}';
     delete from sale_payments   where sale_id in (select id from run_sales);
     delete from sale_lines      where sale_id in (select id from run_sales);
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
@@ -279,6 +281,17 @@ n=$(race "select receive_units('${UNIT_PRODUCT}', '[\"${UPC}\"]'::jsonb)" \
          "select receive_units('${UNIT_PRODUCT}', '[\"0${UPC}\"]'::jsonb)")
 check "one unit barcode (UPC-A vs EAN-13) received by two registers at once" "$n" \
   "$(psql_run -c "select count(*) from product_units where barcode in ('${UPC}', '0${UPC}')") unit(s) with that code"
+
+# 12. One admin approval for a discount over the staff limit, used by two
+#     registers at once: one sale goes through, and the approval names it.
+psql_run -c "update settings set staff_discount_cap = 20, block_oversell = false where id" >/dev/null
+psql_run -c "insert into discount_approvals (id, approved_by, max_percent) values ('${APPROVAL}', '${STAFF}', 60)" >/dev/null
+HALF_TOTAL=$(psql_run -c "select round(10 * (1 + ${TAX_RATE} / 100.0), 2)")
+n=$(race "${AS_STAFF}; select record_sale('[{\"product_id\":\"${PRODUCT}\",\"qty\":1,\"unit_price\":20,
+            \"discount\":0.5,\"discount_reason\":\"Damaged\"}]'::jsonb,
+            null, '[{\"method\":\"cash\",\"amount\":${HALF_TOTAL}}]'::jsonb, '${RUN_TAG}', null, '${APPROVAL}')")
+check "one discount approval used by two registers at once" "$n" \
+  "$(psql_run -c "select count(*) from sales where discount_approved_by = '${STAFF}' and note = '${RUN_TAG}'") sale(s) approved"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

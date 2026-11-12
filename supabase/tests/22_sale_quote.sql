@@ -163,9 +163,9 @@ select throws_ok(
   '42501', null, 'an account waiting for approval can''t get a quote');
 select tests.clear_authentication();
 
-select ok(not has_function_privilege('anon', 'quote_sale(jsonb, uuid)', 'execute'),
+select ok(not has_function_privilege('anon', 'quote_sale(jsonb, uuid, jsonb, uuid)', 'execute'),
           'signed-out visitors can''t call quote_sale');
-select ok(not has_function_privilege('authenticated', 'sale_totals(jsonb)', 'execute')
+select ok(not has_function_privilege('authenticated', 'sale_totals(jsonb, jsonb)', 'execute')
           and not has_function_privilege('authenticated', 'require_sale_line(jsonb)', 'execute'),
           'the internal helpers aren''t callable by signed-in users');
 

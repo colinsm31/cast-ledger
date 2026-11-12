@@ -54,7 +54,9 @@ create temp table q2 as
 select quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":15,"price_reason":"  Price match "}]'::jsonb, null) as q;
 select is((select q->'problems' from q2), '[]'::jsonb, 'a reason clears the problem');
 select is((select q->'lines'->0 from q2),
-          '{"line_total": 15, "taxable": true, "list_price": 20.00, "price_changed": true, "price_reason": "Price match"}'::jsonb,
+          '{"line_total": 15, "taxable": true, "list_price": 20.00, "price_changed": true, "price_reason": "Price match",
+            "price_before_discount": 15, "line_discount_each": 0, "ticket_discount_each": 0, "unit_price": 15,
+            "discount_reason": null, "discount_percent": 25.00}'::jsonb,
           'the quote shows the change and the trimmed reason');
 select is((select (q->>'total')::numeric from q2), 16.24, 'and totals the changed price');
 
