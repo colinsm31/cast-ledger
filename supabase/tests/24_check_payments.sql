@@ -141,7 +141,7 @@ select throws_ok(
   '23514', null, 'only checks have a number');
 select ok(not has_function_privilege('authenticated', 'require_check_number(text)', 'execute'),
           'the check number rule is internal');
-select ok(not has_function_privilege('anon', 'record_sale(jsonb, uuid, jsonb, text)', 'execute'),
+select ok(not has_function_privilege('anon', 'record_sale(jsonb, uuid, jsonb, text, jsonb, uuid)', 'execute'),
           'signed-out visitors still can''t record a sale');
 
 select * from finish();

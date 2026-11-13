@@ -87,7 +87,8 @@ select tests.create_staff('00000000-0000-0000-0000-0000000000a1', 'staff@test.lo
 select tests.create_staff('00000000-0000-0000-0000-0000000000a2', 'admin@test.local', 'admin');
 
 update settings
-   set tax_rate = 8.25, tax_stringing = false, block_oversell = false, stringing_labor = 0
+   set tax_rate = 8.25, tax_stringing = false, block_oversell = false, stringing_labor = 0,
+       staff_discount_cap = 100
  where id;
 
 insert into categories (id, name, sort_order, serialized_default) values
