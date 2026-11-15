@@ -1,5 +1,5 @@
 -- Discounts: one number per line or ticket (1 = 100%, below 1 = fraction,
--- above 1 = dollars each), each with a reason; a staff limit counting price
+-- above 1 = dollars each), a reason optional (0062); a staff limit counting price
 -- changes and discounts; one-time admin approvals; refunds and the report
 -- (Phase 2B).
 begin;
@@ -49,11 +49,14 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 -- ---------------------------------------------------------------------------
 select is(
   (quote_sale(jsonb_build_array(tests.line(1, 20, 0.1)), null))->'problems',
-  '[{"line": 0, "message": "Discount: give a reason"}]'::jsonb,
-  'a discount without a reason is a problem');
-select throws_like(
-  $$ select record_sale(jsonb_build_array(tests.line(1, 20, 0.1)), null, '[{"method":"cash","amount":19.49}]'::jsonb, null) $$,
-  'The discount on line 1 needs a reason', 'and recording it is refused');
+  '[]'::jsonb,
+  'a discount doesn''t need a reason');
+create temp table no_reason_line as
+  select record_sale(jsonb_build_array(tests.line(1, 20, 0.1)), null, '[{"method":"cash","amount":19.49}]'::jsonb, null) as id;
+select results_eq(
+  $$ select unit_price, discount_reason from sale_lines where sale_id = (select id from no_reason_line) $$,
+  $$ values (18.00::numeric, null::text) $$,
+  'and is recorded without one');
 
 create temp table q1 as select quote_sale(jsonb_build_array(tests.line(1, 20, 0.1, '  Promotion ')), null) as q;
 select results_eq(
@@ -121,11 +124,15 @@ select results_eq(
   'the ticket discount doesn''t touch a gift card');
 select is(
   (quote_sale(jsonb_build_array(tests.line(1, 20)), null, '{"discount":0.1}'))->'problems',
-  '[{"line": null, "message": "Ticket discount: give a reason"}]'::jsonb,
-  'a ticket discount needs a reason');
-select throws_like(
-  $$ select record_sale(jsonb_build_array(tests.line(1, 20)), null, '[{"method":"cash","amount":19.49}]'::jsonb, null, '{"discount":0.1}') $$,
-  'The ticket discount needs a reason', 'and recording it without one is refused');
+  '[]'::jsonb,
+  'a ticket discount doesn''t need a reason');
+create temp table no_reason_ticket as
+  select record_sale(jsonb_build_array(tests.line(1, 20)), null, '[{"method":"cash","amount":19.49}]'::jsonb, null,
+                     '{"discount":0.1}') as id;
+select results_eq(
+  $$ select ticket_discount, ticket_discount_reason from sales where id = (select id from no_reason_ticket) $$,
+  $$ values (0.1::numeric, null::text) $$,
+  'and is recorded without one');
 
 create temp table s2 as
 select record_sale(jsonb_build_array(tests.line(1, 20)), null, '[{"method":"cash","amount":19.49}]'::jsonb, null,

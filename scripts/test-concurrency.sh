@@ -33,7 +33,7 @@ CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(n
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
-ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id)
+ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id); HELD=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
 ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select coalesce((select block_oversell from settings where id), false)::text")
@@ -54,6 +54,7 @@ cleanup() {
                                                      '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}');
     delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from discount_approvals where id = '${APPROVAL}';
+    delete from held_tickets    where id = '${HELD}';
     delete from sale_payments   where sale_id in (select id from run_sales);
     delete from sale_lines      where sale_id in (select id from run_sales);
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
@@ -292,6 +293,13 @@ n=$(race "${AS_STAFF}; select record_sale('[{\"product_id\":\"${PRODUCT}\",\"qty
             null, '[{\"method\":\"cash\",\"amount\":${HALF_TOTAL}}]'::jsonb, '${RUN_TAG}', null, '${APPROVAL}')")
 check "one discount approval used by two registers at once" "$n" \
   "$(psql_run -c "select count(*) from sales where discount_approved_by = '${STAFF}' and note = '${RUN_TAG}'") sale(s) approved"
+
+# 13. One held ticket recalled at two registers at once: one gets it.
+psql_run -c "insert into held_tickets (id, name, ticket, held_by, expires_at)
+  values ('${HELD}', '${RUN_TAG}', '{\"lines\":[{\"key\":\"k\",\"qty\":1}]}', '${STAFF}', now() + interval '1 hour')" >/dev/null
+n=$(race "${AS_STAFF}; select recall_held_ticket('${HELD}')")
+check "one held ticket recalled at two registers at once" "$n" \
+  "$(psql_run -c "select count(*) from held_tickets where id = '${HELD}'") left on hold"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
