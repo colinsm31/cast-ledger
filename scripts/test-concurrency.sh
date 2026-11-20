@@ -45,6 +45,7 @@ cleanup() {
     update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP} where id;
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
+    delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refund_lines    where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refunds         where sale_id in (select id from run_sales);

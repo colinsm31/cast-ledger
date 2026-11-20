@@ -24,6 +24,8 @@ select is(
     'quote_sale',
     'receive_stock', 'receive_units', 'record_refund', 'record_sale',
     'require_staff',
+    -- writes: calls require_staff() (0067)
+    'set_unit_status',
     -- checks is_admin() first
     'set_user_role',
     -- read-only: call require_staff()
