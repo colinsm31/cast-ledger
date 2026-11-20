@@ -92,11 +92,12 @@ select throws_like(
        (select id from original_sale), (select job_line from lines)),
   '%Only product lines can be returned%', 'stringing lines are not refundable yet');
 
+-- Frames can be returned since 0070 (test 40), one per line.
 select throws_like(
-  format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":1}]'::jsonb,
-       '[{"method":"credit","amount":270.63}]'::jsonb, null, null) $$,
+  format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":2}]'::jsonb,
+       '[{"method":"credit","amount":541.25}]'::jsonb, null, null) $$,
        (select id from original_sale), (select unit_line from lines)),
-  '%serialized%not supported yet%', 'serialized unit returns are not supported yet');
+  '%A racquet frame is returned one at a time (qty 1)%', 'a frame line returns one frame');
 
 select throws_like(
   format($$ select record_refund('%s', '[]'::jsonb, '[]'::jsonb, null, null) $$, (select id from original_sale)),
