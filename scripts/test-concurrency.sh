@@ -45,6 +45,7 @@ cleanup() {
     update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP} where id;
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
+    delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refund_lines    where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refunds         where sale_id in (select id from run_sales);
@@ -52,11 +53,11 @@ cleanup() {
     delete from store_credit_txns where customer_id = '${CUSTOMER}';
     delete from inventory_txns  where product_id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
                                                      '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}');
-    delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from discount_approvals where id = '${APPROVAL}';
     delete from held_tickets    where id = '${HELD}';
     delete from sale_payments   where sale_id in (select id from run_sales);
     delete from sale_lines      where sale_id in (select id from run_sales);
+    delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}');
     delete from sales           where id in (select id from run_sales);
@@ -300,6 +301,20 @@ psql_run -c "insert into held_tickets (id, name, ticket, held_by, expires_at)
 n=$(race "${AS_STAFF}; select recall_held_ticket('${HELD}')")
 check "one held ticket recalled at two registers at once" "$n" \
   "$(psql_run -c "select count(*) from held_tickets where id = '${HELD}'") left on hold"
+
+# 14. One sold racquet frame returned at two registers at once: one return
+#     goes through and the frame is back in stock once (0070).
+FRAME_CODE="${RUN_TAG}-frame"
+psql_run -c "select receive_units('${UNIT_PRODUCT}', '[\"${FRAME_CODE}\"]'::jsonb)" >/dev/null
+FRAME=$(psql_run -c "select id from product_units where barcode = '${FRAME_CODE}'")
+FRAME_TOTAL=$(psql_run -c "select round(200 * (1 + ${TAX_RATE} / 100.0), 2)")
+FRAME_SALE=$(psql_run -c "select record_sale('[{\"product_id\":\"${UNIT_PRODUCT}\",\"product_unit_id\":\"${FRAME}\",
+  \"qty\":1,\"unit_price\":200}]'::jsonb, null, '[{\"method\":\"cash\",\"amount\":${FRAME_TOTAL}}]'::jsonb, '${RUN_TAG}')")
+FRAME_LINE=$(psql_run -c "select id from sale_lines where sale_id = '${FRAME_SALE}'")
+n=$(race "select record_refund('${FRAME_SALE}', '[{\"sale_line_id\":\"${FRAME_LINE}\",\"qty\":1}]'::jsonb,
+  '[{\"method\":\"cash\",\"amount\":${FRAME_TOTAL}}]'::jsonb, null, null)")
+check "one racquet frame returned by two registers at once" "$n" \
+  "$(psql_run -c "select status || ', ' || (select count(*) from unit_status_changes where product_unit_id = '${FRAME}' and from_status = 'sold') || ' return(s) in its history' from product_units where id = '${FRAME}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

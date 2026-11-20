@@ -17,6 +17,8 @@ select is(
   array[
     -- write data: the 0041 trigger refuses non-staff writes
     'add_store_credit', 'adjust_gift_card', 'adjust_stock', 'advance_string_job',
+    -- write: call require_staff() (0068)
+    'assign_unit_label',
     'cancel_string_job', 'change_paid_string_job', 'ensure_gift_card',
     -- answer only about the caller
     'is_admin', 'is_staff',
@@ -24,6 +26,8 @@ select is(
     'quote_sale',
     'receive_stock', 'receive_units', 'record_refund', 'record_sale',
     'require_staff',
+    -- writes: calls require_staff() (0067)
+    'set_unit_barcode', 'set_unit_status',
     -- checks is_admin() first
     'set_user_role',
     -- read-only: call require_staff()
