@@ -78,7 +78,7 @@ select is((select tax from refunds where id = (select grip_refund from r2)),
           1.65::numeric, 'the overgrip, refunded later, gives back all the tax the sale charged');
 
 select throws_like($$ select tests.refund_line((select id from s), (select card from l), 25) $$,
-                   'Only product and stringing lines can be returned', 'a gift card load isn''t refunded this way');
+                   'Refunding a gift card load needs an admin''s approval', 'a gift card load needs an admin (0075, test 45)');
 
 -- ---------------------------------------------------------------------------
 -- Strung and waiting, then delivered
