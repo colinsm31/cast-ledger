@@ -27,7 +27,10 @@ select is(
     'is_admin', 'is_staff',
     -- read-only: calls require_staff()
     'quote_sale',
-    'receive_stock', 'receive_units', 'record_refund', 'record_sale',
+    'receive_stock', 'receive_units',
+    -- writes: calls require_staff() (0077)
+    'record_exchange',
+    'record_refund', 'record_sale',
     'require_staff',
     -- writes: call require_staff() (0076)
     'set_customer_active',

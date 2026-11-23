@@ -47,6 +47,7 @@ cleanup() {
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
     delete from demo_loans      where customer_id = '${CUSTOMER}';
+    delete from exchanges       where sale_id in (select id from run_sales);
     delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refund_lines    where refund_id in (select id from refunds where sale_id in (select id from run_sales));
@@ -327,6 +328,17 @@ psql_run -c "select set_unit_status('${DEMO}', 'demo', 'Demo fleet')" >/dev/null
 n=$(race "select check_out_demo('${DEMO}', '${CUSTOMER}')")
 check "one demo frame lent by two registers at once" "$n" \
   "$(psql_run -c "select count(*) || ' loan(s), frame ' || (select status from product_units where id = '${DEMO}') from demo_loans where product_unit_id = '${DEMO}'")"
+
+# 16. One sold item exchanged at two registers at once: one exchange goes
+#     through, the other is told the item is already returned (0077).
+SWAP_TOTAL=$(psql_run -c "select round(20 * (1 + ${TAX_RATE} / 100.0), 2)")
+SWAP_SALE=$(psql_run -c "select record_sale('[{\"product_id\":\"${PRODUCT}\",\"qty\":1,\"unit_price\":20}]'::jsonb,
+  '${CUSTOMER}', '[{\"method\":\"cash\",\"amount\":${SWAP_TOTAL}}]'::jsonb, '${RUN_TAG}')")
+SWAP_LINE=$(psql_run -c "select id from sale_lines where sale_id = '${SWAP_SALE}'")
+n=$(race "select record_exchange('${SWAP_SALE}', '[{\"sale_line_id\":\"${SWAP_LINE}\",\"qty\":1}]'::jsonb,
+  '[{\"product_id\":\"${PRODUCT}\",\"qty\":1,\"unit_price\":20}]'::jsonb, '${CUSTOMER}', '[]'::jsonb, '[]'::jsonb, null)")
+check "one sold item exchanged by two registers at once" "$n" \
+  "$(psql_run -c "select count(*) from exchanges e join refunds r on r.id = e.refund_id where r.sale_id = '${SWAP_SALE}'") exchange(s)"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
