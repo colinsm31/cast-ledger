@@ -2,7 +2,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(31);
+select plan(33);
 
 -- Two frames in the demo fleet, one in stock.
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
@@ -121,6 +121,14 @@ select is(
 select throws_like($$ insert into demo_loans (product_unit_id, customer_id, due_back_at)
                       values ((select one from u), '00000000-0000-0000-0000-0000000000c1', now() + interval '1 day') $$,
                    '%permission denied%', 'staff can''t write loans directly');
+
+select tests.clear_authentication();
+select tests.create_staff('00000000-0000-0000-0000-0000000000a3', 'pending@test.local', 'pending');
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a3');
+select throws_ok($$ select check_out_demo((select one from u), '00000000-0000-0000-0000-0000000000c1') $$,
+                 '42501', null, 'an account waiting for approval can''t lend demos');
+select throws_ok($$ select check_in_demo((select first from l)) $$,
+                 '42501', null, 'or check them in');
 
 select tests.act_as_anon();
 select throws_like($$ select check_out_demo('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000c1') $$,

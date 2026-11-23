@@ -2,7 +2,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(7);
+select plan(10);
 
 -- A second racquet model, and a second customer.
 insert into products (id, category_id, brand, name, sell_price) values
@@ -68,16 +68,56 @@ select is((select sale_id from demo_loans where id = (select loan from l)), (sel
           'and leaves the earlier link alone');
 
 -- ---------------------------------------------------------------------------
--- An old demo
+-- A refund leaves the link
+-- ---------------------------------------------------------------------------
+select record_refund((select sale from s), jsonb_build_array(jsonb_build_object(
+         'sale_line_id', (select id from sale_lines where sale_id = (select sale from s)), 'qty', 1)),
+       '[{"method":"cash","amount":270.63}]'::jsonb, 'Changed mind', null);
+select is((select sale_id from demo_loans where id = (select loan from l)), (select sale from s),
+          'returning the frame bought keeps the demo''s link to the sale');
+
+-- ---------------------------------------------------------------------------
+-- When a demo counts: still out, or back in the 30 days before the sale
 -- ---------------------------------------------------------------------------
 select tests.clear_authentication();
-update demo_loans set sale_id = null where id <> (select loan from l);
-update demo_loans set out_at = now() - interval '31 days' where id <> (select loan from l);
-update product_units set status = 'in_stock', sale_id = null, customer_id = null where id = (select demo from u);
-select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
-select tests.sell_frame((select demo from u), '00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000c1');
+create function tests.resell_demo_frame() returns void language plpgsql as $$
+begin
+  perform tests.clear_authentication();
+  update demo_loans set sale_id = null where id <> (select loan from l);
+  update product_units set status = 'in_stock', sale_id = null, customer_id = null where id = (select demo from u);
+  perform tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+  perform tests.sell_frame((select demo from u), '00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000c1');
+end $$;
+grant execute on function tests.resell_demo_frame() to authenticated;
+
+select tests.clear_authentication();
+update demo_loans set out_at = now() - interval '40 days', back_at = now() - interval '31 days' where id <> (select loan from l);
+select tests.resell_demo_frame();
 select is((select sale_id from demo_loans where id <> (select loan from l)), null::uuid,
-          'a demo taken out more than 30 days before doesn''t count');
+          'a demo back more than 30 days before doesn''t count');
+
+select tests.clear_authentication();
+update demo_loans set back_at = now() - interval '5 days' where id <> (select loan from l);
+select tests.resell_demo_frame();
+select isnt((select sale_id from demo_loans where id <> (select loan from l)), null::uuid,
+            'a long loan bought soon after it came back counts');
+
+-- ---------------------------------------------------------------------------
+-- One demo per racquet per sale
+-- ---------------------------------------------------------------------------
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+select receive_units('00000000-0000-0000-0000-0000000000b3', '["OD-1", "OD-2", "OB-1", "OB-2"]');
+select set_unit_status(id, 'demo', 'Demo fleet') from product_units where barcode in ('OD-1', 'OD-2');
+select check_in_demo(check_out_demo(id, '00000000-0000-0000-0000-0000000000c1'))
+  from product_units where barcode in ('OD-1', 'OD-2');
+create temp table pair as select record_sale(
+  (select jsonb_agg(jsonb_build_object('product_id', '00000000-0000-0000-0000-0000000000b3', 'product_unit_id', id,
+                                       'qty', 1, 'unit_price', 250))
+     from product_units where barcode in ('OB-1', 'OB-2')),
+  '00000000-0000-0000-0000-0000000000c1', '[{"method":"cash","amount":541.25}]'::jsonb, null) as sale;
+grant select on pair to authenticated;
+select is((select count(*)::int from demo_loans where sale_id = (select sale from pair)), 1,
+          'two frames bought on one sale credit one demo, not both');
 
 select throws_like($$ update demo_loans set sale_id = null $$, '%permission denied%',
                    'staff can''t change a demo''s sale directly');
