@@ -2,7 +2,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(15);
+select plan(20);
 
 create function tests.refund_load(p_sale uuid, p_amount numeric, p_approval uuid default null,
                                   p_method text default 'cash', p_card uuid default null, p_qty integer default 1)
@@ -42,14 +42,21 @@ select lives_ok(
 -- ---------------------------------------------------------------------------
 select throws_like($$ select tests.refund_load((select a from s), 50) $$,
                    'Refunding a gift card load needs an admin''s approval', 'staff can''t refund a load alone');
-select throws_ok($$ select approve_refund() $$, '42501', 'Only an admin can approve refunding a gift card load',
+select throws_ok($$ select approve_refund((select a from s), 50) $$, '42501', 'Only an admin can approve refunding a gift card load',
                  'staff can''t approve it themselves');
 select throws_ok($$ insert into refund_approvals default values $$, '42501', null,
                  'or write an approval directly');
 
 select tests.clear_authentication();
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
-create temp table ap as select approve_refund() as first, approve_refund() as second;
+create temp table ap as select approve_refund((select a from s), 50) as first,
+                               approve_refund((select c from s), 20) as second,
+                               approve_refund((select a from s), 20) as wrong_amount,
+                               approve_refund((select c from s), 50) as other_sale;
+select throws_like($$ select approve_refund((select a from s), 0) $$,
+                   'The approved amount must be a positive amount in cents', 'an approval names a real amount');
+select throws_ok($$ insert into refund_approvals (sale_id) values ((select a from s)) $$, '42501', null,
+                 'and can''t be written without one');
 grant select on ap to authenticated;
 select tests.clear_authentication();
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
@@ -59,6 +66,14 @@ select throws_like($$ select tests.refund_load((select a from s), 100, (select f
 select throws_like($$ select tests.refund_load((select a from s), 50, (select first from ap), 'gift_card',
                                                '00000000-0000-0000-0000-0000000000e1') $$,
                    'A refunded load can''t go back onto the same gift card', 'the money doesn''t go back onto the card');
+select throws_like($$ select tests.refund_load((select a from s), 50, (select wrong_amount from ap)) $$,
+                   'The admin approved refunding $20.00 of gift card loads, not $50.00: ask again',
+                   'an approval for $20 doesn''t refund a $50 load');
+select throws_like($$ select tests.refund_load((select a from s), 50, (select other_sale from ap)) $$,
+                   'The admin approved a refund on another sale: ask again',
+                   'an approval for one sale doesn''t refund another');
+select throws_like($$ select tests.refund_load((select a from s), 50, gen_random_uuid()) $$,
+                   'The admin approval has expired or been used: ask again', 'an unknown approval is refused');
 select throws_like($$ select tests.refund_load((select b from s), 30, (select first from ap)) $$,
                    'Gift card GC-45B has $25.00 left of this $30.00 load: only an unused load can be refunded',
                    'a load that''s been partly spent isn''t refunded');
