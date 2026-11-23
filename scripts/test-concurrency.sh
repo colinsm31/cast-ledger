@@ -15,7 +15,8 @@
 # paid job's strings changed twice at once (charging the difference twice),
 # a string change racing "Mark complete", a stock adjustment racing a sale of
 # the last unit (block overselling on), and two registers receiving units with
-# the same barcode at once.
+# the same barcode at once, the same sold frame returned twice, and the same
+# demo frame lent twice.
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -45,6 +46,7 @@ cleanup() {
     update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP} where id;
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
+    delete from demo_loans      where customer_id = '${CUSTOMER}';
     delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
     delete from refund_lines    where refund_id in (select id from refunds where sale_id in (select id from run_sales));
@@ -315,6 +317,16 @@ n=$(race "select record_refund('${FRAME_SALE}', '[{\"sale_line_id\":\"${FRAME_LI
   '[{\"method\":\"cash\",\"amount\":${FRAME_TOTAL}}]'::jsonb, null, null)")
 check "one racquet frame returned by two registers at once" "$n" \
   "$(psql_run -c "select status || ', ' || (select count(*) from unit_status_changes where product_unit_id = '${FRAME}' and from_status = 'sold') || ' return(s) in its history' from product_units where id = '${FRAME}'")"
+
+# 15. One demo frame lent at two registers at once: one loan goes out, the
+#     other register is told it's already out (0071).
+DEMO_CODE="${RUN_TAG}-demo"
+psql_run -c "select receive_units('${UNIT_PRODUCT}', '[\"${DEMO_CODE}\"]'::jsonb)" >/dev/null
+DEMO=$(psql_run -c "select id from product_units where barcode = '${DEMO_CODE}'")
+psql_run -c "select set_unit_status('${DEMO}', 'demo', 'Demo fleet')" >/dev/null
+n=$(race "select check_out_demo('${DEMO}', '${CUSTOMER}')")
+check "one demo frame lent by two registers at once" "$n" \
+  "$(psql_run -c "select count(*) || ' loan(s), frame ' || (select status from product_units where id = '${DEMO}') from demo_loans where product_unit_id = '${DEMO}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
