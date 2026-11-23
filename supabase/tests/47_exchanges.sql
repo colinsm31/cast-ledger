@@ -145,9 +145,13 @@ select throws_like(
   $$ select record_sale(jsonb_build_array(tests.line('00000000-0000-0000-0000-0000000000b1', 1, 20)), null,
                         '[{"method":"exchange","amount":21.65}]'::jsonb, null) $$,
   'Invalid payment method "exchange"', 'only an exchange pays by exchange');
+create temp table g as select record_sale(jsonb_build_array(tests.line('00000000-0000-0000-0000-0000000000b7', 1, 30)),
+  null, '[{"method":"cash","amount":32.48}]'::jsonb, null) as id;
+grant select on g to authenticated;
 select throws_like(
-  $$ select record_refund((select grips from s), '[]'::jsonb, '[{"method":"exchange","amount":1}]'::jsonb, null, null) $$,
-  'A refund needs at least one line', 'a refund needs lines');
+  $$ select record_refund((select id from g), tests.return_of((select id from g), '00000000-0000-0000-0000-0000000000b7', 1),
+                          '[{"method":"exchange","amount":32.48}]'::jsonb, null, null) $$,
+  'Invalid refund method "exchange"', 'a refund can''t be paid out as exchange credit');
 select throws_ok($$ insert into exchanges (refund_id, sale_id, credit)
                     select id, sale_id, 0 from refunds limit 1 $$, '42501', null, 'staff can''t write exchanges directly');
 

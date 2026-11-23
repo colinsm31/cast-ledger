@@ -3,7 +3,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(28);
+select plan(35);
 
 insert into customers (id, first_name, last_name) values
   ('00000000-0000-0000-0000-0000000000c2', 'Sam', 'Gone'),
@@ -18,7 +18,7 @@ insert into gift_card_txns (gift_card_id, amount, reason) values ('00000000-0000
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
--- A sale to Sam before he goes inactive, to refund later.
+-- A sale to Sam before they go inactive, to refund later.
 create temp table s as select
   record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]'::jsonb,
               '00000000-0000-0000-0000-0000000000c2', '[{"method":"cash","amount":21.65}]'::jsonb, null) as sam;
@@ -86,9 +86,9 @@ select throws_like(
   'Sam Gone is inactive, so they can''t borrow a demo%', 'no demo for Sam');
 
 select is((select count(*)::int from search_customers('Gone')), 0, 'the register''s search leaves Sam out');
-select is((select count(*)::int from search_customers('Gone', 8, true)), 1, 'the customer list can still find him');
+select is((select count(*)::int from search_customers('Gone', 8, true)), 1, 'the customer list can still find them');
 select is((select count(*)::int from sales where customer_id = '00000000-0000-0000-0000-0000000000c2'), 1,
-          'his sales stay in history');
+          'their sales stay in history');
 
 -- ---------------------------------------------------------------------------
 -- And back again
@@ -121,6 +121,47 @@ select throws_like($$ select adjust_gift_card('00000000-0000-0000-0000-000000000
                    'Gift card GC-LOST is inactive%', 'or adjusted');
 select throws_like($$ insert into gift_cards (code, is_active) values ('GC-NEW', false) $$,
                    '%permission denied%', 'staff can''t write cards directly');
+
+-- An unused load still comes back off a card made inactive (0075).
+select tests.clear_authentication();
+insert into gift_cards (id, code) values ('00000000-0000-0000-0000-0000000000e2', 'GC-46B');
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+create temp table load_sale as select record_sale(
+  '[{"gift_card_id":"00000000-0000-0000-0000-0000000000e2","qty":1,"unit_price":25}]'::jsonb, null,
+  '[{"method":"cash","amount":25}]'::jsonb, null) as id;
+grant select on load_sale to authenticated;
+select lives_ok($$ select set_gift_card_active('00000000-0000-0000-0000-0000000000e2', false, 'Loaded by mistake') $$,
+                'a card loaded by mistake is made inactive');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
+select lives_ok(
+  $$ select record_refund((select id from load_sale),
+       jsonb_build_array(jsonb_build_object('sale_line_id', (select id from sale_lines where sale_id = (select id from load_sale)), 'qty', 1)),
+       '[{"method":"cash","amount":25}]'::jsonb, 'Loaded by mistake', null) $$,
+  'its unused load is refunded all the same');
+select is((select balance from gift_card_balance where gift_card_id = '00000000-0000-0000-0000-0000000000e2'), 0::numeric,
+          'leaving the inactive card empty');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+
+-- A found card is made active again and can be spent.
+select lives_ok($$ select set_gift_card_active('00000000-0000-0000-0000-0000000000e1', true) $$,
+                'the lost card is found and made active again');
+select results_eq(
+  $$ select is_active, deactivated_reason from gift_cards where id = '00000000-0000-0000-0000-0000000000e1' $$,
+  $$ values (true, null::text) $$, 'its reason is cleared');
+select lives_ok(
+  $$ select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]'::jsonb, null,
+       '[{"method":"gift_card","amount":20,"gift_card_id":"00000000-0000-0000-0000-0000000000e1"},
+         {"method":"cash","amount":1.65}]'::jsonb, null) $$,
+  'and it can be spent again');
+
+-- A demo out stops a customer being made inactive.
+select check_out_demo((select id from product_units where barcode = 'DEMO-46'), '00000000-0000-0000-0000-0000000000c1',
+                      now() + interval '2 days', null, null);
+select throws_like($$ select set_customer_active('00000000-0000-0000-0000-0000000000c1', false, 'Moved away') $$,
+                   'This customer has a demo out: settle it before making them inactive',
+                   'a customer with a demo out stays active until it''s back');
 
 insert into customers (id, first_name, last_name, is_active, deactivated_reason)
 values ('00000000-0000-0000-0000-0000000000c4', 'New', 'Person', false, 'Sneaky');
