@@ -17,7 +17,8 @@
 # the last unit (block overselling on), and two registers receiving units with
 # the same barcode at once, the same sold frame returned twice, the same
 # demo frame lent twice, the same item exchanged twice, and a job's charge
-# refunded while its strings are changed (which must queue, not deadlock).
+# refunded while its strings are changed (which must queue, not deadlock),
+# and a demo lent while its customer is being made inactive.
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -35,7 +36,7 @@ CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(n
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
-RACKET_7=$(new_id); JOB_7=$(new_id)
+RACKET_7=$(new_id); JOB_7=$(new_id); CUSTOMER_2=$(new_id)
 ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id); HELD=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
@@ -51,7 +52,7 @@ cleanup() {
     drop function if exists concurrency_test_pause();
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
-    delete from demo_loans      where customer_id = '${CUSTOMER}';
+    delete from demo_loans      where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}');
     delete from exchanges       where sale_id in (select id from run_sales);
     delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
     delete from refund_payments where refund_id in (select id from refunds where sale_id in (select id from run_sales));
@@ -74,7 +75,7 @@ cleanup() {
     delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
                                              '${RACKET_5}', '${RACKET_6}', '${RACKET_7}');
     delete from gift_cards      where id = '${GIFT_CARD}';
-    delete from customers       where id = '${CUSTOMER}';
+    delete from customers       where id in ('${CUSTOMER}', '${CUSTOMER_2}');
     delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
                                              '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}', '${UNIT_PRODUCT}');
     delete from categories      where id in ('${CATEGORY}', '${RACQUET_CATEGORY}');
@@ -385,6 +386,21 @@ else
   check "a job's charge refunded while its strings change" 1 \
     "no deadlock; job $(psql_run -c "select status from string_jobs where id = '${JOB_7}'")"
 fi
+
+# 18. A customer made inactive at one register while a demo is lent to them
+#     at another (0080): the demo waits for the deactivation and is refused,
+#     so no inactive customer has a demo out.
+psql_run -c "insert into customers (id, first_name, last_name) values ('${CUSTOMER_2}', 'Concurrency', 'Leaving')" >/dev/null
+DEMO_2_CODE="${RUN_TAG}-demo-2"
+psql_run -c "select receive_units('${UNIT_PRODUCT}', '[\"${DEMO_2_CODE}\"]'::jsonb)" >/dev/null
+DEMO_2=$(psql_run -c "select id from product_units where barcode = '${DEMO_2_CODE}'")
+psql_run -c "select set_unit_status('${DEMO_2}', 'demo', 'Demo fleet')" >/dev/null
+n=$(race "${AS_STAFF}; select set_customer_active('${CUSTOMER_2}', false, 'Moved away')" \
+         "select check_out_demo('${DEMO_2}', '${CUSTOMER_2}')")
+check "a demo lent while its customer is made inactive" "$n" \
+  "$(psql_run -c "select case when is_active then 'active' else 'inactive' end || ' with ' ||
+    (select count(*) from demo_loans where customer_id = '${CUSTOMER_2}' and back_at is null) || ' demo(s) out'
+    from customers where id = '${CUSTOMER_2}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
