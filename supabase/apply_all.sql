@@ -13348,4 +13348,2068 @@ revoke all on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) from p
 grant execute on function quote_sale(jsonb, uuid, jsonb, uuid) to authenticated;
 grant execute on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) to authenticated;
 
+-- >>> supabase/migrations/0063_string_job_promise.sql
+-- =============================================================================
+-- 0063_string_job_promise.sql — promised time and rush on string jobs
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • A string job had no due time. The open queue was in drop-off order, so a
+--     job promised for this afternoon looked the same as one due next week.
+--
+-- Now:
+--   1. string_jobs.promised_at: when the customer was told it would be ready.
+--      A new job without one is promised settings.stringing_turnaround_hours
+--      (default 24) after it's taken in.
+--   2. string_jobs.is_rush: a rush job is pinned to the top of the queue.
+--   3. Both can be changed while the job is waiting to be strung, never after.
+--      A promised time can't be cleared, can't be set in the past, and is at
+--      most 90 days after drop-off.
+--
+-- Jobs taken in before this migration keep no promised time. Re-runnable.
+-- =============================================================================
+
+alter table settings add column if not exists stringing_turnaround_hours integer not null default 24;
+alter table settings drop constraint if exists ck_settings_stringing_turnaround_hours;
+alter table settings add constraint ck_settings_stringing_turnaround_hours
+  check (stringing_turnaround_hours between 1 and 720);
+comment on column settings.stringing_turnaround_hours is
+  'How long after drop-off a string job is promised, unless staff set a time';
+
+alter table string_jobs add column if not exists promised_at timestamptz;
+alter table string_jobs add column if not exists is_rush boolean not null default false;
+comment on column string_jobs.promised_at is 'When the customer was told the job would be ready';
+comment on column string_jobs.is_rush is 'A rush job goes to the top of the queue';
+
+create index if not exists ix_string_jobs_open_promised
+  on string_jobs (is_rush desc, promised_at)
+  where status = 'entered';
+
+grant update (promised_at, is_rush) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_promise — the default promise and its rules
+-- -----------------------------------------------------------------------------
+-- Runs after guard_new_string_job (trigger names sort that way), so a client's
+-- new job already has its entered_at.
+create or replace function guard_string_job_promise()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_client boolean := current_user in ('authenticated', 'anon');
+begin
+  if tg_op = 'INSERT' then
+    if new.promised_at is null then
+      new.promised_at := new.entered_at
+        + make_interval(hours => coalesce((select stringing_turnaround_hours from settings where id), 24));
+      return new;
+    end if;
+  else
+    if new.promised_at is not distinct from old.promised_at and new.is_rush = old.is_rush then
+      return new;
+    end if;
+    if v_client and old.status <> 'entered' then
+      raise exception 'The racquet has been strung, so its promised time and rush can''t change';
+    end if;
+    if new.promised_at is null and old.promised_at is not null then
+      raise exception 'A string job needs a promised time';
+    end if;
+    if new.promised_at is not distinct from old.promised_at then
+      return new;
+    end if;
+  end if;
+
+  if v_client then
+    if new.promised_at < now() - interval '5 minutes' then
+      raise exception 'The promised time (%) has already passed', to_char(new.promised_at, 'Mon DD HH24:MI');
+    end if;
+    if new.promised_at > new.entered_at + interval '90 days' then
+      raise exception 'Promise the job within 90 days of drop-off';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_string_job_promise on string_jobs;
+create trigger trg_string_job_promise
+  before insert or update of promised_at, is_rush on string_jobs
+  for each row execute function guard_string_job_promise();
+
+-- >>> supabase/migrations/0064_string_job_assignment.sql
+-- =============================================================================
+-- 0064_string_job_assignment.sql — assign string jobs to a stringer
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • Who strung a job (strung_by) was only recorded when it was finished, so
+--     the queue couldn't show who a waiting job was meant for.
+--
+-- Now:
+--   1. string_jobs.assigned_to: the stringer a waiting job is assigned to, by
+--      the same names as strung_by (the 'stringer' list). It can change while
+--      the job waits to be strung, never after; blank means unassigned.
+--   2. advance_string_job: marking a job complete with no stringer recorded
+--      records the one it was assigned to. Otherwise it's as 0051: explicit
+--      transitions, row lock, a stringer before 'complete', paid before
+--      delivery, owner rights, staff only.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists assigned_to text;
+alter table string_jobs drop constraint if exists ck_string_jobs_assigned_to;
+alter table string_jobs add constraint ck_string_jobs_assigned_to
+  check (assigned_to = trim(assigned_to) and char_length(assigned_to) between 1 and 60);
+comment on column string_jobs.assigned_to is 'The stringer a waiting job is assigned to (null = unassigned)';
+
+grant update (assigned_to) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_assignment — tidy the name; fixed once strung
+-- -----------------------------------------------------------------------------
+create or replace function guard_string_job_assignment()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  new.assigned_to := nullif(trim(new.assigned_to), '');
+  if tg_op = 'UPDATE'
+     and new.assigned_to is distinct from old.assigned_to
+     and old.status <> 'entered'
+     and current_user in ('authenticated', 'anon') then
+    raise exception 'The racquet has been strung, so who it''s assigned to can''t change';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_string_job_assignment on string_jobs;
+create trigger trg_string_job_assignment
+  before insert or update of assigned_to on string_jobs
+  for each row execute function guard_string_job_assignment();
+
+-- -----------------------------------------------------------------------------
+-- advance_string_job — same as 0051, plus: the assigned stringer by default
+-- -----------------------------------------------------------------------------
+create or replace function advance_string_job(
+  p_job_id        uuid,
+  p_target_status text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current  text;
+  v_main     uuid;
+  v_cross    uuid;
+  v_paid     uuid;
+  v_strung   text;
+begin
+  perform require_staff();
+
+  if p_target_status is null
+     or p_target_status not in ('entered', 'complete', 'delivered', 'cancelled') then
+    raise exception 'Invalid status "%"', p_target_status;
+  end if;
+
+  -- Lock the job so a second click (or register) waits, then sees this one's result.
+  select status, main_product_id, cross_product_id, paid_sale_id,
+         coalesce(nullif(trim(strung_by), ''), assigned_to)
+    into v_current, v_main, v_cross, v_paid, v_strung
+    from string_jobs where id = p_job_id
+    for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+
+  if (v_current, p_target_status) not in (('entered', 'complete'), ('complete', 'delivered')) then
+    raise exception 'Cannot move a string job from "%" to "%"', v_current, p_target_status;
+  end if;
+  if p_target_status = 'delivered' and v_paid is null then
+    raise exception 'Take payment for this string job before marking it delivered';
+  end if;
+  if p_target_status = 'complete' and coalesce(trim(v_strung), '') = '' then
+    raise exception 'Record who strung it before marking it complete';
+  end if;
+
+  update string_jobs
+    set status       = p_target_status,
+        strung_by    = case when p_target_status = 'complete'  then v_strung   else strung_by end,
+        completed_at = case when p_target_status = 'complete'  then now()      else completed_at end,
+        completed_by = case when p_target_status = 'complete'  then auth.uid() else completed_by end,
+        delivered_at = case when p_target_status = 'delivered' then now()      else delivered_at end,
+        delivered_by = case when p_target_status = 'delivered' then auth.uid() else delivered_by end
+  where id = p_job_id
+    and status = v_current;
+
+  -- Consume one unit of each distinct catalog string the job used.
+  if p_target_status = 'complete' then
+    insert into inventory_txns (txn_type, product_id, qty, note)
+    select 'consume', pid, -1, 'String job completed'
+    from (
+      select distinct pid
+      from (values (v_main), (v_cross)) as t(pid)
+      where pid is not null
+    ) d;
+  end if;
+
+  return p_target_status;
+end;
+$$;
+
+revoke all on function advance_string_job(uuid, text) from public, anon;
+grant execute on function advance_string_job(uuid, text) to authenticated;
+
+-- >>> supabase/migrations/0065_customer_supplied_string.sql
+-- =============================================================================
+-- 0065_customer_supplied_string.sql — the customer brings their own string
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • Both the mains and the crosses had to be catalog strings, so a job where
+--     the customer brought a set of string couldn't be entered at all.
+--
+-- Now:
+--   1. string_jobs.main_customer_supplied / cross_customer_supplied: that side
+--      uses the customer's own string. It has no catalog product, so no stock
+--      is set aside or used up for it and it adds nothing to the price; its
+--      brand and name are typed in (the name is required, each at most 80
+--      characters). A hybrid can mix the customer's mains with the shop's
+--      crosses, or the other way round.
+--   2. guard_string_job_strings: as 0043 for a shop string; a customer side
+--      needs a name and no product. Whose string a side uses is fixed once
+--      the job is paid (the price was set by it) or strung.
+--   3. guard_strung_job_strings: as 0042, also covering the two new columns.
+--   4. The trigger functions added in 0063 and 0064 can't be called by
+--      anyone, like the other trigger functions (0040).
+--
+-- The strings' price (string_job_strings_price) already skips a side with no
+-- product, so a customer side is labor only. Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists main_customer_supplied boolean not null default false;
+alter table string_jobs add column if not exists cross_customer_supplied boolean not null default false;
+comment on column string_jobs.main_customer_supplied is 'The mains are the customer''s own string (no catalog product)';
+comment on column string_jobs.cross_customer_supplied is 'The crosses are the customer''s own string (no catalog product)';
+
+grant update (main_customer_supplied, cross_customer_supplied) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_strung_job_strings — same as 0042, plus whose string each side is
+-- -----------------------------------------------------------------------------
+create or replace function guard_strung_job_strings()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if old.status <> 'entered'
+     and (new.main_product_id, new.main_brand, new.main_string, new.main_specs, new.main_tension,
+          new.cross_product_id, new.cross_brand, new.cross_string, new.cross_specs, new.cross_tension,
+          new.main_customer_supplied, new.cross_customer_supplied)
+         is distinct from
+         (old.main_product_id, old.main_brand, old.main_string, old.main_specs, old.main_tension,
+          old.cross_product_id, old.cross_brand, old.cross_string, old.cross_specs, old.cross_tension,
+          old.main_customer_supplied, old.cross_customer_supplied) then
+    raise exception 'The strings on a % string job can''t be changed', old.status;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_guard_strung_job_strings on string_jobs;
+create trigger trg_guard_strung_job_strings
+  before update of main_product_id, main_brand, main_string, main_specs, main_tension,
+                   cross_product_id, cross_brand, cross_string, cross_specs, cross_tension,
+                   main_customer_supplied, cross_customer_supplied
+  on string_jobs
+  for each row execute function guard_strung_job_strings();
+
+-- -----------------------------------------------------------------------------
+-- customer_string_side — one customer-supplied side: its tidied brand and name
+-- -----------------------------------------------------------------------------
+create or replace function customer_string_side(
+  p_product_id uuid,
+  p_brand      text,
+  p_name       text,
+  p_side       text
+)
+returns table (brand text, name text)
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_brand text := nullif(trim(p_brand), '');
+  v_name  text := nullif(trim(p_name), '');
+begin
+  if p_product_id is not null then
+    raise exception 'The % are the customer''s own string, so they can''t be a catalog string too', p_side;
+  end if;
+  if v_name is null then
+    raise exception 'Enter the customer''s % string', p_side;
+  end if;
+  if char_length(v_name) > 80 or char_length(coalesce(v_brand, '')) > 80 then
+    raise exception 'The customer''s % string: use at most 80 characters for the brand and the name', p_side;
+  end if;
+  return query select v_brand, v_name;
+end;
+$$;
+
+-- The string guard runs with the caller's rights, so staff can call this; it
+-- only checks and tidies the text it's given.
+revoke all on function customer_string_side(uuid, text, text, text) from public, anon;
+grant execute on function customer_string_side(uuid, text, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_strings — same as 0043, plus customer-supplied sides
+-- -----------------------------------------------------------------------------
+create or replace function guard_string_job_strings()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_main          record;
+  v_cross         record;
+  v_main_shop     boolean := not new.main_customer_supplied;
+  v_cross_shop    boolean := not new.cross_customer_supplied;
+  v_check_main    boolean;
+  v_check_cross   boolean;
+  v_strings_moved boolean;
+  v_new_price     numeric;
+  v_old_price     numeric;
+begin
+  -- Only entered jobs, and only writes by a signed-in user. A strung job's
+  -- strings are refused by trg_guard_strung_job_strings.
+  if auth.uid() is null or new.status <> 'entered' then
+    return new;
+  end if;
+
+  -- A paid job's price was set by whose string it uses.
+  if tg_op = 'UPDATE' and old.paid_sale_id is not null
+     and (new.main_customer_supplied, new.cross_customer_supplied)
+         is distinct from (old.main_customer_supplied, old.cross_customer_supplied) then
+    raise exception 'This job is paid, so whose string it uses can''t change';
+  end if;
+
+  if (v_main_shop and new.main_product_id is null) or (v_cross_shop and new.cross_product_id is null) then
+    raise exception 'Choose the mains and crosses strings from the catalog';
+  end if;
+  if new.main_tension is null or new.cross_tension is null then
+    raise exception 'Enter the mains and crosses tension';
+  end if;
+
+  -- Availability is checked for shop strings the job doesn't already hold.
+  v_check_main := v_main_shop
+    and (tg_op = 'INSERT'
+         or (new.main_product_id is distinct from old.main_product_id
+             and new.main_product_id is distinct from old.cross_product_id));
+  v_check_cross := v_cross_shop
+    and new.cross_product_id is distinct from new.main_product_id
+    and (tg_op = 'INSERT'
+         or (new.cross_product_id is distinct from old.main_product_id
+             and new.cross_product_id is distinct from old.cross_product_id));
+
+  -- Each shop string's check locks it; take them in id order so two registers
+  -- choosing the same pair of strings can't deadlock.
+  if v_main_shop and v_cross_shop and new.cross_product_id < new.main_product_id then
+    select * into v_cross from string_job_side(new.cross_product_id, new.id, v_check_cross, 'crosses');
+    select * into v_main  from string_job_side(new.main_product_id,  new.id, v_check_main,  'mains');
+  else
+    if v_main_shop then
+      select * into v_main from string_job_side(new.main_product_id, new.id, v_check_main, 'mains');
+    else
+      select s.brand, s.name, '{}'::jsonb as specs into v_main
+        from customer_string_side(new.main_product_id, new.main_brand, new.main_string, 'mains') s;
+    end if;
+    if v_cross_shop then
+      select * into v_cross from string_job_side(new.cross_product_id, new.id, v_check_cross, 'crosses');
+    else
+      select s.brand, s.name, '{}'::jsonb as specs into v_cross
+        from customer_string_side(new.cross_product_id, new.cross_brand, new.cross_string, 'crosses') s;
+    end if;
+  end if;
+
+  new.main_brand   := v_main.brand;
+  new.main_string  := v_main.name;
+  new.main_specs   := v_main.specs;
+  new.cross_brand  := v_cross.brand;
+  new.cross_string := v_cross.name;
+  new.cross_specs  := v_cross.specs;
+
+  -- Record the strings' catalog price when they're chosen (not on a
+  -- tension-only edit, so later catalog price changes don't count). A
+  -- customer's string has no product, so it adds nothing.
+  v_strings_moved := tg_op = 'INSERT'
+    or (new.main_product_id, new.cross_product_id) is distinct from (old.main_product_id, old.cross_product_id);
+  if v_strings_moved then
+    v_new_price := string_job_strings_price(new.main_product_id, new.cross_product_id);
+    if tg_op = 'UPDATE' and old.paid_sale_id is not null
+       and coalesce(current_setting('acestock.string_change_job', true), '') <> old.id::text then
+      v_old_price := coalesce(old.strings_price, string_job_strings_price(old.main_product_id, old.cross_product_id));
+      if v_new_price <> v_old_price then
+        raise exception 'This job was paid for strings costing $%; the new strings cost $%. Use String change to settle the difference',
+          to_char(v_old_price, 'FM999999990.00'), to_char(v_new_price, 'FM999999990.00');
+      end if;
+    end if;
+    new.strings_price := v_new_price;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_string_job_strings() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_string_job_strings on string_jobs;
+create trigger trg_guard_string_job_strings
+  before insert or update of main_product_id, main_brand, main_string, main_specs, main_tension,
+                             cross_product_id, cross_brand, cross_string, cross_specs, cross_tension,
+                             main_customer_supplied, cross_customer_supplied
+  on string_jobs
+  for each row execute function guard_string_job_strings();
+
+-- -----------------------------------------------------------------------------
+-- 0063 and 0064's trigger functions, closed like the others
+-- -----------------------------------------------------------------------------
+revoke all on function guard_string_job_promise() from public, anon, authenticated;
+revoke all on function guard_string_job_assignment() from public, anon, authenticated;
+
+-- >>> supabase/migrations/0066_string_job_numbers.sql
+-- =============================================================================
+-- 0066_string_job_numbers.sql — a number for every string job, and scanning
+-- its tag (AceStock, Phase 3A)
+--
+-- Before:
+--   • A string job had no number of its own: staff found it through the
+--     customer or the racquet's tag, and nothing printed could name it.
+--
+-- Now:
+--   1. string_jobs.job_number: a short number, given in order from 1001
+--      (existing jobs are numbered too). It's printed on the job's tag as the
+--      barcode "J1042" and can't be set or changed by anyone.
+--   2. resolve_barcode: as 0045, plus a job tag ("J1042", any case) resolves
+--      to kind 'job' with the job, its customer and (as open_job_id) the job
+--      itself. Every other barcode is looked up first, so an existing code
+--      that happens to look like a job number still finds what it did.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists job_number bigint generated always as identity (start with 1001);
+create unique index if not exists uq_string_jobs_job_number on string_jobs (job_number);
+comment on column string_jobs.job_number is 'The job''s number, printed on its tag as J<number>';
+
+-- -----------------------------------------------------------------------------
+-- resolve_barcode — same as 0045, plus job tags
+-- -----------------------------------------------------------------------------
+create or replace function resolve_barcode(p_code text)
+returns table (
+  kind          text,
+  code          text,
+  id            uuid,      -- the matched thing's id (product / unit / racket / gift card / job)
+  product_id    uuid,      -- for a unit: its catalog product; else null
+  customer_id   uuid,
+  open_job_id   uuid,
+  brand         text,
+  name          text,
+  attributes    jsonb,
+  sell_price    numeric,
+  is_serialized boolean,
+  unit_status   text       -- for a unit: its status; else null
+)
+language plpgsql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_code       text := regexp_replace(coalesce(p_code, ''), '\s+', '', 'g');
+  v_candidates text[];
+  v_product    products%rowtype;
+  v_unit       product_units%rowtype;
+  v_racket     customer_rackets%rowtype;
+  v_gift_card  gift_cards%rowtype;
+  v_job_id     uuid;
+  v_job_number bigint;
+  v_customer   uuid;
+begin
+  if v_code = '' then
+    return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- EAN-13 with a leading zero <-> UPC-A.
+  v_candidates := array[v_code];
+  if v_code ~ '^0[0-9]{12}$' then
+    v_candidates := v_candidates || substr(v_code, 2);
+  elsif v_code ~ '^[0-9]{12}$' then
+    v_candidates := v_candidates || ('0' || v_code);
+  end if;
+
+  -- Product UPC.
+  select * into v_product from products p where p.barcode = any (v_candidates)
+   order by (p.barcode = v_code) desc limit 1;
+  if found then
+    return query select 'product', v_product.barcode, v_product.id, null::uuid, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        v_product.is_serialized, null::text;
+    return;
+  end if;
+
+  -- Individual unit's personal barcode.
+  select * into v_unit from product_units u where u.barcode = any (v_candidates)
+   order by (u.barcode = v_code) desc limit 1;
+  if found then
+    select * into v_product from products p where p.id = v_unit.product_id;
+    return query select 'unit', v_unit.barcode, v_unit.id, v_unit.product_id, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        true, v_unit.status;
+    return;
+  end if;
+
+  -- Customer racket tag (active rackets only).
+  select * into v_racket
+  from customer_rackets r
+  where r.barcode = any (v_candidates) and r.is_active
+  order by (r.barcode = v_code) desc
+  limit 1;
+  if found then
+    return query select 'racket', v_racket.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                        (select j.id from string_jobs j
+                          where j.customer_racket_id = v_racket.id
+                            and j.status in ('entered', 'complete')
+                          order by j.entered_at desc limit 1),
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  select * into v_gift_card from gift_cards g where g.code = any (v_candidates)
+   order by (g.code = v_code) desc limit 1;
+  if found then
+    return query select 'gift_card', v_gift_card.code, v_gift_card.id, null::uuid, v_gift_card.customer_id, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- A string job's tag: J and its number.
+  if v_code ~* '^J[0-9]{1,15}$' then
+    select j.id, j.job_number, r.customer_id into v_job_id, v_job_number, v_customer
+      from string_jobs j
+      join customer_rackets r on r.id = j.customer_racket_id
+     where j.job_number = substr(v_code, 2)::bigint;
+    if found then
+      return query select 'job', 'J' || v_job_number, v_job_id, null::uuid, v_customer, v_job_id,
+                          null::text, null::text, null::jsonb, null::numeric, false, null::text;
+      return;
+    end if;
+  end if;
+
+  return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                      null::text, null::text, null::jsonb, null::numeric, false, null::text;
+end;
+$$;
+
+revoke all on function resolve_barcode(text) from public, anon;
+grant execute on function resolve_barcode(text) to authenticated;
+
+-- >>> supabase/migrations/0067_unit_status_changes.sql
+-- =============================================================================
+-- 0067_unit_status_changes.sql — retire a frame or move it to demo, with a
+-- reason, and keep each frame's history (AceStock, Phase 3B)
+--
+-- Before:
+--   • A frame (product_units row) only changed status when it was sold. A
+--     damaged frame or one set aside as a demo couldn't be taken out of
+--     stock, and nothing recorded why or by whom.
+--
+-- Now:
+--   1. unit_status_changes: every status a frame has had — received, sold,
+--      moved to demo, retired, back in stock — with the reason, the sale (for
+--      a sale), who did it and when. Written by a trigger on product_units, so
+--      sales and receipts are recorded too. Read-only for staff.
+--   2. set_unit_status(unit, status, reason): staff move a frame between
+--      in_stock, demo and retired, giving a reason (at most 200 characters).
+--      'sold' is set by sales (and, later, returns); 'assigned' is left for the
+--      demo program (3C). Owner rights, staff only, the frame locked.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create table if not exists unit_status_changes (
+  id              uuid primary key default gen_random_uuid(),
+  product_unit_id uuid not null references product_units (id),
+  from_status     text,           -- null when the frame was received
+  to_status       text not null,
+  reason          text,
+  sale_id         uuid references sales (id),
+  refund_id       uuid references refunds (id),
+  changed_by      uuid references profiles (id),
+  changed_at      timestamptz not null default now()
+);
+comment on table unit_status_changes is 'Each status a frame has had, with why and who';
+create index if not exists ix_unit_status_changes_unit on unit_status_changes (product_unit_id, changed_at);
+
+alter table unit_status_changes enable row level security;
+drop policy if exists unit_status_changes_staff_select on unit_status_changes;
+create policy unit_status_changes_staff_select on unit_status_changes
+  for select to authenticated using (is_staff());
+revoke all on unit_status_changes from anon;
+revoke insert, update, delete, truncate on unit_status_changes from authenticated;
+grant select on unit_status_changes to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- log_unit_status — record each status a frame takes
+-- -----------------------------------------------------------------------------
+-- The reason and refund come from settings set by the function making the
+-- change (acestock.unit_status_reason, acestock.unit_refund_id) for this
+-- transaction only.
+create or replace function log_unit_status()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'UPDATE' and new.status is not distinct from old.status then
+    return new;
+  end if;
+  insert into unit_status_changes (product_unit_id, from_status, to_status, reason, sale_id, refund_id, changed_by)
+  values (
+    new.id,
+    case when tg_op = 'UPDATE' then old.status end,
+    new.status,
+    nullif(current_setting('acestock.unit_status_reason', true), ''),
+    case when new.status = 'sold' then new.sale_id end,
+    nullif(current_setting('acestock.unit_refund_id', true), '')::uuid,
+    auth.uid()
+  );
+  return new;
+end;
+$$;
+
+revoke all on function log_unit_status() from public, anon, authenticated;
+
+drop trigger if exists trg_log_unit_status on product_units;
+create trigger trg_log_unit_status
+  after insert or update of status on product_units
+  for each row execute function log_unit_status();
+
+-- Frames already in the shop start their history as they are now.
+insert into unit_status_changes (product_unit_id, from_status, to_status, reason, sale_id, changed_at)
+select u.id, null, u.status, 'Status when history began', u.sale_id, u.created_at
+  from product_units u
+ where not exists (select 1 from unit_status_changes c where c.product_unit_id = u.id);
+
+-- -----------------------------------------------------------------------------
+-- set_unit_status — staff move a frame in or out of stock, with a reason
+-- -----------------------------------------------------------------------------
+create or replace function set_unit_status(
+  p_unit_id uuid,
+  p_status  text,
+  p_reason  text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current text;
+  v_reason  text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_staff();
+
+  if p_status is null or p_status not in ('in_stock', 'demo', 'retired') then
+    raise exception 'A frame can be put in stock, in the demo fleet or retired here (not "%")', p_status;
+  end if;
+  if v_reason is null then
+    raise exception 'Give a reason';
+  end if;
+  if char_length(v_reason) > 200 then
+    raise exception 'Keep the reason to 200 characters';
+  end if;
+
+  select status into v_current from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_current = p_status then
+    raise exception 'This frame is already %', replace(p_status, '_', ' ');
+  end if;
+  if v_current not in ('in_stock', 'demo', 'retired') then
+    raise exception 'This frame is %, so it can''t be moved here', v_current;
+  end if;
+
+  perform set_config('acestock.unit_status_reason', v_reason, true);
+  update product_units set status = p_status, updated_at = now() where id = p_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return p_status;
+end;
+$$;
+
+revoke all on function set_unit_status(uuid, text, text) from public, anon;
+grant execute on function set_unit_status(uuid, text, text) to authenticated;
+
+-- >>> supabase/migrations/0068_unit_labels.sql
+-- =============================================================================
+-- 0068_unit_labels.sql — barcodes for frames received without one
+-- (AceStock, Phase 3B)
+--
+-- Before:
+--   • A frame could be received without a barcode ("it can be added later"),
+--     but nothing could add one afterwards, so it couldn't be scanned.
+--
+-- Now:
+--   1. assign_unit_label(unit): gives a frame with no barcode the shop's next
+--      label code, "U" and a number from 10001, skipping any code already in
+--      use, and returns it (or the frame's barcode, if it has one) for
+--      printing. Scanning the label finds the frame like any unit barcode.
+--   2. set_unit_barcode(unit, barcode): records a barcode typed or scanned
+--      later for a frame that has none (at most 64 characters, no spaces).
+--      A frame's barcode isn't changed once set.
+--
+-- Both are owner rights, staff only, and lock the frame; the barcode rules of
+-- 0045 (one code, one thing) still apply. Re-runnable.
+-- =============================================================================
+
+create sequence if not exists unit_label_seq start with 10001;
+revoke all on sequence unit_label_seq from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- assign_unit_label — the shop's next label code for a frame with none
+-- -----------------------------------------------------------------------------
+create or replace function assign_unit_label(p_unit_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_barcode text;
+  v_code    text;
+begin
+  perform require_staff();
+
+  select barcode into v_barcode from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_barcode is not null then
+    return v_barcode;
+  end if;
+
+  loop
+    v_code := 'U' || nextval('unit_label_seq');
+    exit when barcode_owner(v_code, 'product_units', p_unit_id) is null;
+  end loop;
+
+  update product_units set barcode = v_code, updated_at = now() where id = p_unit_id;
+  return v_code;
+end;
+$$;
+
+revoke all on function assign_unit_label(uuid) from public, anon;
+grant execute on function assign_unit_label(uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- set_unit_barcode — a barcode added later
+-- -----------------------------------------------------------------------------
+create or replace function set_unit_barcode(p_unit_id uuid, p_barcode text)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_code    text := btrim(coalesce(p_barcode, ''));
+  v_barcode text;
+begin
+  perform require_staff();
+
+  if v_code = '' then
+    raise exception 'Scan or type the barcode';
+  end if;
+  if v_code !~ '^\S{1,64}$' then
+    raise exception 'A barcode is at most 64 characters, with no spaces';
+  end if;
+
+  select barcode into v_barcode from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_barcode is not null then
+    raise exception 'This frame already has barcode %', v_barcode;
+  end if;
+
+  update product_units set barcode = v_code, updated_at = now() where id = p_unit_id;
+  return v_code;
+end;
+$$;
+
+revoke all on function set_unit_barcode(uuid, text) from public, anon;
+grant execute on function set_unit_barcode(uuid, text) to authenticated;
+
+-- >>> supabase/migrations/0069_sell_strung.sql
+-- =============================================================================
+-- 0069_sell_strung.sql — a racquet sold to a customer becomes one of their
+-- racquets (AceStock, Phase 3B)
+--
+-- Before:
+--   • Selling a frame to a customer didn't add it to their racquets, so
+--     stringing it in the same visit meant adding it by hand first, and its
+--     barcode couldn't be its tag (a unit's barcode was taken).
+--
+-- Now:
+--   1. customer_rackets.product_unit_id: the frame a customer's racquet came
+--      from (at most one active racquet per frame).
+--   2. add_sold_racket (trigger on product_units): when a frame is sold to a
+--      customer, it's added to their racquets with its brand, model, grip and
+--      barcode as the tag. If that barcode is already used by something else,
+--      the racquet is added without one. A sale to nobody adds nothing.
+--   3. barcode_owner: a racquet may share the barcode of the frame it came
+--      from, and that frame may keep it; everything else is as 0045, except
+--      that leaving out the row being written (p_id) is null-safe, so a check
+--      for a row not yet written (p_id null) sees every owner. The
+--      three-argument form stays for its callers.
+--   4. guard_unique_barcode: as 0045, passing a racquet's frame along.
+--   5. resolve_barcode: as 0066, except that a sold frame with a racquet made
+--      from it resolves as that racquet (kind 'racket', with its open job),
+--      so scanning it starts or opens the customer's string job.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table customer_rackets add column if not exists product_unit_id uuid references product_units (id);
+comment on column customer_rackets.product_unit_id is 'The frame this racquet came from, when it was bought here';
+create unique index if not exists uq_customer_rackets_unit
+  on customer_rackets (product_unit_id) where is_active and product_unit_id is not null;
+
+-- -----------------------------------------------------------------------------
+-- barcode_owner — same as 0045, plus a racquet and its own frame share a code
+-- -----------------------------------------------------------------------------
+create or replace function barcode_owner(p_code text, p_table text, p_id uuid, p_own_unit uuid)
+returns text
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_canon text := barcode_canonical(p_code);
+  v_owner text;
+begin
+  select 'the UPC of ' || trim(coalesce(p.brand || ' ', '') || p.name) into v_owner
+    from products p
+   where p.barcode is not null and barcode_canonical(p.barcode) = v_canon
+     and not (p_table = 'products' and p.id is not distinct from p_id)
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  -- A racquet may carry the barcode of the frame it came from (p_own_unit).
+  select 'the barcode of a ' || trim(coalesce(p.brand || ' ', '') || p.name) || ' unit' into v_owner
+    from product_units u join products p on p.id = u.product_id
+   where u.barcode is not null and barcode_canonical(u.barcode) = v_canon
+     and not (p_table = 'product_units' and u.id is not distinct from p_id)
+     and u.id is distinct from p_own_unit
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  -- ... and a frame may keep the barcode its own racquet carries.
+  select 'the tag on ' || c.first_name || ' ' || c.last_name || '''s '
+         || trim(coalesce(r.brand || ' ', '') || r.model) into v_owner
+    from customer_rackets r join customers c on c.id = r.customer_id
+   where r.is_active and r.barcode is not null and barcode_canonical(r.barcode) = v_canon
+     and not (p_table = 'customer_rackets' and r.id is not distinct from p_id)
+     and not (p_table = 'product_units' and r.product_unit_id is not distinct from p_id)
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  if p_table <> 'gift_cards' then
+    select 'a gift card''s code' into v_owner
+      from gift_cards g
+     where barcode_canonical(g.code) = v_canon
+     limit 1;
+  end if;
+  return v_owner;
+end;
+$$;
+
+create or replace function barcode_owner(p_code text, p_table text, p_id uuid)
+returns text
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select barcode_owner(p_code, p_table, p_id, null::uuid);
+$$;
+
+revoke all on function barcode_owner(text, text, uuid, uuid) from public, anon, authenticated;
+revoke all on function barcode_owner(text, text, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_unique_barcode — same as 0045, passing a racquet's own frame along
+-- -----------------------------------------------------------------------------
+create or replace function guard_unique_barcode()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row   jsonb := to_jsonb(new);  -- the four tables name the column differently
+  v_code  text;
+  v_owner text;
+begin
+  v_code := v_row ->> case tg_table_name when 'gift_cards' then 'code' else 'barcode' end;
+  if v_code is null or btrim(v_code) = '' then
+    return new;
+  end if;
+  -- A retired racquet's tag is free to reuse.
+  if tg_table_name = 'customer_rackets' and not (v_row ->> 'is_active')::boolean then
+    return new;
+  end if;
+
+  -- Two registers claiming the same code wait for each other here.
+  perform pg_advisory_xact_lock(hashtext('acestock.barcode:' || barcode_canonical(v_code)));
+
+  v_owner := barcode_owner(v_code, tg_table_name, new.id,
+                           case when tg_table_name = 'customer_rackets' then (v_row ->> 'product_unit_id')::uuid end);
+  if v_owner is not null then
+    raise exception 'Barcode % is already %', v_code, v_owner;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_unique_barcode() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- add_sold_racket — a frame sold to a customer joins their racquets
+-- -----------------------------------------------------------------------------
+create or replace function add_sold_racket()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_product products%rowtype;
+  v_tag     text := new.barcode;
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null then
+    return new;
+  end if;
+  if exists (select 1 from customer_rackets where product_unit_id = new.id and is_active) then
+    return new;
+  end if;
+
+  select * into v_product from products where id = new.product_id;
+  -- Never let a taken code stop the sale: add the racquet without a tag.
+  if v_tag is not null then
+    perform pg_advisory_xact_lock(hashtext('acestock.barcode:' || barcode_canonical(v_tag)));
+    if barcode_owner(v_tag, 'customer_rackets', null, new.id) is not null then
+      v_tag := null;
+    end if;
+  end if;
+
+  insert into customer_rackets (customer_id, product_id, product_unit_id, brand, model, grip_size, barcode)
+  values (new.customer_id, new.product_id, new.id, v_product.brand, v_product.name,
+          nullif(v_product.attributes ->> 'grip_size', ''), v_tag);
+  return new;
+end;
+$$;
+
+revoke all on function add_sold_racket() from public, anon, authenticated;
+
+drop trigger if exists trg_add_sold_racket on product_units;
+create trigger trg_add_sold_racket
+  after update of status on product_units
+  for each row execute function add_sold_racket();
+
+-- -----------------------------------------------------------------------------
+-- resolve_barcode — same as 0066, plus a sold frame resolves as its racquet
+-- -----------------------------------------------------------------------------
+create or replace function resolve_barcode(p_code text)
+returns table (
+  kind          text,
+  code          text,
+  id            uuid,      -- the matched thing's id (product / unit / racket / gift card / job)
+  product_id    uuid,      -- for a unit: its catalog product; else null
+  customer_id   uuid,
+  open_job_id   uuid,
+  brand         text,
+  name          text,
+  attributes    jsonb,
+  sell_price    numeric,
+  is_serialized boolean,
+  unit_status   text       -- for a unit: its status; else null
+)
+language plpgsql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_code       text := regexp_replace(coalesce(p_code, ''), '\s+', '', 'g');
+  v_candidates text[];
+  v_product    products%rowtype;
+  v_unit       product_units%rowtype;
+  v_racket     customer_rackets%rowtype;
+  v_gift_card  gift_cards%rowtype;
+  v_job_id     uuid;
+  v_job_number bigint;
+  v_customer   uuid;
+begin
+  if v_code = '' then
+    return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- EAN-13 with a leading zero <-> UPC-A.
+  v_candidates := array[v_code];
+  if v_code ~ '^0[0-9]{12}$' then
+    v_candidates := v_candidates || substr(v_code, 2);
+  elsif v_code ~ '^[0-9]{12}$' then
+    v_candidates := v_candidates || ('0' || v_code);
+  end if;
+
+  -- Product UPC.
+  select * into v_product from products p where p.barcode = any (v_candidates)
+   order by (p.barcode = v_code) desc limit 1;
+  if found then
+    return query select 'product', v_product.barcode, v_product.id, null::uuid, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        v_product.is_serialized, null::text;
+    return;
+  end if;
+
+  -- Individual unit's personal barcode.
+  select * into v_unit from product_units u where u.barcode = any (v_candidates)
+   order by (u.barcode = v_code) desc limit 1;
+  if found then
+    -- A frame sold to a customer is their racquet now: its barcode is the tag.
+    if v_unit.status = 'sold' then
+      select * into v_racket from customer_rackets r
+       where r.product_unit_id = v_unit.id and r.is_active
+       limit 1;
+      if found then
+        return query select 'racket', v_unit.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                            (select j.id from string_jobs j
+                              where j.customer_racket_id = v_racket.id
+                                and j.status in ('entered', 'complete')
+                              order by j.entered_at desc limit 1),
+                            null::text, null::text, null::jsonb, null::numeric, false, null::text;
+        return;
+      end if;
+    end if;
+    select * into v_product from products p where p.id = v_unit.product_id;
+    return query select 'unit', v_unit.barcode, v_unit.id, v_unit.product_id, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        true, v_unit.status;
+    return;
+  end if;
+
+  -- Customer racket tag (active rackets only).
+  select * into v_racket
+  from customer_rackets r
+  where r.barcode = any (v_candidates) and r.is_active
+  order by (r.barcode = v_code) desc
+  limit 1;
+  if found then
+    return query select 'racket', v_racket.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                        (select j.id from string_jobs j
+                          where j.customer_racket_id = v_racket.id
+                            and j.status in ('entered', 'complete')
+                          order by j.entered_at desc limit 1),
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  select * into v_gift_card from gift_cards g where g.code = any (v_candidates)
+   order by (g.code = v_code) desc limit 1;
+  if found then
+    return query select 'gift_card', v_gift_card.code, v_gift_card.id, null::uuid, v_gift_card.customer_id, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- A string job's tag: J and its number.
+  if v_code ~* '^J[0-9]{1,15}$' then
+    select j.id, j.job_number, r.customer_id into v_job_id, v_job_number, v_customer
+      from string_jobs j
+      join customer_rackets r on r.id = j.customer_racket_id
+     where j.job_number = substr(v_code, 2)::bigint;
+    if found then
+      return query select 'job', 'J' || v_job_number, v_job_id, null::uuid, v_customer, v_job_id,
+                          null::text, null::text, null::jsonb, null::numeric, false, null::text;
+      return;
+    end if;
+  end if;
+
+  return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                      null::text, null::text, null::jsonb, null::numeric, false, null::text;
+end;
+$$;
+
+revoke all on function resolve_barcode(text) from public, anon;
+grant execute on function resolve_barcode(text) to authenticated;
+
+-- >>> supabase/migrations/0070_racquet_returns.sql
+-- =============================================================================
+-- 0070_racquet_returns.sql — return a sold racquet frame (AceStock, Phase 3B)
+--
+-- Before:
+--   • record_refund refused any serialized line ("Returning individual
+--     (serialized) items is not supported yet"), so a sold racquet couldn't
+--     be returned.
+--
+-- Now (record_refund, otherwise the same as 0054):
+--   1. A frame's sale line can be returned, one frame (qty 1) per line. The
+--      refund itself is as for any product: the price paid, the sale's tax
+--      rate, and the payment-type rules.
+--   2. Each returned frame line may say what happens to the frame:
+--        unit_status  'in_stock' (default) or 'retired' (damaged);
+--        unit_reason  why, required when retired (at most 200 characters).
+--      The frame must still be sold on this sale. It leaves the customer
+--      (sale and customer cleared), its history records the return with the
+--      refund, and no stock-ledger row is written (frames are counted).
+--   3. The racquet made from the frame (0069) is taken off the customer's
+--      racquets. A frame whose racquet has a string job open can't be
+--      returned until that job is delivered or cancelled.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- record_refund — same as 0054, plus returned frames
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null then raise exception 'Only product lines can be returned'; end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_sl.unit_price);
+
+    if v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_sl.unit_price;
+  end loop;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Products are taxed.
+  v_tax   := sale_refund_tax(p_sale_id, v_sub, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text) to authenticated;
+
+-- >>> supabase/migrations/0071_demo_loans.sql
+-- =============================================================================
+-- 0071_demo_loans.sql — lend a demo frame to a customer and check it back in
+-- (AceStock, Phase 3C)
+--
+-- Before:
+--   • A frame could be moved to the demo fleet (0067), but nothing recorded
+--     who had it, when it was due back, or what the shop was holding for it.
+--
+-- Now:
+--   1. demo_loans: each time a demo frame goes out — a loan number (D1001
+--      on), the frame, the customer, when it went out and is due back, a
+--      deposit note ("card on file", "$50 cash held": a note only, no money
+--      is taken), who lent it and, once back, who checked it in and whether
+--      it went back to the demo fleet or was retired. One open loan per
+--      frame. Read-only for staff.
+--   2. settings.demo_loan_days (default 3, 1–60): when a loan is due back
+--      unless staff pick a time.
+--   3. check_out_demo(unit, customer, due, deposit note, note): lends a frame
+--      in the demo fleet. The frame becomes 'assigned' to the customer, and
+--      its history (0067) says who it was lent to and the loan number.
+--   4. check_in_demo(loan, status, reason): the frame goes back to the demo
+--      fleet, or is retired (with a reason) if it came back damaged.
+--   5. set_demo_due(loan, due): a new due time for a loan that's still out.
+--      A due time is in the future and at most 90 days away.
+--
+-- All three are owner rights, staff only, and lock the frame or loan.
+-- Re-runnable.
+-- =============================================================================
+
+alter table settings add column if not exists demo_loan_days integer not null default 3;
+alter table settings drop constraint if exists ck_settings_demo_loan_days;
+alter table settings add constraint ck_settings_demo_loan_days check (demo_loan_days between 1 and 60);
+comment on column settings.demo_loan_days is 'How many days a demo loan lasts, unless staff pick a time';
+
+create table if not exists demo_loans (
+  id              uuid primary key default gen_random_uuid(),
+  loan_number     bigint generated always as identity (start with 1001),
+  product_unit_id uuid not null references product_units (id),
+  customer_id     uuid not null references customers (id),
+  out_at          timestamptz not null default now(),
+  out_by          uuid references profiles (id),
+  due_back_at     timestamptz not null,
+  deposit_note    text check (char_length(deposit_note) <= 200),
+  note            text check (char_length(note) <= 200),
+  back_at         timestamptz,
+  back_by         uuid references profiles (id),
+  back_status     text check (back_status in ('demo', 'retired')),
+  back_reason     text check (char_length(back_reason) <= 200),
+  constraint ck_demo_loans_back check ((back_at is null) = (back_status is null))
+);
+comment on table demo_loans is 'Each time a demo frame was lent to a customer';
+create unique index if not exists uq_demo_loans_loan_number on demo_loans (loan_number);
+create unique index if not exists uq_demo_loans_open_unit on demo_loans (product_unit_id) where back_at is null;
+create index if not exists ix_demo_loans_customer on demo_loans (customer_id, out_at desc);
+create index if not exists ix_demo_loans_open_due on demo_loans (due_back_at) where back_at is null;
+
+alter table demo_loans enable row level security;
+drop policy if exists demo_loans_staff_select on demo_loans;
+create policy demo_loans_staff_select on demo_loans
+  for select to authenticated using (is_staff());
+revoke all on demo_loans from anon;
+revoke insert, update, delete, truncate on demo_loans from authenticated;
+grant select on demo_loans to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- demo_due_problem — why a due time can't be used (null if it can)
+-- -----------------------------------------------------------------------------
+create or replace function demo_due_problem(p_due timestamptz)
+returns text
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select case
+    when p_due is null then 'Pick when the demo is due back'
+    when p_due <= now() then 'The due time has to be in the future'
+    when p_due > now() + interval '90 days' then 'A demo can be lent for at most 90 days'
+  end;
+$$;
+
+revoke all on function demo_due_problem(timestamptz) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- check_out_demo — lend a demo frame to a customer
+-- -----------------------------------------------------------------------------
+create or replace function check_out_demo(
+  p_unit_id      uuid,
+  p_customer_id  uuid,
+  p_due_back_at  timestamptz default null,
+  p_deposit_note text default null,
+  p_note         text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_status   text;
+  v_name     text;
+  v_due      timestamptz;
+  v_deposit  text := nullif(btrim(coalesce(p_deposit_note, '')), '');
+  v_note     text := nullif(btrim(coalesce(p_note, '')), '');
+  v_problem  text;
+  v_loan     demo_loans%rowtype;
+begin
+  perform require_staff();
+
+  select btrim(concat_ws(' ', first_name, last_name)) into v_name from customers where id = p_customer_id;
+  if not found then
+    raise exception 'Pick the customer borrowing the demo';
+  end if;
+  if char_length(coalesce(v_deposit, '')) > 200 or char_length(coalesce(v_note, '')) > 200 then
+    raise exception 'Keep each note to 200 characters';
+  end if;
+
+  v_due := coalesce(p_due_back_at,
+                    now() + make_interval(days => coalesce((select demo_loan_days from settings where id), 3)));
+  v_problem := demo_due_problem(v_due);
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+
+  select status into v_status from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_status = 'assigned' then
+    raise exception 'This frame is already out on demo';
+  end if;
+  if v_status <> 'demo' then
+    raise exception 'Only a frame in the demo fleet can be lent (this one is %)', replace(v_status, '_', ' ');
+  end if;
+
+  insert into demo_loans (product_unit_id, customer_id, due_back_at, deposit_note, note, out_by)
+  values (p_unit_id, p_customer_id, v_due, v_deposit, v_note, auth.uid())
+  returning * into v_loan;
+
+  perform set_config('acestock.unit_status_reason',
+                     format('Lent to %s (D%s)', coalesce(nullif(v_name, ''), 'a customer'), v_loan.loan_number), true);
+  update product_units set status = 'assigned', customer_id = p_customer_id, updated_at = now() where id = p_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return v_loan.id;
+end;
+$$;
+
+revoke all on function check_out_demo(uuid, uuid, timestamptz, text, text) from public, anon;
+grant execute on function check_out_demo(uuid, uuid, timestamptz, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- check_in_demo — a lent frame comes back
+-- -----------------------------------------------------------------------------
+create or replace function check_in_demo(
+  p_loan_id uuid,
+  p_status  text default 'demo',
+  p_reason  text default null
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_loan   demo_loans%rowtype;
+  v_status text := coalesce(nullif(p_status, ''), 'demo');
+  v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_staff();
+
+  if v_status not in ('demo', 'retired') then
+    raise exception 'A demo comes back to the demo fleet or is retired (not "%")', v_status;
+  end if;
+  if v_status = 'retired' and v_reason is null then
+    raise exception 'Say why the frame is retired';
+  end if;
+  if char_length(coalesce(v_reason, '')) > 200 then
+    raise exception 'Keep the reason to 200 characters';
+  end if;
+
+  select * into v_loan from demo_loans where id = p_loan_id for update;
+  if not found then
+    raise exception 'Unknown demo loan %', p_loan_id;
+  end if;
+  if v_loan.back_at is not null then
+    raise exception 'Demo D% has already been checked in', v_loan.loan_number;
+  end if;
+  perform 1 from product_units where id = v_loan.product_unit_id for update;
+
+  update demo_loans
+     set back_at = now(), back_by = auth.uid(), back_status = v_status, back_reason = v_reason
+   where id = p_loan_id;
+
+  perform set_config('acestock.unit_status_reason',
+                     coalesce(v_reason || format(' (back from D%s)', v_loan.loan_number),
+                              format('Back from D%s', v_loan.loan_number)), true);
+  update product_units set status = v_status, customer_id = null, updated_at = now() where id = v_loan.product_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return v_status;
+end;
+$$;
+
+revoke all on function check_in_demo(uuid, text, text) from public, anon;
+grant execute on function check_in_demo(uuid, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- set_demo_due — a new due time for a loan still out
+-- -----------------------------------------------------------------------------
+create or replace function set_demo_due(p_loan_id uuid, p_due_back_at timestamptz)
+returns timestamptz
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_loan    demo_loans%rowtype;
+  v_problem text := demo_due_problem(p_due_back_at);
+begin
+  perform require_staff();
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+
+  select * into v_loan from demo_loans where id = p_loan_id for update;
+  if not found then
+    raise exception 'Unknown demo loan %', p_loan_id;
+  end if;
+  if v_loan.back_at is not null then
+    raise exception 'Demo D% has already been checked in', v_loan.loan_number;
+  end if;
+
+  update demo_loans set due_back_at = p_due_back_at where id = p_loan_id;
+  return p_due_back_at;
+end;
+$$;
+
+revoke all on function set_demo_due(uuid, timestamptz) from public, anon;
+grant execute on function set_demo_due(uuid, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0072_demo_conversions.sql
+-- =============================================================================
+-- 0072_demo_conversions.sql — demos that led to a sale (AceStock, Phase 3C)
+--
+-- Before:
+--   • A demo loan (0071) said who borrowed which frame, but not whether the
+--     customer went on to buy that racquet.
+--
+-- Now:
+--   1. demo_loans.sale_id: the sale the demo led to.
+--   2. link_demo_sale trigger: when a frame is sold to a customer, their
+--      latest loan of a frame of the same racquet (product), taken out in the
+--      30 days before and not yet linked, is linked to the sale. It doesn't
+--      matter whether they buy the demo frame itself (moved back in stock
+--      first) or a new one, or whether the demo is still out.
+--
+-- A walk-in sale (no customer) links nothing. A later return of the frame
+-- leaves the link: the demo still led to that sale. Re-runnable.
+-- =============================================================================
+
+alter table demo_loans add column if not exists sale_id uuid references sales (id);
+comment on column demo_loans.sale_id is 'The sale this demo led to: the customer bought a frame of the same racquet';
+create index if not exists ix_demo_loans_sale on demo_loans (sale_id) where sale_id is not null;
+
+-- -----------------------------------------------------------------------------
+-- link_demo_sale — a frame sold to a customer who demoed that racquet
+-- -----------------------------------------------------------------------------
+create or replace function link_demo_sale()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null or new.sale_id is null then
+    return new;
+  end if;
+
+  update demo_loans
+     set sale_id = new.sale_id
+   where id = (
+     select l.id
+       from demo_loans l
+       join product_units u on u.id = l.product_unit_id
+      where l.customer_id = new.customer_id
+        and u.product_id = new.product_id
+        and l.sale_id is null
+        and l.out_at >= now() - interval '30 days'
+      order by l.out_at desc, l.loan_number desc
+      limit 1
+      for update of l
+   );
+  return new;
+end;
+$$;
+
+revoke all on function link_demo_sale() from public, anon, authenticated;
+
+drop trigger if exists trg_link_demo_sale on product_units;
+create trigger trg_link_demo_sale
+  after update of status on product_units
+  for each row execute function link_demo_sale();
+
+-- >>> supabase/migrations/0073_demo_review_fixes.sql
+-- =============================================================================
+-- 0073_demo_review_fixes.sql — fixes from the Phase 3C review (AceStock)
+--
+-- Before:
+--   • A demo was linked to a sale only if it went out in the 30 days before
+--     the sale, so a long loan bought on its return was never linked.
+--   • Buying two frames of a racquet demoed twice linked both demos to the
+--     same sale.
+--   • Deleting a customer with demo loans showed a raw foreign-key error.
+--   • The staff-only write check of 0041 (trg_enforce_staff_writer) was only
+--     put on the tables that existed then. demo_loans, discount_approvals,
+--     held_tickets and unit_status_changes don't have it. Nothing is exposed
+--     today (their server functions check for staff), but it's the backstop.
+--
+-- Now:
+--   1. link_demo_sale (0072): a demo counts if it's still out or came back in
+--      the 30 days before the sale, and one sale is linked to at most one
+--      demo of each racquet.
+--   2. guard_customer_delete (0046): demos are history too, named in the
+--      message like sales and string jobs.
+--   3. Every public table without trg_enforce_staff_writer gets it, as in
+--      0041. Test 43 keeps it that way for tables added later.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- link_demo_sale — same as 0072, with the window from the demo's return and
+-- one demo per racquet per sale
+-- -----------------------------------------------------------------------------
+create or replace function link_demo_sale()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null or new.sale_id is null then
+    return new;
+  end if;
+  -- Another frame of this racquet on the same sale already credited a demo.
+  if exists (select 1 from demo_loans l join product_units u on u.id = l.product_unit_id
+              where l.sale_id = new.sale_id and u.product_id = new.product_id) then
+    return new;
+  end if;
+
+  update demo_loans
+     set sale_id = new.sale_id
+   where id = (
+     select l.id
+       from demo_loans l
+       join product_units u on u.id = l.product_unit_id
+      where l.customer_id = new.customer_id
+        and u.product_id = new.product_id
+        and l.sale_id is null
+        and coalesce(l.back_at, now()) >= now() - interval '30 days'
+      order by l.out_at desc, l.loan_number desc
+      limit 1
+      for update of l
+   );
+  return new;
+end;
+$$;
+
+revoke all on function link_demo_sale() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_customer_delete — same as 0046, plus demos
+-- -----------------------------------------------------------------------------
+create or replace function guard_customer_delete()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_history text[];
+begin
+  select array_remove(array[
+           case when exists (select 1 from sales where customer_id = old.id) then 'sales' end,
+           case when exists (select 1 from store_credit_txns where customer_id = old.id) then 'store credit' end,
+           case when exists (select 1 from gift_cards where customer_id = old.id) then 'gift cards' end,
+           case when exists (select 1 from product_units where customer_id = old.id) then 'racquet units' end,
+           case when exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                              where r.customer_id = old.id) then 'string jobs' end,
+           case when exists (select 1 from demo_loans where customer_id = old.id) then 'demo' end
+         ], null)
+    into v_history;
+  if cardinality(v_history) > 0 then
+    raise exception '% % has % history, so they can''t be deleted',
+      old.first_name, old.last_name, array_to_string(v_history, ', ');
+  end if;
+  return old;
+end;
+$$;
+
+revoke all on function guard_customer_delete() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- The staff-only write check (0041) on every table that lacks it
+-- -----------------------------------------------------------------------------
+do $$
+declare
+  tbl text;
+begin
+  for tbl in
+    select c.relname
+      from pg_class c
+     where c.relnamespace = 'public'::regnamespace
+       and c.relkind = 'r'
+       and not exists (select 1 from pg_trigger t
+                        where t.tgrelid = c.oid and t.tgname = 'trg_enforce_staff_writer')
+  loop
+    execute format(
+      'create trigger trg_enforce_staff_writer before insert or update or delete on %I '
+      'for each statement execute function enforce_staff_writer()', tbl);
+  end loop;
+end $$;
+
+-- >>> supabase/migrations/0074_service_refunds.sql
+-- =============================================================================
+-- 0074_service_refunds.sql — refund a stringing charge (AceStock, Phase 3D)
+--
+-- Before:
+--   • record_refund refused every line that wasn't a product ("Only product
+--     lines can be returned"), so a stringing charge couldn't be given back.
+--   • A paid job couldn't be cancelled either ("This string job has been
+--     paid, so it can't be cancelled"), so a prepaid job the customer no
+--     longer wanted had no way out.
+--   • Refund tax counted every refunded line as taxed.
+--
+-- Now (record_refund, otherwise the same as 0070):
+--   1. A stringing line (a job's charge, or a string-change charge) can be
+--      refunded whole, once. It gives back the line's price less any
+--      string-change give-backs already made against it.
+--   2. The job stays on record, marked refunded (string_jobs.refunded_at,
+--      refund_id). A job not started yet is cancelled by the refund; one
+--      strung and waiting must be delivered first; a delivered or cancelled
+--      job is just marked.
+--   3. Refund tax counts only lines the sale taxed (stringing may be untaxed).
+--   4. cancel_string_job on a paid job points to the refund instead.
+--   5. A new job can't be entered already refunded.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Columns
+-- -----------------------------------------------------------------------------
+alter table string_jobs add column if not exists refunded_at timestamptz;
+alter table string_jobs add column if not exists refund_id uuid references refunds (id);
+create index if not exists idx_string_jobs_refund on string_jobs (refund_id) where refund_id is not null;
+
+comment on column string_jobs.refunded_at is 'When the job''s charge was refunded; the job stays on record';
+comment on column string_jobs.refund_id is 'The refund that gave back the job''s charge';
+
+-- -----------------------------------------------------------------------------
+-- 2. guard_new_string_job — same as 0040, plus the refund columns
+-- -----------------------------------------------------------------------------
+create or replace function guard_new_string_job()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if current_user in ('authenticated', 'anon') then
+    if new.status <> 'entered'
+       or new.paid_sale_id is not null
+       or new.completed_at is not null or new.completed_by is not null
+       or new.delivered_at is not null or new.delivered_by is not null
+       or new.cancelled_at is not null or new.cancelled_by is not null
+       or new.refunded_at is not null or new.refund_id is not null then
+      raise exception 'A new string job starts as entered and unpaid';
+    end if;
+    new.entered_by := auth.uid();
+    new.entered_at := now();
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_new_string_job() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 3. record_refund — same as 0070, plus stringing lines
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null then
+      raise exception 'Only product and stringing lines can be returned';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 4. cancel_string_job — same as 0042; a paid job points to its refund
+-- -----------------------------------------------------------------------------
+create or replace function cancel_string_job(p_job_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current text;
+  v_paid    uuid;
+begin
+  perform require_staff();
+
+  select status, paid_sale_id into v_current, v_paid
+    from string_jobs where id = p_job_id
+    for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+  if v_current <> 'entered' then
+    raise exception 'Only an entered job can be cancelled (this one is "%")', v_current;
+  end if;
+  if v_paid is not null then
+    -- Refunding its charge from the sale cancels it (0074), so the money and
+    -- the job are settled together.
+    raise exception 'This string job has been paid: refund its charge from the sale to cancel it';
+  end if;
+
+  update string_jobs
+     set status       = 'cancelled',
+         cancelled_at = now(),
+         cancelled_by = auth.uid()
+   where id = p_job_id
+     and status = 'entered';
+  return 'cancelled';
+end;
+$$;
+
+
+revoke all on function cancel_string_job(uuid) from public, anon;
+grant execute on function cancel_string_job(uuid) to authenticated;
+
 commit;

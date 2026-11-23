@@ -90,7 +90,7 @@ select lives_ok(
   'a job can be paid before it is strung');
 select throws_like(
   $$ select cancel_string_job('00000000-0000-0000-0000-000000000f02') $$,
-  '%has been paid, so it can''t be cancelled%', 'a paid job cannot be cancelled');
+  'This string job has been paid: refund its charge from the sale to cancel it', 'a paid job is cancelled by refunding it');
 select is((select status from string_jobs where id = '00000000-0000-0000-0000-000000000f02'), 'entered',
           'the paid job is still entered');
 
