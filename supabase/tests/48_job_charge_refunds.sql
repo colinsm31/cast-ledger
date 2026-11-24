@@ -4,7 +4,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(7);
+select plan(11);
 
 create function tests.refund_line(p_sale uuid, p_line uuid, p_amount numeric)
 returns uuid language sql as $$
@@ -18,7 +18,8 @@ select '00000000-0000-0000-0000-0000000000b8', id, 'TestBrand', 'Premium', 30, '
   from categories where name = 'Strings';
 insert into inventory_txns (txn_type, product_id, qty) values ('receive', '00000000-0000-0000-0000-0000000000b8', 10);
 insert into customer_rackets (id, customer_id, model) values
-  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Pat 1');
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'Pat 1'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c1', 'Pat 2');
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
@@ -51,7 +52,7 @@ select ok((select change_line from l) is not null and (select change_sale from l
 -- The string change's charge alone is refused
 -- ---------------------------------------------------------------------------
 select throws_like($$ select tests.refund_line((select change_sale from l), (select change_line from l), (select total from q)) $$,
-                   'This is a string change on job J%: refund the job''s own charge first',
+                   'This is a string change on job J%: refund the job''s own charge first, or deliver the job',
                    'a string change''s charge isn''t refunded before the job''s own');
 select is((select status from string_jobs where id = '00000000-0000-0000-0000-000000000f01'), 'entered',
           'so the paid job isn''t cancelled by it');
@@ -72,6 +73,36 @@ select is((select refund_id from string_jobs where id = '00000000-0000-0000-0000
           'and the job keeps the refund that cancelled it');
 select throws_like($$ select tests.refund_line((select change_sale from l), (select change_line from l), (select total from q)) $$,
                    'Cannot return 1 of line (only 0 remaining)', 'each charge comes back once');
+
+-- ---------------------------------------------------------------------------
+-- A delivered job's string change can come back on its own (0084)
+-- ---------------------------------------------------------------------------
+insert into string_jobs (id, customer_racket_id, main_product_id, cross_product_id, main_tension, cross_tension, price, strung_by)
+values ('00000000-0000-0000-0000-000000000f02', '00000000-0000-0000-0000-0000000000f2',
+        '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', 55, 53, 20, 'Tester');
+create temp table s2 as select record_sale(
+  '[{"string_job_id":"00000000-0000-0000-0000-000000000f02","qty":1,"unit_price":20}]'::jsonb,
+  '00000000-0000-0000-0000-0000000000c1', '[{"method":"cash","amount":20}]'::jsonb, null) as job_sale;
+grant select on s2 to authenticated;
+create temp table q2 as select (string_change_quote('00000000-0000-0000-0000-000000000f02',
+  '00000000-0000-0000-0000-0000000000b8', '00000000-0000-0000-0000-0000000000b8')->>'total')::numeric as total;
+grant select on q2 to authenticated;
+select lives_ok($$ select change_paid_string_job('00000000-0000-0000-0000-000000000f02',
+  '00000000-0000-0000-0000-0000000000b8', '00000000-0000-0000-0000-0000000000b8', 55, 53,
+  jsonb_build_array(jsonb_build_object('method', 'cash', 'amount', (select total from q2)))) $$,
+  'a second job is changed to the dearer string');
+select lives_ok($$ select advance_string_job('00000000-0000-0000-0000-000000000f02', 'complete'),
+                          advance_string_job('00000000-0000-0000-0000-000000000f02', 'delivered') $$,
+                'then strung and delivered');
+select lives_ok(
+  $$ select tests.refund_line(
+       (select sale_id from sale_lines where string_job_id = '00000000-0000-0000-0000-000000000f02' and kind = 'string_change'),
+       (select id from sale_lines where string_job_id = '00000000-0000-0000-0000-000000000f02' and kind = 'string_change'),
+       (select total from q2)) $$,
+  'its string change''s charge is refunded on its own');
+select results_eq($$ select status, refund_id from string_jobs where id = '00000000-0000-0000-0000-000000000f02' $$,
+                  $$ values ('delivered'::text, null::uuid) $$,
+                  'and the job stays delivered, its own charge not refunded');
 
 select * from finish();
 rollback;

@@ -18,7 +18,8 @@
 # the same barcode at once, the same sold frame returned twice, the same
 # demo frame lent twice, the same item exchanged twice, and a job's charge
 # refunded while its strings are changed (which must queue, not deadlock),
-# and a demo lent while its customer is being made inactive.
+# a demo lent while its customer is being made inactive, and a racquet moved
+# to another customer while a job is entered for it.
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -36,7 +37,7 @@ CATEGORY=$(new_id); PRODUCT=$(new_id); LAST_UNIT_PRODUCT=$(new_id); CUSTOMER=$(n
 GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=$(new_id)
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
-RACKET_7=$(new_id); JOB_7=$(new_id); CUSTOMER_2=$(new_id)
+RACKET_7=$(new_id); JOB_7=$(new_id); CUSTOMER_2=$(new_id); CUSTOMER_3=$(new_id); RACKET_8=$(new_id)
 ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id); HELD=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
@@ -70,12 +71,12 @@ cleanup() {
     delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}',
-                                                             '${RACKET_7}');
+                                                             '${RACKET_7}', '${RACKET_8}');
     delete from sales           where id in (select id from run_sales);
     delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
-                                             '${RACKET_5}', '${RACKET_6}', '${RACKET_7}');
+                                             '${RACKET_5}', '${RACKET_6}', '${RACKET_7}', '${RACKET_8}');
     delete from gift_cards      where id = '${GIFT_CARD}';
-    delete from customers       where id in ('${CUSTOMER}', '${CUSTOMER_2}');
+    delete from customers       where id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}');
     delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
                                              '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}', '${UNIT_PRODUCT}');
     delete from categories      where id in ('${CATEGORY}', '${RACQUET_CATEGORY}');
@@ -380,11 +381,14 @@ psql "$DB_URL" -qAt -v ON_ERROR_STOP=1 -c "begin; ${AS_STAFF};
   select change_paid_string_job('${JOB_7}', '${STRING_A}', '${STRING_A}', 52, 52,
     '[{\"method\":\"cash\",\"amount\":${GIVE_BACK}}]'::jsonb); commit;" > "$RACE_DIR/change" 2>&1 || true
 wait
+JOB_7_REFUNDS=$(psql_run -c "select count(*) from refunds where sale_id = '${JOB_7_SALE}'")
 if grep -qi "deadlock" "$RACE_DIR/refund" "$RACE_DIR/change"; then
   check "a job's charge refunded while its strings change" 0 "deadlock detected"
+elif [[ "$JOB_7_REFUNDS" -lt 1 ]] || grep -qi "error" "$RACE_DIR/refund"; then
+  check "a job's charge refunded while its strings change" 0 "the refund failed: $(head -c 200 "$RACE_DIR/refund")"
 else
   check "a job's charge refunded while its strings change" 1 \
-    "no deadlock; job $(psql_run -c "select status from string_jobs where id = '${JOB_7}'")"
+    "no deadlock; refund recorded, job $(psql_run -c "select status from string_jobs where id = '${JOB_7}'")"
 fi
 
 # 18. A customer made inactive at one register while a demo is lent to them
@@ -401,6 +405,22 @@ check "a demo lent while its customer is made inactive" "$n" \
   "$(psql_run -c "select case when is_active then 'active' else 'inactive' end || ' with ' ||
     (select count(*) from demo_loans where customer_id = '${CUSTOMER_2}' and back_at is null) || ' demo(s) out'
     from customers where id = '${CUSTOMER_2}'")"
+
+# 19. A job entered for a racquet at one register while the racquet is moved
+#     to another customer at the other: the move waits for the job (the new
+#     job locks its racquet, guard_string_job_racket 0042) and is refused
+#     (guard_racket_owner 0080), so no racquet has a job open under someone else.
+psql_run <<SQL >/dev/null
+  insert into customers (id, first_name, last_name) values ('${CUSTOMER_3}', 'Concurrency', 'Taker');
+  insert into customer_rackets (id, customer_id, model) values ('${RACKET_8}', '${CUSTOMER}', 'Eighth frame');
+SQL
+n=$(race "${AS_STAFF}; insert into string_jobs (customer_racket_id, main_product_id, cross_product_id, main_tension,
+           cross_tension, price) values ('${RACKET_8}', '${STRING_A}', '${STRING_A}', 52, 52, 20)" \
+         "update customer_rackets set customer_id = '${CUSTOMER_3}' where id = '${RACKET_8}'")
+check "a racquet moved while a job is entered for it" "$n" \
+  "$(psql_run -c "select 'racquet with ' || case when customer_id = '${CUSTOMER}' then 'its owner' else 'the other customer' end ||
+    ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_8}' and status = 'entered') || ' job(s) open'
+    from customer_rackets where id = '${RACKET_8}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

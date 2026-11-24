@@ -2,7 +2,7 @@
 -- 0079_job_charge_refunds.sql — a job paid on two sales, and refunds racing a
 -- string change (AceStock, Phase 3D review)
 --
--- Before (0074):
+-- Before (since 0074; record_refund as carried over in 0078):
 --   • A job's strings changed to dearer ones adds a 'string_change' charge on
 --     a second sale (0043). Refunding that charge on its own cancelled the
 --     job, though its main charge was still paid.
