@@ -124,6 +124,8 @@ update notifications set status = 'failed', error = 'Timed out'
  where id = (select id from claimed where channel = 'email');
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 update customers set email = 'sam.new@example.com' where id = '00000000-0000-0000-0000-0000000000c5';
+-- A new address needs Sam's say again (0089).
+update customers set email_opt_in = true where id = '00000000-0000-0000-0000-0000000000c5';
 select is(resend_notification((select id from claimed where channel = 'email')),
           (select id from claimed where channel = 'email'), 'a failed email is put back in the queue');
 select results_eq(
