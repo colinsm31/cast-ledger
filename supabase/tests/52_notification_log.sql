@@ -57,11 +57,7 @@ select ok((select body from notifications where string_job_id = '00000000-0000-0
 select advance_string_job('00000000-0000-0000-0000-000000000f06', 'complete');
 select is((select count(*)::int from notifications where string_job_id = '00000000-0000-0000-0000-000000000f06'),
           0, 'a customer who hasn''t opted in gets nothing');
-select tests.clear_authentication();
-update string_jobs set status = 'delivered' where id = '00000000-0000-0000-0000-000000000f05';
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
-select is((select count(*)::int from notifications where string_job_id = '00000000-0000-0000-0000-000000000f05'),
-          2, 'delivering the job queues nothing more');
 
 -- Staff read the log but only the functions write it.
 select throws_like(
@@ -76,7 +72,7 @@ select throws_like($$ select finish_notification(gen_random_uuid(), 'sent') $$, 
 -- The sender's side (run here as the database owner, like the service role)
 -- ---------------------------------------------------------------------------
 select tests.clear_authentication();
-select ok(has_function_privilege('service_role', 'claim_notifications(uuid, uuid, integer)', 'execute')
+select ok(has_function_privilege('service_role', 'claim_notifications(uuid, uuid, integer, uuid)', 'execute')
           and has_function_privilege('service_role', 'finish_notification(uuid, text, text, text, boolean)', 'execute'),
           'the service role can claim and finish');
 
@@ -117,7 +113,7 @@ select results_eq(
 -- ---------------------------------------------------------------------------
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select throws_like($$ select resend_notification((select id from claimed where channel = 'email')) $$,
-                   'Only a message that failed or wasn''t sent can be sent again', 'a sent message isn''t resent');
+                   'This message was already sent', 'a sent message isn''t resent');
 select throws_like($$ select resend_notification((select id from claimed where channel = 'sms')) $$,
                    'Sam has opted out of texts', 'nor a text to someone who opted out');
 select throws_like($$ select resend_notification(gen_random_uuid()) $$, 'Unknown message %', 'an unknown message');
@@ -148,6 +144,12 @@ select throws_like($$ select resend_notification((select id from claimed where c
 select advance_string_job('00000000-0000-0000-0000-000000000f07', 'complete');
 select is((select count(*)::int from notifications where string_job_id = '00000000-0000-0000-0000-000000000f07'),
           0, 'an inactive customer''s job queues no message');
+
+select tests.clear_authentication();
+update string_jobs set status = 'delivered' where id = '00000000-0000-0000-0000-000000000f05';
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
+select is((select count(*)::int from notifications where string_job_id = '00000000-0000-0000-0000-000000000f05'),
+          2, 'delivering the job queues nothing more');
 
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
 select is((select count(*)::int from notifications where customer_id = '00000000-0000-0000-0000-0000000000c5'), 2,

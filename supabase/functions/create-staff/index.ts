@@ -12,7 +12,7 @@
 // Request:  POST { "email": string, "password": string }
 // Response: 201 { "id", "email" } | 4xx/5xx { "error": message }
 
-import { createClient } from 'jsr:@supabase/supabase-js@2';
+import { createClient } from 'jsr:@supabase/supabase-js@2.118.0';
 
 // Match the web app's lib/passwordRules.ts. Supabase Auth ignores anything
 // past 72 characters, so longer is refused rather than silently cut.

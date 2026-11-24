@@ -40,7 +40,9 @@ jobs:
         with:
           deno-version: 2.9.6
 
+      # Exact versions, held by supabase/functions/deno.lock (frozen).
       - name: Run Edge Function tests
+        working-directory: supabase/functions
         run: |
-          deno test supabase/functions/
-          deno check --node-modules-dir=none supabase/functions/*/index.ts
+          deno test
+          deno check */index.ts

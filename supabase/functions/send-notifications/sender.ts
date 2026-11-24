@@ -11,6 +11,8 @@ export interface ClaimedMessage {
   body: string;
   html: string | null;
   attempts: number;
+  /** Raised only by Send again on a finished message (0088). */
+  resend_count: number;
 }
 
 export type Outcome = 'sent' | 'failed' | 'skipped';
@@ -24,8 +26,15 @@ export interface SendResult {
 /** Sends one email; resolves to the provider's message id or throws a readable error. */
 export type EmailSender = (message: ClaimedMessage) => Promise<string>;
 
+/** Which queued messages to send: one message, one job's, one sale's, or the oldest of any. */
+export interface SendFilter {
+  stringJobId: string | null;
+  saleId: string | null;
+  notificationId: string | null;
+}
+
 export interface SenderDeps {
-  claim(filter: { stringJobId: string | null; saleId: string | null }): Promise<ClaimedMessage[]>;
+  claim(filter: SendFilter): Promise<ClaimedMessage[]>;
   finish(id: string, status: Outcome, providerId: string | null, error: string | null): Promise<void>;
   /** Missing when email isn't set up (test mode): nothing leaves, the log says so. */
   sendEmail?: EmailSender;
@@ -36,20 +45,28 @@ export const NO_TEXTING_MESSAGE = "Texting isn't set up yet, so nothing was sent
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Which queued messages to send: one job's, one sale's, or the oldest of any. */
-export function parseRequest(body: unknown): { stringJobId: string | null; saleId: string | null } | { error: string } {
+export function parseRequest(body: unknown): SendFilter | { error: string } {
   const value = (body ?? {}) as Record<string, unknown>;
   const stringJobId = value.string_job_id ?? null;
   const saleId = value.sale_id ?? null;
-  for (const [name, id] of [['string_job_id', stringJobId], ['sale_id', saleId]] as const) {
+  const notificationId = value.notification_id ?? null;
+  for (const [name, id] of [
+    ['string_job_id', stringJobId],
+    ['sale_id', saleId],
+    ['notification_id', notificationId],
+  ] as const) {
     if (id !== null && (typeof id !== 'string' || !UUID.test(id))) return { error: `${name} must be an id` };
   }
-  return { stringJobId: stringJobId as string | null, saleId: saleId as string | null };
+  return {
+    stringJobId: stringJobId as string | null,
+    saleId: saleId as string | null,
+    notificationId: notificationId as string | null,
+  };
 }
 
 /** Claim the queued messages and send each, recording every outcome. */
 export async function sendQueued(
-  filter: { stringJobId: string | null; saleId: string | null },
+  filter: SendFilter,
   deps: SenderDeps,
 ): Promise<SendResult[]> {
   const messages = await deps.claim(filter);
@@ -104,8 +121,10 @@ export function resendEmailSender(config: ResendConfig): EmailSender {
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
-          // The same attempt is never sent twice, even if this request is retried.
-          'Idempotency-Key': `acestock-${message.id}-${message.attempts}`,
+          // A message is delivered once however often this request is retried or
+          // the message is taken again; only Send again on a finished message
+          // (resend_count) makes a new send.
+          'Idempotency-Key': `acestock-${message.id}-r${message.resend_count}`,
         },
         body: JSON.stringify({
           from: config.from,

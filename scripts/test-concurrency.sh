@@ -425,12 +425,13 @@ check "a racquet moved while a job is entered for it" "$n" \
     ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_8}' and status = 'entered') || ' job(s) open'
     from customer_rackets where id = '${RACKET_8}'")"
 
-# 20. Two senders claim the same queued message (0086): it's claimed, so sent,
-#     only once (claim_notifications takes rows FOR UPDATE SKIP LOCKED).
-NOTE_ID=$(psql_run -c "insert into notifications (kind, channel, customer_id, string_job_id, to_address, body)
-  values ('job_ready', 'email', '${CUSTOMER}', '${JOB}', 'race@example.com', '${RUN_TAG}') returning id")
+# 20. Two senders claim the same queued message (0086, 0088): it's claimed, so
+#     sent, only once (claim_notifications takes rows FOR UPDATE SKIP LOCKED).
+#     A receipt email, so the ready-message checks (0088) don't come into it.
+NOTE_ID=$(psql_run -c "insert into notifications (kind, channel, customer_id, to_address, subject, body)
+  values ('receipt', 'email', '${CUSTOMER}', 'race@example.com', 'Receipt', '${RUN_TAG}') returning id")
 claim_one="do \$\$ begin
-  if not exists (select 1 from claim_notifications(p_string_job_id => '${JOB}') where id = '${NOTE_ID}') then
+  if not exists (select 1 from claim_notifications(p_id => '${NOTE_ID}')) then
     raise exception 'not claimed';
   end if; end \$\$"
 n=$(race "${claim_one}")
