@@ -25,6 +25,8 @@ select is(
     'ensure_gift_card',
     -- answer only about the caller
     'is_admin', 'is_staff',
+    -- writes: calls require_staff() (0087)
+    'queue_receipt_email',
     -- read-only: calls require_staff()
     'quote_sale',
     'receive_stock', 'receive_units',
