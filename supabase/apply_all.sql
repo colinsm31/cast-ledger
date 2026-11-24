@@ -13348,4 +13348,5661 @@ revoke all on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) from p
 grant execute on function quote_sale(jsonb, uuid, jsonb, uuid) to authenticated;
 grant execute on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) to authenticated;
 
+-- >>> supabase/migrations/0063_string_job_promise.sql
+-- =============================================================================
+-- 0063_string_job_promise.sql — promised time and rush on string jobs
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • A string job had no due time. The open queue was in drop-off order, so a
+--     job promised for this afternoon looked the same as one due next week.
+--
+-- Now:
+--   1. string_jobs.promised_at: when the customer was told it would be ready.
+--      A new job without one is promised settings.stringing_turnaround_hours
+--      (default 24) after it's taken in.
+--   2. string_jobs.is_rush: a rush job is pinned to the top of the queue.
+--   3. Both can be changed while the job is waiting to be strung, never after.
+--      A promised time can't be cleared, can't be set in the past, and is at
+--      most 90 days after drop-off.
+--
+-- Jobs taken in before this migration keep no promised time. Re-runnable.
+-- =============================================================================
+
+alter table settings add column if not exists stringing_turnaround_hours integer not null default 24;
+alter table settings drop constraint if exists ck_settings_stringing_turnaround_hours;
+alter table settings add constraint ck_settings_stringing_turnaround_hours
+  check (stringing_turnaround_hours between 1 and 720);
+comment on column settings.stringing_turnaround_hours is
+  'How long after drop-off a string job is promised, unless staff set a time';
+
+alter table string_jobs add column if not exists promised_at timestamptz;
+alter table string_jobs add column if not exists is_rush boolean not null default false;
+comment on column string_jobs.promised_at is 'When the customer was told the job would be ready';
+comment on column string_jobs.is_rush is 'A rush job goes to the top of the queue';
+
+create index if not exists ix_string_jobs_open_promised
+  on string_jobs (is_rush desc, promised_at)
+  where status = 'entered';
+
+grant update (promised_at, is_rush) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_promise — the default promise and its rules
+-- -----------------------------------------------------------------------------
+-- Runs after guard_new_string_job (trigger names sort that way), so a client's
+-- new job already has its entered_at.
+create or replace function guard_string_job_promise()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_client boolean := current_user in ('authenticated', 'anon');
+begin
+  if tg_op = 'INSERT' then
+    if new.promised_at is null then
+      new.promised_at := new.entered_at
+        + make_interval(hours => coalesce((select stringing_turnaround_hours from settings where id), 24));
+      return new;
+    end if;
+  else
+    if new.promised_at is not distinct from old.promised_at and new.is_rush = old.is_rush then
+      return new;
+    end if;
+    if v_client and old.status <> 'entered' then
+      raise exception 'The racquet has been strung, so its promised time and rush can''t change';
+    end if;
+    if new.promised_at is null and old.promised_at is not null then
+      raise exception 'A string job needs a promised time';
+    end if;
+    if new.promised_at is not distinct from old.promised_at then
+      return new;
+    end if;
+  end if;
+
+  if v_client then
+    if new.promised_at < now() - interval '5 minutes' then
+      raise exception 'The promised time (%) has already passed', to_char(new.promised_at, 'Mon DD HH24:MI');
+    end if;
+    if new.promised_at > new.entered_at + interval '90 days' then
+      raise exception 'Promise the job within 90 days of drop-off';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_string_job_promise on string_jobs;
+create trigger trg_string_job_promise
+  before insert or update of promised_at, is_rush on string_jobs
+  for each row execute function guard_string_job_promise();
+
+-- >>> supabase/migrations/0064_string_job_assignment.sql
+-- =============================================================================
+-- 0064_string_job_assignment.sql — assign string jobs to a stringer
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • Who strung a job (strung_by) was only recorded when it was finished, so
+--     the queue couldn't show who a waiting job was meant for.
+--
+-- Now:
+--   1. string_jobs.assigned_to: the stringer a waiting job is assigned to, by
+--      the same names as strung_by (the 'stringer' list). It can change while
+--      the job waits to be strung, never after; blank means unassigned.
+--   2. advance_string_job: marking a job complete with no stringer recorded
+--      records the one it was assigned to. Otherwise it's as 0051: explicit
+--      transitions, row lock, a stringer before 'complete', paid before
+--      delivery, owner rights, staff only.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists assigned_to text;
+alter table string_jobs drop constraint if exists ck_string_jobs_assigned_to;
+alter table string_jobs add constraint ck_string_jobs_assigned_to
+  check (assigned_to = trim(assigned_to) and char_length(assigned_to) between 1 and 60);
+comment on column string_jobs.assigned_to is 'The stringer a waiting job is assigned to (null = unassigned)';
+
+grant update (assigned_to) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_assignment — tidy the name; fixed once strung
+-- -----------------------------------------------------------------------------
+create or replace function guard_string_job_assignment()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  new.assigned_to := nullif(trim(new.assigned_to), '');
+  if tg_op = 'UPDATE'
+     and new.assigned_to is distinct from old.assigned_to
+     and old.status <> 'entered'
+     and current_user in ('authenticated', 'anon') then
+    raise exception 'The racquet has been strung, so who it''s assigned to can''t change';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_string_job_assignment on string_jobs;
+create trigger trg_string_job_assignment
+  before insert or update of assigned_to on string_jobs
+  for each row execute function guard_string_job_assignment();
+
+-- -----------------------------------------------------------------------------
+-- advance_string_job — same as 0051, plus: the assigned stringer by default
+-- -----------------------------------------------------------------------------
+create or replace function advance_string_job(
+  p_job_id        uuid,
+  p_target_status text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current  text;
+  v_main     uuid;
+  v_cross    uuid;
+  v_paid     uuid;
+  v_strung   text;
+begin
+  perform require_staff();
+
+  if p_target_status is null
+     or p_target_status not in ('entered', 'complete', 'delivered', 'cancelled') then
+    raise exception 'Invalid status "%"', p_target_status;
+  end if;
+
+  -- Lock the job so a second click (or register) waits, then sees this one's result.
+  select status, main_product_id, cross_product_id, paid_sale_id,
+         coalesce(nullif(trim(strung_by), ''), assigned_to)
+    into v_current, v_main, v_cross, v_paid, v_strung
+    from string_jobs where id = p_job_id
+    for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+
+  if (v_current, p_target_status) not in (('entered', 'complete'), ('complete', 'delivered')) then
+    raise exception 'Cannot move a string job from "%" to "%"', v_current, p_target_status;
+  end if;
+  if p_target_status = 'delivered' and v_paid is null then
+    raise exception 'Take payment for this string job before marking it delivered';
+  end if;
+  if p_target_status = 'complete' and coalesce(trim(v_strung), '') = '' then
+    raise exception 'Record who strung it before marking it complete';
+  end if;
+
+  update string_jobs
+    set status       = p_target_status,
+        strung_by    = case when p_target_status = 'complete'  then v_strung   else strung_by end,
+        completed_at = case when p_target_status = 'complete'  then now()      else completed_at end,
+        completed_by = case when p_target_status = 'complete'  then auth.uid() else completed_by end,
+        delivered_at = case when p_target_status = 'delivered' then now()      else delivered_at end,
+        delivered_by = case when p_target_status = 'delivered' then auth.uid() else delivered_by end
+  where id = p_job_id
+    and status = v_current;
+
+  -- Consume one unit of each distinct catalog string the job used.
+  if p_target_status = 'complete' then
+    insert into inventory_txns (txn_type, product_id, qty, note)
+    select 'consume', pid, -1, 'String job completed'
+    from (
+      select distinct pid
+      from (values (v_main), (v_cross)) as t(pid)
+      where pid is not null
+    ) d;
+  end if;
+
+  return p_target_status;
+end;
+$$;
+
+revoke all on function advance_string_job(uuid, text) from public, anon;
+grant execute on function advance_string_job(uuid, text) to authenticated;
+
+-- >>> supabase/migrations/0065_customer_supplied_string.sql
+-- =============================================================================
+-- 0065_customer_supplied_string.sql — the customer brings their own string
+-- (AceStock, Phase 3A)
+--
+-- Before:
+--   • Both the mains and the crosses had to be catalog strings, so a job where
+--     the customer brought a set of string couldn't be entered at all.
+--
+-- Now:
+--   1. string_jobs.main_customer_supplied / cross_customer_supplied: that side
+--      uses the customer's own string. It has no catalog product, so no stock
+--      is set aside or used up for it and it adds nothing to the price; its
+--      brand and name are typed in (the name is required, each at most 80
+--      characters). A hybrid can mix the customer's mains with the shop's
+--      crosses, or the other way round.
+--   2. guard_string_job_strings: as 0043 for a shop string; a customer side
+--      needs a name and no product. Whose string a side uses is fixed once
+--      the job is paid (the price was set by it) or strung.
+--   3. guard_strung_job_strings: as 0042, also covering the two new columns.
+--   4. The trigger functions added in 0063 and 0064 can't be called by
+--      anyone, like the other trigger functions (0040).
+--
+-- The strings' price (string_job_strings_price) already skips a side with no
+-- product, so a customer side is labor only. Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists main_customer_supplied boolean not null default false;
+alter table string_jobs add column if not exists cross_customer_supplied boolean not null default false;
+comment on column string_jobs.main_customer_supplied is 'The mains are the customer''s own string (no catalog product)';
+comment on column string_jobs.cross_customer_supplied is 'The crosses are the customer''s own string (no catalog product)';
+
+grant update (main_customer_supplied, cross_customer_supplied) on string_jobs to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_strung_job_strings — same as 0042, plus whose string each side is
+-- -----------------------------------------------------------------------------
+create or replace function guard_strung_job_strings()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if old.status <> 'entered'
+     and (new.main_product_id, new.main_brand, new.main_string, new.main_specs, new.main_tension,
+          new.cross_product_id, new.cross_brand, new.cross_string, new.cross_specs, new.cross_tension,
+          new.main_customer_supplied, new.cross_customer_supplied)
+         is distinct from
+         (old.main_product_id, old.main_brand, old.main_string, old.main_specs, old.main_tension,
+          old.cross_product_id, old.cross_brand, old.cross_string, old.cross_specs, old.cross_tension,
+          old.main_customer_supplied, old.cross_customer_supplied) then
+    raise exception 'The strings on a % string job can''t be changed', old.status;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_guard_strung_job_strings on string_jobs;
+create trigger trg_guard_strung_job_strings
+  before update of main_product_id, main_brand, main_string, main_specs, main_tension,
+                   cross_product_id, cross_brand, cross_string, cross_specs, cross_tension,
+                   main_customer_supplied, cross_customer_supplied
+  on string_jobs
+  for each row execute function guard_strung_job_strings();
+
+-- -----------------------------------------------------------------------------
+-- customer_string_side — one customer-supplied side: its tidied brand and name
+-- -----------------------------------------------------------------------------
+create or replace function customer_string_side(
+  p_product_id uuid,
+  p_brand      text,
+  p_name       text,
+  p_side       text
+)
+returns table (brand text, name text)
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_brand text := nullif(trim(p_brand), '');
+  v_name  text := nullif(trim(p_name), '');
+begin
+  if p_product_id is not null then
+    raise exception 'The % are the customer''s own string, so they can''t be a catalog string too', p_side;
+  end if;
+  if v_name is null then
+    raise exception 'Enter the customer''s % string', p_side;
+  end if;
+  if char_length(v_name) > 80 or char_length(coalesce(v_brand, '')) > 80 then
+    raise exception 'The customer''s % string: use at most 80 characters for the brand and the name', p_side;
+  end if;
+  return query select v_brand, v_name;
+end;
+$$;
+
+-- The string guard runs with the caller's rights, so staff can call this; it
+-- only checks and tidies the text it's given.
+revoke all on function customer_string_side(uuid, text, text, text) from public, anon;
+grant execute on function customer_string_side(uuid, text, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_string_job_strings — same as 0043, plus customer-supplied sides
+-- -----------------------------------------------------------------------------
+create or replace function guard_string_job_strings()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_main          record;
+  v_cross         record;
+  v_main_shop     boolean := not new.main_customer_supplied;
+  v_cross_shop    boolean := not new.cross_customer_supplied;
+  v_check_main    boolean;
+  v_check_cross   boolean;
+  v_strings_moved boolean;
+  v_new_price     numeric;
+  v_old_price     numeric;
+begin
+  -- Only entered jobs, and only writes by a signed-in user. A strung job's
+  -- strings are refused by trg_guard_strung_job_strings.
+  if auth.uid() is null or new.status <> 'entered' then
+    return new;
+  end if;
+
+  -- A paid job's price was set by whose string it uses.
+  if tg_op = 'UPDATE' and old.paid_sale_id is not null
+     and (new.main_customer_supplied, new.cross_customer_supplied)
+         is distinct from (old.main_customer_supplied, old.cross_customer_supplied) then
+    raise exception 'This job is paid, so whose string it uses can''t change';
+  end if;
+
+  if (v_main_shop and new.main_product_id is null) or (v_cross_shop and new.cross_product_id is null) then
+    raise exception 'Choose the mains and crosses strings from the catalog';
+  end if;
+  if new.main_tension is null or new.cross_tension is null then
+    raise exception 'Enter the mains and crosses tension';
+  end if;
+
+  -- Availability is checked for shop strings the job doesn't already hold.
+  v_check_main := v_main_shop
+    and (tg_op = 'INSERT'
+         or (new.main_product_id is distinct from old.main_product_id
+             and new.main_product_id is distinct from old.cross_product_id));
+  v_check_cross := v_cross_shop
+    and new.cross_product_id is distinct from new.main_product_id
+    and (tg_op = 'INSERT'
+         or (new.cross_product_id is distinct from old.main_product_id
+             and new.cross_product_id is distinct from old.cross_product_id));
+
+  -- Each shop string's check locks it; take them in id order so two registers
+  -- choosing the same pair of strings can't deadlock.
+  if v_main_shop and v_cross_shop and new.cross_product_id < new.main_product_id then
+    select * into v_cross from string_job_side(new.cross_product_id, new.id, v_check_cross, 'crosses');
+    select * into v_main  from string_job_side(new.main_product_id,  new.id, v_check_main,  'mains');
+  else
+    if v_main_shop then
+      select * into v_main from string_job_side(new.main_product_id, new.id, v_check_main, 'mains');
+    else
+      select s.brand, s.name, '{}'::jsonb as specs into v_main
+        from customer_string_side(new.main_product_id, new.main_brand, new.main_string, 'mains') s;
+    end if;
+    if v_cross_shop then
+      select * into v_cross from string_job_side(new.cross_product_id, new.id, v_check_cross, 'crosses');
+    else
+      select s.brand, s.name, '{}'::jsonb as specs into v_cross
+        from customer_string_side(new.cross_product_id, new.cross_brand, new.cross_string, 'crosses') s;
+    end if;
+  end if;
+
+  new.main_brand   := v_main.brand;
+  new.main_string  := v_main.name;
+  new.main_specs   := v_main.specs;
+  new.cross_brand  := v_cross.brand;
+  new.cross_string := v_cross.name;
+  new.cross_specs  := v_cross.specs;
+
+  -- Record the strings' catalog price when they're chosen (not on a
+  -- tension-only edit, so later catalog price changes don't count). A
+  -- customer's string has no product, so it adds nothing.
+  v_strings_moved := tg_op = 'INSERT'
+    or (new.main_product_id, new.cross_product_id) is distinct from (old.main_product_id, old.cross_product_id);
+  if v_strings_moved then
+    v_new_price := string_job_strings_price(new.main_product_id, new.cross_product_id);
+    if tg_op = 'UPDATE' and old.paid_sale_id is not null
+       and coalesce(current_setting('acestock.string_change_job', true), '') <> old.id::text then
+      v_old_price := coalesce(old.strings_price, string_job_strings_price(old.main_product_id, old.cross_product_id));
+      if v_new_price <> v_old_price then
+        raise exception 'This job was paid for strings costing $%; the new strings cost $%. Use String change to settle the difference',
+          to_char(v_old_price, 'FM999999990.00'), to_char(v_new_price, 'FM999999990.00');
+      end if;
+    end if;
+    new.strings_price := v_new_price;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_string_job_strings() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_string_job_strings on string_jobs;
+create trigger trg_guard_string_job_strings
+  before insert or update of main_product_id, main_brand, main_string, main_specs, main_tension,
+                             cross_product_id, cross_brand, cross_string, cross_specs, cross_tension,
+                             main_customer_supplied, cross_customer_supplied
+  on string_jobs
+  for each row execute function guard_string_job_strings();
+
+-- -----------------------------------------------------------------------------
+-- 0063 and 0064's trigger functions, closed like the others
+-- -----------------------------------------------------------------------------
+revoke all on function guard_string_job_promise() from public, anon, authenticated;
+revoke all on function guard_string_job_assignment() from public, anon, authenticated;
+
+-- >>> supabase/migrations/0066_string_job_numbers.sql
+-- =============================================================================
+-- 0066_string_job_numbers.sql — a number for every string job, and scanning
+-- its tag (AceStock, Phase 3A)
+--
+-- Before:
+--   • A string job had no number of its own: staff found it through the
+--     customer or the racquet's tag, and nothing printed could name it.
+--
+-- Now:
+--   1. string_jobs.job_number: a short number, given in order from 1001
+--      (existing jobs are numbered too). It's printed on the job's tag as the
+--      barcode "J1042" and can't be set or changed by anyone.
+--   2. resolve_barcode: as 0045, plus a job tag ("J1042", any case) resolves
+--      to kind 'job' with the job, its customer and (as open_job_id) the job
+--      itself. Every other barcode is looked up first, so an existing code
+--      that happens to look like a job number still finds what it did.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table string_jobs add column if not exists job_number bigint generated always as identity (start with 1001);
+create unique index if not exists uq_string_jobs_job_number on string_jobs (job_number);
+comment on column string_jobs.job_number is 'The job''s number, printed on its tag as J<number>';
+
+-- -----------------------------------------------------------------------------
+-- resolve_barcode — same as 0045, plus job tags
+-- -----------------------------------------------------------------------------
+create or replace function resolve_barcode(p_code text)
+returns table (
+  kind          text,
+  code          text,
+  id            uuid,      -- the matched thing's id (product / unit / racket / gift card / job)
+  product_id    uuid,      -- for a unit: its catalog product; else null
+  customer_id   uuid,
+  open_job_id   uuid,
+  brand         text,
+  name          text,
+  attributes    jsonb,
+  sell_price    numeric,
+  is_serialized boolean,
+  unit_status   text       -- for a unit: its status; else null
+)
+language plpgsql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_code       text := regexp_replace(coalesce(p_code, ''), '\s+', '', 'g');
+  v_candidates text[];
+  v_product    products%rowtype;
+  v_unit       product_units%rowtype;
+  v_racket     customer_rackets%rowtype;
+  v_gift_card  gift_cards%rowtype;
+  v_job_id     uuid;
+  v_job_number bigint;
+  v_customer   uuid;
+begin
+  if v_code = '' then
+    return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- EAN-13 with a leading zero <-> UPC-A.
+  v_candidates := array[v_code];
+  if v_code ~ '^0[0-9]{12}$' then
+    v_candidates := v_candidates || substr(v_code, 2);
+  elsif v_code ~ '^[0-9]{12}$' then
+    v_candidates := v_candidates || ('0' || v_code);
+  end if;
+
+  -- Product UPC.
+  select * into v_product from products p where p.barcode = any (v_candidates)
+   order by (p.barcode = v_code) desc limit 1;
+  if found then
+    return query select 'product', v_product.barcode, v_product.id, null::uuid, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        v_product.is_serialized, null::text;
+    return;
+  end if;
+
+  -- Individual unit's personal barcode.
+  select * into v_unit from product_units u where u.barcode = any (v_candidates)
+   order by (u.barcode = v_code) desc limit 1;
+  if found then
+    select * into v_product from products p where p.id = v_unit.product_id;
+    return query select 'unit', v_unit.barcode, v_unit.id, v_unit.product_id, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        true, v_unit.status;
+    return;
+  end if;
+
+  -- Customer racket tag (active rackets only).
+  select * into v_racket
+  from customer_rackets r
+  where r.barcode = any (v_candidates) and r.is_active
+  order by (r.barcode = v_code) desc
+  limit 1;
+  if found then
+    return query select 'racket', v_racket.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                        (select j.id from string_jobs j
+                          where j.customer_racket_id = v_racket.id
+                            and j.status in ('entered', 'complete')
+                          order by j.entered_at desc limit 1),
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  select * into v_gift_card from gift_cards g where g.code = any (v_candidates)
+   order by (g.code = v_code) desc limit 1;
+  if found then
+    return query select 'gift_card', v_gift_card.code, v_gift_card.id, null::uuid, v_gift_card.customer_id, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- A string job's tag: J and its number.
+  if v_code ~* '^J[0-9]{1,15}$' then
+    select j.id, j.job_number, r.customer_id into v_job_id, v_job_number, v_customer
+      from string_jobs j
+      join customer_rackets r on r.id = j.customer_racket_id
+     where j.job_number = substr(v_code, 2)::bigint;
+    if found then
+      return query select 'job', 'J' || v_job_number, v_job_id, null::uuid, v_customer, v_job_id,
+                          null::text, null::text, null::jsonb, null::numeric, false, null::text;
+      return;
+    end if;
+  end if;
+
+  return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                      null::text, null::text, null::jsonb, null::numeric, false, null::text;
+end;
+$$;
+
+revoke all on function resolve_barcode(text) from public, anon;
+grant execute on function resolve_barcode(text) to authenticated;
+
+-- >>> supabase/migrations/0067_unit_status_changes.sql
+-- =============================================================================
+-- 0067_unit_status_changes.sql — retire a frame or move it to demo, with a
+-- reason, and keep each frame's history (AceStock, Phase 3B)
+--
+-- Before:
+--   • A frame (product_units row) only changed status when it was sold. A
+--     damaged frame or one set aside as a demo couldn't be taken out of
+--     stock, and nothing recorded why or by whom.
+--
+-- Now:
+--   1. unit_status_changes: every status a frame has had — received, sold,
+--      moved to demo, retired, back in stock — with the reason, the sale (for
+--      a sale), who did it and when. Written by a trigger on product_units, so
+--      sales and receipts are recorded too. Read-only for staff.
+--   2. set_unit_status(unit, status, reason): staff move a frame between
+--      in_stock, demo and retired, giving a reason (at most 200 characters).
+--      'sold' is set by sales (and, later, returns); 'assigned' is left for the
+--      demo program (3C). Owner rights, staff only, the frame locked.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create table if not exists unit_status_changes (
+  id              uuid primary key default gen_random_uuid(),
+  product_unit_id uuid not null references product_units (id),
+  from_status     text,           -- null when the frame was received
+  to_status       text not null,
+  reason          text,
+  sale_id         uuid references sales (id),
+  refund_id       uuid references refunds (id),
+  changed_by      uuid references profiles (id),
+  changed_at      timestamptz not null default now()
+);
+comment on table unit_status_changes is 'Each status a frame has had, with why and who';
+create index if not exists ix_unit_status_changes_unit on unit_status_changes (product_unit_id, changed_at);
+
+alter table unit_status_changes enable row level security;
+drop policy if exists unit_status_changes_staff_select on unit_status_changes;
+create policy unit_status_changes_staff_select on unit_status_changes
+  for select to authenticated using (is_staff());
+revoke all on unit_status_changes from anon;
+revoke insert, update, delete, truncate on unit_status_changes from authenticated;
+grant select on unit_status_changes to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- log_unit_status — record each status a frame takes
+-- -----------------------------------------------------------------------------
+-- The reason and refund come from settings set by the function making the
+-- change (acestock.unit_status_reason, acestock.unit_refund_id) for this
+-- transaction only.
+create or replace function log_unit_status()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'UPDATE' and new.status is not distinct from old.status then
+    return new;
+  end if;
+  insert into unit_status_changes (product_unit_id, from_status, to_status, reason, sale_id, refund_id, changed_by)
+  values (
+    new.id,
+    case when tg_op = 'UPDATE' then old.status end,
+    new.status,
+    nullif(current_setting('acestock.unit_status_reason', true), ''),
+    case when new.status = 'sold' then new.sale_id end,
+    nullif(current_setting('acestock.unit_refund_id', true), '')::uuid,
+    auth.uid()
+  );
+  return new;
+end;
+$$;
+
+revoke all on function log_unit_status() from public, anon, authenticated;
+
+drop trigger if exists trg_log_unit_status on product_units;
+create trigger trg_log_unit_status
+  after insert or update of status on product_units
+  for each row execute function log_unit_status();
+
+-- Frames already in the shop start their history as they are now.
+insert into unit_status_changes (product_unit_id, from_status, to_status, reason, sale_id, changed_at)
+select u.id, null, u.status, 'Status when history began', u.sale_id, u.created_at
+  from product_units u
+ where not exists (select 1 from unit_status_changes c where c.product_unit_id = u.id);
+
+-- -----------------------------------------------------------------------------
+-- set_unit_status — staff move a frame in or out of stock, with a reason
+-- -----------------------------------------------------------------------------
+create or replace function set_unit_status(
+  p_unit_id uuid,
+  p_status  text,
+  p_reason  text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current text;
+  v_reason  text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_staff();
+
+  if p_status is null or p_status not in ('in_stock', 'demo', 'retired') then
+    raise exception 'A frame can be put in stock, in the demo fleet or retired here (not "%")', p_status;
+  end if;
+  if v_reason is null then
+    raise exception 'Give a reason';
+  end if;
+  if char_length(v_reason) > 200 then
+    raise exception 'Keep the reason to 200 characters';
+  end if;
+
+  select status into v_current from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_current = p_status then
+    raise exception 'This frame is already %', replace(p_status, '_', ' ');
+  end if;
+  if v_current not in ('in_stock', 'demo', 'retired') then
+    raise exception 'This frame is %, so it can''t be moved here', v_current;
+  end if;
+
+  perform set_config('acestock.unit_status_reason', v_reason, true);
+  update product_units set status = p_status, updated_at = now() where id = p_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return p_status;
+end;
+$$;
+
+revoke all on function set_unit_status(uuid, text, text) from public, anon;
+grant execute on function set_unit_status(uuid, text, text) to authenticated;
+
+-- >>> supabase/migrations/0068_unit_labels.sql
+-- =============================================================================
+-- 0068_unit_labels.sql — barcodes for frames received without one
+-- (AceStock, Phase 3B)
+--
+-- Before:
+--   • A frame could be received without a barcode ("it can be added later"),
+--     but nothing could add one afterwards, so it couldn't be scanned.
+--
+-- Now:
+--   1. assign_unit_label(unit): gives a frame with no barcode the shop's next
+--      label code, "U" and a number from 10001, skipping any code already in
+--      use, and returns it (or the frame's barcode, if it has one) for
+--      printing. Scanning the label finds the frame like any unit barcode.
+--   2. set_unit_barcode(unit, barcode): records a barcode typed or scanned
+--      later for a frame that has none (at most 64 characters, no spaces).
+--      A frame's barcode isn't changed once set.
+--
+-- Both are owner rights, staff only, and lock the frame; the barcode rules of
+-- 0045 (one code, one thing) still apply. Re-runnable.
+-- =============================================================================
+
+create sequence if not exists unit_label_seq start with 10001;
+revoke all on sequence unit_label_seq from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- assign_unit_label — the shop's next label code for a frame with none
+-- -----------------------------------------------------------------------------
+create or replace function assign_unit_label(p_unit_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_barcode text;
+  v_code    text;
+begin
+  perform require_staff();
+
+  select barcode into v_barcode from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_barcode is not null then
+    return v_barcode;
+  end if;
+
+  loop
+    v_code := 'U' || nextval('unit_label_seq');
+    exit when barcode_owner(v_code, 'product_units', p_unit_id) is null;
+  end loop;
+
+  update product_units set barcode = v_code, updated_at = now() where id = p_unit_id;
+  return v_code;
+end;
+$$;
+
+revoke all on function assign_unit_label(uuid) from public, anon;
+grant execute on function assign_unit_label(uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- set_unit_barcode — a barcode added later
+-- -----------------------------------------------------------------------------
+create or replace function set_unit_barcode(p_unit_id uuid, p_barcode text)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_code    text := btrim(coalesce(p_barcode, ''));
+  v_barcode text;
+begin
+  perform require_staff();
+
+  if v_code = '' then
+    raise exception 'Scan or type the barcode';
+  end if;
+  if v_code !~ '^\S{1,64}$' then
+    raise exception 'A barcode is at most 64 characters, with no spaces';
+  end if;
+
+  select barcode into v_barcode from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_barcode is not null then
+    raise exception 'This frame already has barcode %', v_barcode;
+  end if;
+
+  update product_units set barcode = v_code, updated_at = now() where id = p_unit_id;
+  return v_code;
+end;
+$$;
+
+revoke all on function set_unit_barcode(uuid, text) from public, anon;
+grant execute on function set_unit_barcode(uuid, text) to authenticated;
+
+-- >>> supabase/migrations/0069_sell_strung.sql
+-- =============================================================================
+-- 0069_sell_strung.sql — a racquet sold to a customer becomes one of their
+-- racquets (AceStock, Phase 3B)
+--
+-- Before:
+--   • Selling a frame to a customer didn't add it to their racquets, so
+--     stringing it in the same visit meant adding it by hand first, and its
+--     barcode couldn't be its tag (a unit's barcode was taken).
+--
+-- Now:
+--   1. customer_rackets.product_unit_id: the frame a customer's racquet came
+--      from (at most one active racquet per frame).
+--   2. add_sold_racket (trigger on product_units): when a frame is sold to a
+--      customer, it's added to their racquets with its brand, model, grip and
+--      barcode as the tag. If that barcode is already used by something else,
+--      the racquet is added without one. A sale to nobody adds nothing.
+--   3. barcode_owner: a racquet may share the barcode of the frame it came
+--      from, and that frame may keep it; everything else is as 0045, except
+--      that leaving out the row being written (p_id) is null-safe, so a check
+--      for a row not yet written (p_id null) sees every owner. The
+--      three-argument form stays for its callers.
+--   4. guard_unique_barcode: as 0045, passing a racquet's frame along.
+--   5. resolve_barcode: as 0066, except that a sold frame with a racquet made
+--      from it resolves as that racquet (kind 'racket', with its open job),
+--      so scanning it starts or opens the customer's string job.
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table customer_rackets add column if not exists product_unit_id uuid references product_units (id);
+comment on column customer_rackets.product_unit_id is 'The frame this racquet came from, when it was bought here';
+create unique index if not exists uq_customer_rackets_unit
+  on customer_rackets (product_unit_id) where is_active and product_unit_id is not null;
+
+-- -----------------------------------------------------------------------------
+-- barcode_owner — same as 0045, plus a racquet and its own frame share a code
+-- -----------------------------------------------------------------------------
+create or replace function barcode_owner(p_code text, p_table text, p_id uuid, p_own_unit uuid)
+returns text
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_canon text := barcode_canonical(p_code);
+  v_owner text;
+begin
+  select 'the UPC of ' || trim(coalesce(p.brand || ' ', '') || p.name) into v_owner
+    from products p
+   where p.barcode is not null and barcode_canonical(p.barcode) = v_canon
+     and not (p_table = 'products' and p.id is not distinct from p_id)
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  -- A racquet may carry the barcode of the frame it came from (p_own_unit).
+  select 'the barcode of a ' || trim(coalesce(p.brand || ' ', '') || p.name) || ' unit' into v_owner
+    from product_units u join products p on p.id = u.product_id
+   where u.barcode is not null and barcode_canonical(u.barcode) = v_canon
+     and not (p_table = 'product_units' and u.id is not distinct from p_id)
+     and u.id is distinct from p_own_unit
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  -- ... and a frame may keep the barcode its own racquet carries.
+  select 'the tag on ' || c.first_name || ' ' || c.last_name || '''s '
+         || trim(coalesce(r.brand || ' ', '') || r.model) into v_owner
+    from customer_rackets r join customers c on c.id = r.customer_id
+   where r.is_active and r.barcode is not null and barcode_canonical(r.barcode) = v_canon
+     and not (p_table = 'customer_rackets' and r.id is not distinct from p_id)
+     and not (p_table = 'product_units' and r.product_unit_id is not distinct from p_id)
+   limit 1;
+  if v_owner is not null then return v_owner; end if;
+
+  if p_table <> 'gift_cards' then
+    select 'a gift card''s code' into v_owner
+      from gift_cards g
+     where barcode_canonical(g.code) = v_canon
+     limit 1;
+  end if;
+  return v_owner;
+end;
+$$;
+
+create or replace function barcode_owner(p_code text, p_table text, p_id uuid)
+returns text
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select barcode_owner(p_code, p_table, p_id, null::uuid);
+$$;
+
+revoke all on function barcode_owner(text, text, uuid, uuid) from public, anon, authenticated;
+revoke all on function barcode_owner(text, text, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_unique_barcode — same as 0045, passing a racquet's own frame along
+-- -----------------------------------------------------------------------------
+create or replace function guard_unique_barcode()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row   jsonb := to_jsonb(new);  -- the four tables name the column differently
+  v_code  text;
+  v_owner text;
+begin
+  v_code := v_row ->> case tg_table_name when 'gift_cards' then 'code' else 'barcode' end;
+  if v_code is null or btrim(v_code) = '' then
+    return new;
+  end if;
+  -- A retired racquet's tag is free to reuse.
+  if tg_table_name = 'customer_rackets' and not (v_row ->> 'is_active')::boolean then
+    return new;
+  end if;
+
+  -- Two registers claiming the same code wait for each other here.
+  perform pg_advisory_xact_lock(hashtext('acestock.barcode:' || barcode_canonical(v_code)));
+
+  v_owner := barcode_owner(v_code, tg_table_name, new.id,
+                           case when tg_table_name = 'customer_rackets' then (v_row ->> 'product_unit_id')::uuid end);
+  if v_owner is not null then
+    raise exception 'Barcode % is already %', v_code, v_owner;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_unique_barcode() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- add_sold_racket — a frame sold to a customer joins their racquets
+-- -----------------------------------------------------------------------------
+create or replace function add_sold_racket()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_product products%rowtype;
+  v_tag     text := new.barcode;
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null then
+    return new;
+  end if;
+  if exists (select 1 from customer_rackets where product_unit_id = new.id and is_active) then
+    return new;
+  end if;
+
+  select * into v_product from products where id = new.product_id;
+  -- Never let a taken code stop the sale: add the racquet without a tag.
+  if v_tag is not null then
+    perform pg_advisory_xact_lock(hashtext('acestock.barcode:' || barcode_canonical(v_tag)));
+    if barcode_owner(v_tag, 'customer_rackets', null, new.id) is not null then
+      v_tag := null;
+    end if;
+  end if;
+
+  insert into customer_rackets (customer_id, product_id, product_unit_id, brand, model, grip_size, barcode)
+  values (new.customer_id, new.product_id, new.id, v_product.brand, v_product.name,
+          nullif(v_product.attributes ->> 'grip_size', ''), v_tag);
+  return new;
+end;
+$$;
+
+revoke all on function add_sold_racket() from public, anon, authenticated;
+
+drop trigger if exists trg_add_sold_racket on product_units;
+create trigger trg_add_sold_racket
+  after update of status on product_units
+  for each row execute function add_sold_racket();
+
+-- -----------------------------------------------------------------------------
+-- resolve_barcode — same as 0066, plus a sold frame resolves as its racquet
+-- -----------------------------------------------------------------------------
+create or replace function resolve_barcode(p_code text)
+returns table (
+  kind          text,
+  code          text,
+  id            uuid,      -- the matched thing's id (product / unit / racket / gift card / job)
+  product_id    uuid,      -- for a unit: its catalog product; else null
+  customer_id   uuid,
+  open_job_id   uuid,
+  brand         text,
+  name          text,
+  attributes    jsonb,
+  sell_price    numeric,
+  is_serialized boolean,
+  unit_status   text       -- for a unit: its status; else null
+)
+language plpgsql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_code       text := regexp_replace(coalesce(p_code, ''), '\s+', '', 'g');
+  v_candidates text[];
+  v_product    products%rowtype;
+  v_unit       product_units%rowtype;
+  v_racket     customer_rackets%rowtype;
+  v_gift_card  gift_cards%rowtype;
+  v_job_id     uuid;
+  v_job_number bigint;
+  v_customer   uuid;
+begin
+  if v_code = '' then
+    return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- EAN-13 with a leading zero <-> UPC-A.
+  v_candidates := array[v_code];
+  if v_code ~ '^0[0-9]{12}$' then
+    v_candidates := v_candidates || substr(v_code, 2);
+  elsif v_code ~ '^[0-9]{12}$' then
+    v_candidates := v_candidates || ('0' || v_code);
+  end if;
+
+  -- Product UPC.
+  select * into v_product from products p where p.barcode = any (v_candidates)
+   order by (p.barcode = v_code) desc limit 1;
+  if found then
+    return query select 'product', v_product.barcode, v_product.id, null::uuid, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        v_product.is_serialized, null::text;
+    return;
+  end if;
+
+  -- Individual unit's personal barcode.
+  select * into v_unit from product_units u where u.barcode = any (v_candidates)
+   order by (u.barcode = v_code) desc limit 1;
+  if found then
+    -- A frame sold to a customer is their racquet now: its barcode is the tag.
+    if v_unit.status = 'sold' then
+      select * into v_racket from customer_rackets r
+       where r.product_unit_id = v_unit.id and r.is_active
+       limit 1;
+      if found then
+        return query select 'racket', v_unit.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                            (select j.id from string_jobs j
+                              where j.customer_racket_id = v_racket.id
+                                and j.status in ('entered', 'complete')
+                              order by j.entered_at desc limit 1),
+                            null::text, null::text, null::jsonb, null::numeric, false, null::text;
+        return;
+      end if;
+    end if;
+    select * into v_product from products p where p.id = v_unit.product_id;
+    return query select 'unit', v_unit.barcode, v_unit.id, v_unit.product_id, null::uuid, null::uuid,
+                        v_product.brand, v_product.name, v_product.attributes, v_product.sell_price,
+                        true, v_unit.status;
+    return;
+  end if;
+
+  -- Customer racket tag (active rackets only).
+  select * into v_racket
+  from customer_rackets r
+  where r.barcode = any (v_candidates) and r.is_active
+  order by (r.barcode = v_code) desc
+  limit 1;
+  if found then
+    return query select 'racket', v_racket.barcode, v_racket.id, null::uuid, v_racket.customer_id,
+                        (select j.id from string_jobs j
+                          where j.customer_racket_id = v_racket.id
+                            and j.status in ('entered', 'complete')
+                          order by j.entered_at desc limit 1),
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  select * into v_gift_card from gift_cards g where g.code = any (v_candidates)
+   order by (g.code = v_code) desc limit 1;
+  if found then
+    return query select 'gift_card', v_gift_card.code, v_gift_card.id, null::uuid, v_gift_card.customer_id, null::uuid,
+                        null::text, null::text, null::jsonb, null::numeric, false, null::text;
+    return;
+  end if;
+
+  -- A string job's tag: J and its number.
+  if v_code ~* '^J[0-9]{1,15}$' then
+    select j.id, j.job_number, r.customer_id into v_job_id, v_job_number, v_customer
+      from string_jobs j
+      join customer_rackets r on r.id = j.customer_racket_id
+     where j.job_number = substr(v_code, 2)::bigint;
+    if found then
+      return query select 'job', 'J' || v_job_number, v_job_id, null::uuid, v_customer, v_job_id,
+                          null::text, null::text, null::jsonb, null::numeric, false, null::text;
+      return;
+    end if;
+  end if;
+
+  return query select 'none', v_code, null::uuid, null::uuid, null::uuid, null::uuid,
+                      null::text, null::text, null::jsonb, null::numeric, false, null::text;
+end;
+$$;
+
+revoke all on function resolve_barcode(text) from public, anon;
+grant execute on function resolve_barcode(text) to authenticated;
+
+-- >>> supabase/migrations/0070_racquet_returns.sql
+-- =============================================================================
+-- 0070_racquet_returns.sql — return a sold racquet frame (AceStock, Phase 3B)
+--
+-- Before:
+--   • record_refund refused any serialized line ("Returning individual
+--     (serialized) items is not supported yet"), so a sold racquet couldn't
+--     be returned.
+--
+-- Now (record_refund, otherwise the same as 0054):
+--   1. A frame's sale line can be returned, one frame (qty 1) per line. The
+--      refund itself is as for any product: the price paid, the sale's tax
+--      rate, and the payment-type rules.
+--   2. Each returned frame line may say what happens to the frame:
+--        unit_status  'in_stock' (default) or 'retired' (damaged);
+--        unit_reason  why, required when retired (at most 200 characters).
+--      The frame must still be sold on this sale. It leaves the customer
+--      (sale and customer cleared), its history records the return with the
+--      refund, and no stock-ledger row is written (frames are counted).
+--   3. The racquet made from the frame (0069) is taken off the customer's
+--      racquets. A frame whose racquet has a string job open can't be
+--      returned until that job is delivered or cancelled.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- record_refund — same as 0054, plus returned frames
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null then raise exception 'Only product lines can be returned'; end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_sl.unit_price);
+
+    if v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_sl.unit_price;
+  end loop;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Products are taxed.
+  v_tax   := sale_refund_tax(p_sale_id, v_sub, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text) to authenticated;
+
+-- >>> supabase/migrations/0071_demo_loans.sql
+-- =============================================================================
+-- 0071_demo_loans.sql — lend a demo frame to a customer and check it back in
+-- (AceStock, Phase 3C)
+--
+-- Before:
+--   • A frame could be moved to the demo fleet (0067), but nothing recorded
+--     who had it, when it was due back, or what the shop was holding for it.
+--
+-- Now:
+--   1. demo_loans: each time a demo frame goes out — a loan number (D1001
+--      on), the frame, the customer, when it went out and is due back, a
+--      deposit note ("card on file", "$50 cash held": a note only, no money
+--      is taken), who lent it and, once back, who checked it in and whether
+--      it went back to the demo fleet or was retired. One open loan per
+--      frame. Read-only for staff.
+--   2. settings.demo_loan_days (default 3, 1–60): when a loan is due back
+--      unless staff pick a time.
+--   3. check_out_demo(unit, customer, due, deposit note, note): lends a frame
+--      in the demo fleet. The frame becomes 'assigned' to the customer, and
+--      its history (0067) says who it was lent to and the loan number.
+--   4. check_in_demo(loan, status, reason): the frame goes back to the demo
+--      fleet, or is retired (with a reason) if it came back damaged.
+--   5. set_demo_due(loan, due): a new due time for a loan that's still out.
+--      A due time is in the future and at most 90 days away.
+--
+-- All three are owner rights, staff only, and lock the frame or loan.
+-- Re-runnable.
+-- =============================================================================
+
+alter table settings add column if not exists demo_loan_days integer not null default 3;
+alter table settings drop constraint if exists ck_settings_demo_loan_days;
+alter table settings add constraint ck_settings_demo_loan_days check (demo_loan_days between 1 and 60);
+comment on column settings.demo_loan_days is 'How many days a demo loan lasts, unless staff pick a time';
+
+create table if not exists demo_loans (
+  id              uuid primary key default gen_random_uuid(),
+  loan_number     bigint generated always as identity (start with 1001),
+  product_unit_id uuid not null references product_units (id),
+  customer_id     uuid not null references customers (id),
+  out_at          timestamptz not null default now(),
+  out_by          uuid references profiles (id),
+  due_back_at     timestamptz not null,
+  deposit_note    text check (char_length(deposit_note) <= 200),
+  note            text check (char_length(note) <= 200),
+  back_at         timestamptz,
+  back_by         uuid references profiles (id),
+  back_status     text check (back_status in ('demo', 'retired')),
+  back_reason     text check (char_length(back_reason) <= 200),
+  constraint ck_demo_loans_back check ((back_at is null) = (back_status is null))
+);
+comment on table demo_loans is 'Each time a demo frame was lent to a customer';
+create unique index if not exists uq_demo_loans_loan_number on demo_loans (loan_number);
+create unique index if not exists uq_demo_loans_open_unit on demo_loans (product_unit_id) where back_at is null;
+create index if not exists ix_demo_loans_customer on demo_loans (customer_id, out_at desc);
+create index if not exists ix_demo_loans_open_due on demo_loans (due_back_at) where back_at is null;
+
+alter table demo_loans enable row level security;
+drop policy if exists demo_loans_staff_select on demo_loans;
+create policy demo_loans_staff_select on demo_loans
+  for select to authenticated using (is_staff());
+revoke all on demo_loans from anon;
+revoke insert, update, delete, truncate on demo_loans from authenticated;
+grant select on demo_loans to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- demo_due_problem — why a due time can't be used (null if it can)
+-- -----------------------------------------------------------------------------
+create or replace function demo_due_problem(p_due timestamptz)
+returns text
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select case
+    when p_due is null then 'Pick when the demo is due back'
+    when p_due <= now() then 'The due time has to be in the future'
+    when p_due > now() + interval '90 days' then 'A demo can be lent for at most 90 days'
+  end;
+$$;
+
+revoke all on function demo_due_problem(timestamptz) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- check_out_demo — lend a demo frame to a customer
+-- -----------------------------------------------------------------------------
+create or replace function check_out_demo(
+  p_unit_id      uuid,
+  p_customer_id  uuid,
+  p_due_back_at  timestamptz default null,
+  p_deposit_note text default null,
+  p_note         text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_status   text;
+  v_name     text;
+  v_due      timestamptz;
+  v_deposit  text := nullif(btrim(coalesce(p_deposit_note, '')), '');
+  v_note     text := nullif(btrim(coalesce(p_note, '')), '');
+  v_problem  text;
+  v_loan     demo_loans%rowtype;
+begin
+  perform require_staff();
+
+  select btrim(concat_ws(' ', first_name, last_name)) into v_name from customers where id = p_customer_id;
+  if not found then
+    raise exception 'Pick the customer borrowing the demo';
+  end if;
+  if char_length(coalesce(v_deposit, '')) > 200 or char_length(coalesce(v_note, '')) > 200 then
+    raise exception 'Keep each note to 200 characters';
+  end if;
+
+  v_due := coalesce(p_due_back_at,
+                    now() + make_interval(days => coalesce((select demo_loan_days from settings where id), 3)));
+  v_problem := demo_due_problem(v_due);
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+
+  select status into v_status from product_units where id = p_unit_id for update;
+  if not found then
+    raise exception 'Unknown unit %', p_unit_id;
+  end if;
+  if v_status = 'assigned' then
+    raise exception 'This frame is already out on demo';
+  end if;
+  if v_status <> 'demo' then
+    raise exception 'Only a frame in the demo fleet can be lent (this one is %)', replace(v_status, '_', ' ');
+  end if;
+
+  insert into demo_loans (product_unit_id, customer_id, due_back_at, deposit_note, note, out_by)
+  values (p_unit_id, p_customer_id, v_due, v_deposit, v_note, auth.uid())
+  returning * into v_loan;
+
+  perform set_config('acestock.unit_status_reason',
+                     format('Lent to %s (D%s)', coalesce(nullif(v_name, ''), 'a customer'), v_loan.loan_number), true);
+  update product_units set status = 'assigned', customer_id = p_customer_id, updated_at = now() where id = p_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return v_loan.id;
+end;
+$$;
+
+revoke all on function check_out_demo(uuid, uuid, timestamptz, text, text) from public, anon;
+grant execute on function check_out_demo(uuid, uuid, timestamptz, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- check_in_demo — a lent frame comes back
+-- -----------------------------------------------------------------------------
+create or replace function check_in_demo(
+  p_loan_id uuid,
+  p_status  text default 'demo',
+  p_reason  text default null
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_loan   demo_loans%rowtype;
+  v_status text := coalesce(nullif(p_status, ''), 'demo');
+  v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_staff();
+
+  if v_status not in ('demo', 'retired') then
+    raise exception 'A demo comes back to the demo fleet or is retired (not "%")', v_status;
+  end if;
+  if v_status = 'retired' and v_reason is null then
+    raise exception 'Say why the frame is retired';
+  end if;
+  if char_length(coalesce(v_reason, '')) > 200 then
+    raise exception 'Keep the reason to 200 characters';
+  end if;
+
+  select * into v_loan from demo_loans where id = p_loan_id for update;
+  if not found then
+    raise exception 'Unknown demo loan %', p_loan_id;
+  end if;
+  if v_loan.back_at is not null then
+    raise exception 'Demo D% has already been checked in', v_loan.loan_number;
+  end if;
+  perform 1 from product_units where id = v_loan.product_unit_id for update;
+
+  update demo_loans
+     set back_at = now(), back_by = auth.uid(), back_status = v_status, back_reason = v_reason
+   where id = p_loan_id;
+
+  perform set_config('acestock.unit_status_reason',
+                     coalesce(v_reason || format(' (back from D%s)', v_loan.loan_number),
+                              format('Back from D%s', v_loan.loan_number)), true);
+  update product_units set status = v_status, customer_id = null, updated_at = now() where id = v_loan.product_unit_id;
+  perform set_config('acestock.unit_status_reason', '', true);
+  return v_status;
+end;
+$$;
+
+revoke all on function check_in_demo(uuid, text, text) from public, anon;
+grant execute on function check_in_demo(uuid, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- set_demo_due — a new due time for a loan still out
+-- -----------------------------------------------------------------------------
+create or replace function set_demo_due(p_loan_id uuid, p_due_back_at timestamptz)
+returns timestamptz
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_loan    demo_loans%rowtype;
+  v_problem text := demo_due_problem(p_due_back_at);
+begin
+  perform require_staff();
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+
+  select * into v_loan from demo_loans where id = p_loan_id for update;
+  if not found then
+    raise exception 'Unknown demo loan %', p_loan_id;
+  end if;
+  if v_loan.back_at is not null then
+    raise exception 'Demo D% has already been checked in', v_loan.loan_number;
+  end if;
+
+  update demo_loans set due_back_at = p_due_back_at where id = p_loan_id;
+  return p_due_back_at;
+end;
+$$;
+
+revoke all on function set_demo_due(uuid, timestamptz) from public, anon;
+grant execute on function set_demo_due(uuid, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0072_demo_conversions.sql
+-- =============================================================================
+-- 0072_demo_conversions.sql — demos that led to a sale (AceStock, Phase 3C)
+--
+-- Before:
+--   • A demo loan (0071) said who borrowed which frame, but not whether the
+--     customer went on to buy that racquet.
+--
+-- Now:
+--   1. demo_loans.sale_id: the sale the demo led to.
+--   2. link_demo_sale trigger: when a frame is sold to a customer, their
+--      latest loan of a frame of the same racquet (product), taken out in the
+--      30 days before and not yet linked, is linked to the sale. It doesn't
+--      matter whether they buy the demo frame itself (moved back in stock
+--      first) or a new one, or whether the demo is still out.
+--
+-- A walk-in sale (no customer) links nothing. A later return of the frame
+-- leaves the link: the demo still led to that sale. Re-runnable.
+-- =============================================================================
+
+alter table demo_loans add column if not exists sale_id uuid references sales (id);
+comment on column demo_loans.sale_id is 'The sale this demo led to: the customer bought a frame of the same racquet';
+create index if not exists ix_demo_loans_sale on demo_loans (sale_id) where sale_id is not null;
+
+-- -----------------------------------------------------------------------------
+-- link_demo_sale — a frame sold to a customer who demoed that racquet
+-- -----------------------------------------------------------------------------
+create or replace function link_demo_sale()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null or new.sale_id is null then
+    return new;
+  end if;
+
+  update demo_loans
+     set sale_id = new.sale_id
+   where id = (
+     select l.id
+       from demo_loans l
+       join product_units u on u.id = l.product_unit_id
+      where l.customer_id = new.customer_id
+        and u.product_id = new.product_id
+        and l.sale_id is null
+        and l.out_at >= now() - interval '30 days'
+      order by l.out_at desc, l.loan_number desc
+      limit 1
+      for update of l
+   );
+  return new;
+end;
+$$;
+
+revoke all on function link_demo_sale() from public, anon, authenticated;
+
+drop trigger if exists trg_link_demo_sale on product_units;
+create trigger trg_link_demo_sale
+  after update of status on product_units
+  for each row execute function link_demo_sale();
+
+-- >>> supabase/migrations/0073_demo_review_fixes.sql
+-- =============================================================================
+-- 0073_demo_review_fixes.sql — fixes from the Phase 3C review (AceStock)
+--
+-- Before:
+--   • A demo was linked to a sale only if it went out in the 30 days before
+--     the sale, so a long loan bought on its return was never linked.
+--   • Buying two frames of a racquet demoed twice linked both demos to the
+--     same sale.
+--   • Deleting a customer with demo loans showed a raw foreign-key error.
+--   • The staff-only write check of 0041 (trg_enforce_staff_writer) was only
+--     put on the tables that existed then. demo_loans, discount_approvals,
+--     held_tickets and unit_status_changes don't have it. Nothing is exposed
+--     today (their server functions check for staff), but it's the backstop.
+--
+-- Now:
+--   1. link_demo_sale (0072): a demo counts if it's still out or came back in
+--      the 30 days before the sale, and one sale is linked to at most one
+--      demo of each racquet.
+--   2. guard_customer_delete (0046): demos are history too, named in the
+--      message like sales and string jobs.
+--   3. Every public table without trg_enforce_staff_writer gets it, as in
+--      0041. Test 43 keeps it that way for tables added later.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- link_demo_sale — same as 0072, with the window from the demo's return and
+-- one demo per racquet per sale
+-- -----------------------------------------------------------------------------
+create or replace function link_demo_sale()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.status <> 'sold' or old.status = 'sold' or new.customer_id is null or new.sale_id is null then
+    return new;
+  end if;
+  -- Another frame of this racquet on the same sale already credited a demo.
+  if exists (select 1 from demo_loans l join product_units u on u.id = l.product_unit_id
+              where l.sale_id = new.sale_id and u.product_id = new.product_id) then
+    return new;
+  end if;
+
+  update demo_loans
+     set sale_id = new.sale_id
+   where id = (
+     select l.id
+       from demo_loans l
+       join product_units u on u.id = l.product_unit_id
+      where l.customer_id = new.customer_id
+        and u.product_id = new.product_id
+        and l.sale_id is null
+        and coalesce(l.back_at, now()) >= now() - interval '30 days'
+      order by l.out_at desc, l.loan_number desc
+      limit 1
+      for update of l
+   );
+  return new;
+end;
+$$;
+
+revoke all on function link_demo_sale() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- guard_customer_delete — same as 0046, plus demos
+-- -----------------------------------------------------------------------------
+create or replace function guard_customer_delete()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_history text[];
+begin
+  select array_remove(array[
+           case when exists (select 1 from sales where customer_id = old.id) then 'sales' end,
+           case when exists (select 1 from store_credit_txns where customer_id = old.id) then 'store credit' end,
+           case when exists (select 1 from gift_cards where customer_id = old.id) then 'gift cards' end,
+           case when exists (select 1 from product_units where customer_id = old.id) then 'racquet units' end,
+           case when exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                              where r.customer_id = old.id) then 'string jobs' end,
+           case when exists (select 1 from demo_loans where customer_id = old.id) then 'demo' end
+         ], null)
+    into v_history;
+  if cardinality(v_history) > 0 then
+    raise exception '% % has % history, so they can''t be deleted',
+      old.first_name, old.last_name, array_to_string(v_history, ', ');
+  end if;
+  return old;
+end;
+$$;
+
+revoke all on function guard_customer_delete() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- The staff-only write check (0041) on every table that lacks it
+-- -----------------------------------------------------------------------------
+do $$
+declare
+  tbl text;
+begin
+  for tbl in
+    select c.relname
+      from pg_class c
+     where c.relnamespace = 'public'::regnamespace
+       and c.relkind = 'r'
+       and not exists (select 1 from pg_trigger t
+                        where t.tgrelid = c.oid and t.tgname = 'trg_enforce_staff_writer')
+  loop
+    execute format(
+      'create trigger trg_enforce_staff_writer before insert or update or delete on %I '
+      'for each statement execute function enforce_staff_writer()', tbl);
+  end loop;
+end $$;
+
+-- >>> supabase/migrations/0074_service_refunds.sql
+-- =============================================================================
+-- 0074_service_refunds.sql — refund a stringing charge (AceStock, Phase 3D)
+--
+-- Before:
+--   • record_refund refused every line that wasn't a product ("Only product
+--     lines can be returned"), so a stringing charge couldn't be given back.
+--   • A paid job couldn't be cancelled either ("This string job has been
+--     paid, so it can't be cancelled"), so a prepaid job the customer no
+--     longer wanted had no way out.
+--   • Refund tax counted every refunded line as taxed.
+--
+-- Now (record_refund, otherwise the same as 0070):
+--   1. A stringing line (a job's charge, or a string-change charge) can be
+--      refunded whole, once. It gives back the line's price less any
+--      string-change give-backs already made against it.
+--   2. The job stays on record, marked refunded (string_jobs.refunded_at,
+--      refund_id). A job not started yet is cancelled by the refund; one
+--      strung and waiting must be delivered first; a delivered or cancelled
+--      job is just marked.
+--   3. Refund tax counts only lines the sale taxed (stringing may be untaxed).
+--   4. cancel_string_job on a paid job points to the refund instead.
+--   5. A new job can't be entered already refunded.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Columns
+-- -----------------------------------------------------------------------------
+alter table string_jobs add column if not exists refunded_at timestamptz;
+alter table string_jobs add column if not exists refund_id uuid references refunds (id);
+create index if not exists idx_string_jobs_refund on string_jobs (refund_id) where refund_id is not null;
+
+comment on column string_jobs.refunded_at is 'When the job''s charge was refunded; the job stays on record';
+comment on column string_jobs.refund_id is 'The refund that gave back the job''s charge';
+
+-- -----------------------------------------------------------------------------
+-- 2. guard_new_string_job — same as 0040, plus the refund columns
+-- -----------------------------------------------------------------------------
+create or replace function guard_new_string_job()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if current_user in ('authenticated', 'anon') then
+    if new.status <> 'entered'
+       or new.paid_sale_id is not null
+       or new.completed_at is not null or new.completed_by is not null
+       or new.delivered_at is not null or new.delivered_by is not null
+       or new.cancelled_at is not null or new.cancelled_by is not null
+       or new.refunded_at is not null or new.refund_id is not null then
+      raise exception 'A new string job starts as entered and unpaid';
+    end if;
+    new.entered_by := auth.uid();
+    new.entered_at := now();
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function guard_new_string_job() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 3. record_refund — same as 0070, plus stringing lines
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null then
+      raise exception 'Only product and stringing lines can be returned';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 4. cancel_string_job — same as 0042; a paid job points to its refund
+-- -----------------------------------------------------------------------------
+create or replace function cancel_string_job(p_job_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_current text;
+  v_paid    uuid;
+begin
+  perform require_staff();
+
+  select status, paid_sale_id into v_current, v_paid
+    from string_jobs where id = p_job_id
+    for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+  if v_current <> 'entered' then
+    raise exception 'Only an entered job can be cancelled (this one is "%")', v_current;
+  end if;
+  if v_paid is not null then
+    -- Refunding its charge from the sale cancels it (0074), so the money and
+    -- the job are settled together.
+    raise exception 'This string job has been paid: refund its charge from the sale to cancel it';
+  end if;
+
+  update string_jobs
+     set status       = 'cancelled',
+         cancelled_at = now(),
+         cancelled_by = auth.uid()
+   where id = p_job_id
+     and status = 'entered';
+  return 'cancelled';
+end;
+$$;
+
+
+revoke all on function cancel_string_job(uuid) from public, anon;
+grant execute on function cancel_string_job(uuid) to authenticated;
+
+-- >>> supabase/migrations/0075_gift_card_load_refunds.sql
+-- =============================================================================
+-- 0075_gift_card_load_refunds.sql — refund an unused gift card load with an
+-- admin's approval (AceStock, Phase 3D)
+--
+-- Before:
+--   • record_refund refused a gift card load line ("Only product and
+--     stringing lines can be returned"), so money put on a card by mistake
+--     stayed there.
+--
+-- Now:
+--   1. A gift card load can be refunded whole while the card still holds all
+--      of it. The load comes back off the card ('load refund'), and a card
+--      left empty is no longer anyone's (as when it's spent, record_sale).
+--      The money can't go back onto the same card.
+--   2. It needs an admin: one signed in at the register, or a one-time
+--      approval (refund_approvals, approve_refund) that lasts 15 minutes and
+--      is used up by the refund. refunds.approved_by records who.
+--   3. record_refund gains p_approval_id (default null); otherwise the same
+--      as 0074.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Approvals
+-- -----------------------------------------------------------------------------
+create table if not exists refund_approvals (
+  id           uuid primary key default gen_random_uuid(),
+  approved_by  uuid not null default auth.uid() references profiles (id),
+  created_at   timestamptz not null default now(),
+  expires_at   timestamptz not null default now() + interval '15 minutes',
+  refund_id    uuid references refunds (id)
+);
+comment on table refund_approvals is 'One-time admin approvals for refunding a gift card load';
+
+alter table refund_approvals enable row level security;
+drop policy if exists refund_approvals_admin_select on refund_approvals;
+drop policy if exists refund_approvals_admin_insert on refund_approvals;
+create policy refund_approvals_admin_select on refund_approvals
+  for select to authenticated using (is_admin());
+create policy refund_approvals_admin_insert on refund_approvals
+  for insert to authenticated with check (is_admin() and approved_by = auth.uid() and refund_id is null);
+revoke all on refund_approvals from anon, authenticated;
+grant select, insert on refund_approvals to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on refund_approvals;
+create trigger trg_enforce_staff_writer before insert or update or delete on refund_approvals
+  for each statement execute function enforce_staff_writer();
+
+alter table refunds add column if not exists approved_by uuid references profiles (id);
+comment on column refunds.approved_by is 'The admin who approved refunding a gift card load';
+
+create or replace function approve_refund()
+returns uuid
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_id uuid;
+begin
+  if not is_admin() then
+    raise exception 'Only an admin can approve refunding a gift card load' using errcode = '42501';
+  end if;
+  insert into refund_approvals default values returning id into v_id;
+  return v_id;
+end;
+$$;
+
+revoke all on function approve_refund() from public, anon;
+grant execute on function approve_refund() to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. record_refund — same as 0074, plus gift card loads and p_approval_id
+-- -----------------------------------------------------------------------------
+drop function if exists record_refund(uuid, jsonb, jsonb, text, text, text);
+
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_ok          boolean;
+  v_approver    uuid;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now(), a.approved_by into v_ok, v_approver
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not coalesce(v_ok, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0076_deactivate_customers_and_gift_cards.sql
+-- =============================================================================
+-- 0076_deactivate_customers_and_gift_cards.sql — inactive customers and gift
+-- cards (AceStock, Phase 3D)
+--
+-- Before:
+--   • customers.is_active (0012) and gift_cards.is_active (0024) existed but
+--     nothing read them. A customer with history can't be deleted (0073), and
+--     a lost gift card stayed usable by whoever found it.
+--   • Staff could flip customers.is_active directly, with no reason kept.
+--
+-- Now:
+--   1. set_customer_active / set_gift_card_active turn a record off with a
+--      reason (who and when kept too) or back on. A customer with a string job
+--      open or a demo out can't be turned off until it's settled. Any store
+--      credit or card balance stays, for when the record is turned back on.
+--   2. Those columns change only through those functions, and a new customer
+--      starts active.
+--   3. An inactive customer can't be put on a sale, a new string job or a
+--      demo, or have store credit added or used. An inactive gift card can't
+--      be loaded, spent, refunded to or adjusted; only an unused load can
+--      still come back off it (0075). Their history is untouched.
+--   4. search_customers leaves inactive customers out unless asked
+--      (p_include_inactive), so the register doesn't offer them.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Columns
+-- -----------------------------------------------------------------------------
+alter table customers  add column if not exists deactivated_at     timestamptz;
+alter table customers  add column if not exists deactivated_by     uuid references profiles (id);
+alter table customers  add column if not exists deactivated_reason text;
+alter table gift_cards add column if not exists deactivated_at     timestamptz;
+alter table gift_cards add column if not exists deactivated_by     uuid references profiles (id);
+alter table gift_cards add column if not exists deactivated_reason text;
+
+comment on column customers.deactivated_reason is 'Why the customer was made inactive; cleared when made active again';
+comment on column gift_cards.deactivated_reason is 'Why the card was made inactive (e.g. lost); cleared when made active again';
+
+-- The register looks cards up by code here, so it says whether one is active.
+create or replace view gift_card_balance with (security_invoker = true) as
+select gc.id as gift_card_id, gc.code, gc.customer_id,
+       coalesce(sum(t.amount), 0)::numeric as balance,
+       gc.is_active
+from gift_cards gc
+left join gift_card_txns t on t.gift_card_id = gc.id
+group by gc.id, gc.code, gc.customer_id, gc.is_active;
+revoke all on gift_card_balance from anon;
+grant select on gift_card_balance to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. Only the functions below change whether a record is active
+-- -----------------------------------------------------------------------------
+create or replace function guard_active_flag()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if current_setting('acestock.set_active', true) = 'on' then
+    return new;
+  end if;
+  if tg_op = 'INSERT' then
+    new.is_active          := true;
+    new.deactivated_at     := null;
+    new.deactivated_by     := null;
+    new.deactivated_reason := null;
+  elsif new.is_active is distinct from old.is_active
+     or new.deactivated_at is distinct from old.deactivated_at
+     or new.deactivated_by is distinct from old.deactivated_by
+     or new.deactivated_reason is distinct from old.deactivated_reason then
+    raise exception 'Make a record inactive or active again from its page (it keeps the reason)';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_active_flag() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_active_flag on customers;
+create trigger trg_guard_active_flag before insert or update on customers
+  for each row execute function guard_active_flag();
+drop trigger if exists trg_guard_active_flag on gift_cards;
+create trigger trg_guard_active_flag before insert or update on gift_cards
+  for each row execute function guard_active_flag();
+
+-- -----------------------------------------------------------------------------
+-- 3. Turning a record off or back on
+-- -----------------------------------------------------------------------------
+create or replace function set_customer_active(p_customer_id uuid, p_active boolean, p_reason text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+  v_open   text[];
+begin
+  perform require_staff();
+  perform 1 from customers where id = p_customer_id for update;
+  if not found then
+    raise exception 'Unknown customer %', p_customer_id;
+  end if;
+  if p_active is null then
+    raise exception 'Say whether the customer is active';
+  end if;
+
+  if not p_active then
+    if v_reason is null then
+      raise exception 'Say why the customer is inactive';
+    end if;
+    if char_length(v_reason) > 200 then
+      raise exception 'Keep the reason to 200 characters';
+    end if;
+    select array_remove(array[
+             case when exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                                where r.customer_id = p_customer_id and j.status in ('entered', 'complete'))
+                  then 'a string job open' end,
+             case when exists (select 1 from demo_loans where customer_id = p_customer_id and back_at is null)
+                  then 'a demo out' end
+           ], null)
+      into v_open;
+    if cardinality(v_open) > 0 then
+      raise exception 'This customer has %: settle it before making them inactive', array_to_string(v_open, ' and ');
+    end if;
+  end if;
+
+  perform set_config('acestock.set_active', 'on', true);
+  update customers
+     set is_active          = p_active,
+         deactivated_at     = case when p_active then null else now() end,
+         deactivated_by     = case when p_active then null else auth.uid() end,
+         deactivated_reason = case when p_active then null else v_reason end,
+         updated_at         = now()
+   where id = p_customer_id;
+  perform set_config('acestock.set_active', '', true);
+end;
+$$;
+
+create or replace function set_gift_card_active(p_gift_card_id uuid, p_active boolean, p_reason text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_staff();
+  perform 1 from gift_cards where id = p_gift_card_id for update;
+  if not found then
+    raise exception 'Unknown gift card %', p_gift_card_id;
+  end if;
+  if p_active is null then
+    raise exception 'Say whether the gift card is active';
+  end if;
+  if not p_active and v_reason is null then
+    raise exception 'Say why the gift card is inactive';
+  end if;
+  if char_length(coalesce(v_reason, '')) > 200 then
+    raise exception 'Keep the reason to 200 characters';
+  end if;
+
+  perform set_config('acestock.set_active', 'on', true);
+  update gift_cards
+     set is_active          = p_active,
+         deactivated_at     = case when p_active then null else now() end,
+         deactivated_by     = case when p_active then null else auth.uid() end,
+         deactivated_reason = case when p_active then null else v_reason end
+   where id = p_gift_card_id;
+  perform set_config('acestock.set_active', '', true);
+end;
+$$;
+
+revoke all on function set_customer_active(uuid, boolean, text) from public, anon;
+revoke all on function set_gift_card_active(uuid, boolean, text) from public, anon;
+grant execute on function set_customer_active(uuid, boolean, text) to authenticated;
+grant execute on function set_gift_card_active(uuid, boolean, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 4. Inactive records can't be used
+-- -----------------------------------------------------------------------------
+-- Refuse an inactive customer on a sale, demo, store credit or new string job.
+create or replace function guard_active_customer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_customer uuid;
+  v_use      text;
+  v_name     text;
+begin
+  case tg_table_name
+    when 'sales' then
+      v_customer := new.customer_id;
+      v_use := 'be put on a sale';
+    when 'demo_loans' then
+      v_customer := new.customer_id;
+      v_use := 'borrow a demo';
+    when 'store_credit_txns' then
+      v_customer := new.customer_id;
+      v_use := 'use store credit';
+    when 'string_jobs' then
+      select customer_id into v_customer from customer_rackets where id = new.customer_racket_id;
+      v_use := 'have a new string job';
+  end case;
+  select first_name || ' ' || last_name into v_name from customers where id = v_customer and not is_active;
+  if found then
+    raise exception '% is inactive, so they can''t %: make them active again first', v_name, v_use;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_active_customer() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_active_customer on sales;
+create trigger trg_guard_active_customer before insert on sales
+  for each row when (new.customer_id is not null) execute function guard_active_customer();
+drop trigger if exists trg_guard_active_customer on demo_loans;
+create trigger trg_guard_active_customer before insert on demo_loans
+  for each row execute function guard_active_customer();
+drop trigger if exists trg_guard_active_customer on store_credit_txns;
+create trigger trg_guard_active_customer before insert on store_credit_txns
+  for each row execute function guard_active_customer();
+drop trigger if exists trg_guard_active_customer on string_jobs;
+create trigger trg_guard_active_customer before insert on string_jobs
+  for each row execute function guard_active_customer();
+
+create or replace function guard_active_gift_card()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_code text;
+begin
+  -- An unused load can still come back off an inactive card (0075).
+  if new.reason = 'load refund' then
+    return new;
+  end if;
+  select code into v_code from gift_cards where id = new.gift_card_id and not is_active;
+  if found then
+    raise exception 'Gift card % is inactive, so it can''t be used: make it active again first', v_code;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_active_gift_card() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_active_gift_card on gift_card_txns;
+create trigger trg_guard_active_gift_card before insert on gift_card_txns
+  for each row execute function guard_active_gift_card();
+
+-- -----------------------------------------------------------------------------
+-- 5. search_customers — same as 0037; inactive customers only when asked
+-- -----------------------------------------------------------------------------
+drop function if exists search_customers(text, integer);
+create or replace function search_customers(p_term text, p_limit integer default 8, p_include_inactive boolean default false)
+returns setof customers
+language sql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+  with input as (
+    select
+      btrim(coalesce(p_term, ''))                              as term,
+      regexp_replace(coalesce(p_term, ''), '\D', '', 'g')      as digits
+  ),
+  pattern as (
+    select
+      term,
+      digits,
+      -- Escape LIKE wildcards so the typed text is matched literally.
+      '%' || replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_') || '%' as contains
+    from input
+  )
+  select c.*
+  from customers c, pattern p
+  where p.term <> ''
+    and (c.is_active or coalesce(p_include_inactive, false))
+    and (
+         c.first_name ilike p.contains
+      or c.last_name  ilike p.contains
+      or (c.first_name || ' '  || c.last_name)  ilike p.contains
+      or (c.last_name  || ', ' || c.first_name) ilike p.contains
+      or c.email ilike p.contains
+      or (
+           p.term ~ '^[0-9()+.\s-]+$'
+           and length(p.digits) >= 3
+           and regexp_replace(coalesce(c.phone_number, ''), '\D', '', 'g') like '%' || p.digits || '%'
+         )
+    )
+  order by lower(c.last_name), lower(c.first_name)
+  limit least(greatest(coalesce(p_limit, 8), 1), 50);
+$$;
+revoke all on function search_customers(text, integer, boolean) from public, anon;
+grant execute on function search_customers(text, integer, boolean) to authenticated;
+
+-- >>> supabase/migrations/0077_exchanges.sql
+-- =============================================================================
+-- 0077_exchanges.sql — return and sell on one ticket (AceStock, Phase 3D)
+--
+-- Before:
+--   • Swapping shoes for another size took a refund and then a separate sale,
+--     with the money going out and back in and nothing tying the two.
+--
+-- Now:
+--   1. record_exchange returns items from a sale and sells new ones in one
+--      step: either both are saved or neither is. It calls record_refund and
+--      record_sale, so every rule of each still applies.
+--   2. The returned items' value moves to the new sale as an 'exchange'
+--      payment, on the refund and on the sale (no money changes hands for
+--      it). The customer pays any difference the usual ways; when the return
+--      is worth more, the cashier gives the difference back the usual ways,
+--      and the refund-type rules apply to that part only.
+--   3. exchanges links the refund and the sale, with the credit moved.
+--   4. 'exchange' is a payment type only record_exchange writes; the sales
+--      summary leaves it out of the payment-type totals (it nets to zero).
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. The exchange payment type
+-- -----------------------------------------------------------------------------
+alter table sale_payments drop constraint if exists sale_payments_method_check;
+alter table sale_payments add constraint sale_payments_method_check
+  check (method in ('cash', 'credit', 'gift_card', 'store_credit', 'check', 'exchange'));
+alter table refund_payments drop constraint if exists refund_payments_method_check;
+alter table refund_payments add constraint refund_payments_method_check
+  check (method in ('cash', 'credit', 'gift_card', 'store_credit', 'check', 'exchange'));
+alter table sales drop constraint if exists sales_payment_method_check;
+alter table sales add constraint sales_payment_method_check
+  check (payment_method is null or payment_method in ('credit', 'cash', 'gift_card', 'store_credit', 'check', 'split', 'exchange'));
+
+-- -----------------------------------------------------------------------------
+-- 2. Exchanges
+-- -----------------------------------------------------------------------------
+create table if not exists exchanges (
+  id          uuid primary key default gen_random_uuid(),
+  refund_id   uuid not null unique references refunds (id),
+  sale_id     uuid not null unique references sales (id),
+  credit      numeric(12, 2) not null check (credit >= 0),
+  user_id     uuid default auth.uid() references profiles (id),
+  created_at  timestamptz not null default now()
+);
+comment on table exchanges is 'A return and a sale on one ticket; credit is what moved from the return to the sale';
+create index if not exists idx_exchanges_created on exchanges (created_at);
+
+alter table exchanges enable row level security;
+drop policy if exists exchanges_staff_select on exchanges;
+create policy exchanges_staff_select on exchanges for select to authenticated using (is_staff());
+revoke all on exchanges from anon, authenticated;
+grant select on exchanges to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on exchanges;
+create trigger trg_enforce_staff_writer before insert or update or delete on exchanges
+  for each statement execute function enforce_staff_writer();
+
+-- -----------------------------------------------------------------------------
+-- 3. record_sale — same as 0062; an exchange's credit pays first
+-- -----------------------------------------------------------------------------
+create or replace function record_sale(
+  p_lines       jsonb,
+  p_customer_id uuid,
+  p_payments    jsonb,
+  p_note        text,
+  p_ticket      jsonb default null,
+  p_approval_id uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_sale_id     uuid := gen_random_uuid();
+  v_line        jsonb;
+  v_pay         jsonb;
+  v_product     uuid;
+  v_unit        uuid;
+  v_serialized  boolean;
+  v_job         uuid;
+  v_job_status  text;
+  v_job_paid    uuid;
+  v_gc          uuid;
+  v_qty         integer;
+  v_price       numeric;
+  v_line_total  numeric;
+  v_index       integer;
+  v_totals      jsonb;
+  v_taxed       boolean;
+  v_priced      jsonb;
+  v_list        numeric;
+  v_reason      text;
+  v_subtotal    numeric;
+  v_total       numeric;
+  v_paid        numeric := 0;
+  v_method      text;
+  v_amount      numeric;
+  v_bal         numeric;
+  v_prev        numeric;
+  v_onhand      numeric;
+  v_count       integer;
+  v_rate        numeric;
+  v_block       boolean := false;
+  v_checks      boolean := false;
+  v_check_no    text;
+  v_tax         numeric;
+  v_unit_status text;
+  v_unit_prod   uuid;
+  v_unit_price  numeric;
+  v_line_each   numeric;
+  v_ticket_each numeric;
+  v_line_disc   numeric;
+  v_disc_reason text;
+  v_ticket      numeric := nullif(nullif(p_ticket->>'discount', '')::numeric, 0);
+  v_problem     text;
+  v_approved_by uuid;
+  v_exempt_id   text;
+  v_credit      numeric;
+begin
+  perform require_cents_each(p_lines, 'unit_price', 'Price');
+  perform require_cents_each(p_payments, 'amount', 'Payment amount');
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then
+    raise exception 'A sale needs at least one line';
+  end if;
+  if p_customer_id is not null
+     and not exists (select 1 from customers where id = p_customer_id) then
+    raise exception 'Unknown customer_id %', p_customer_id;
+  end if;
+
+  select block_oversell, accept_checks into v_block, v_checks from settings where id = true;
+
+  -- Lock everything whose balance or state this sale checks, in a fixed order,
+  -- so a concurrent sale waits here and then sees this sale's effects.
+  if v_block then
+    perform 1 from products
+     where id in (select nullif(l->>'product_id', '')::uuid from jsonb_array_elements(p_lines) l)
+     order by id for update;
+  end if;
+  perform 1 from product_units
+   where id in (select nullif(l->>'product_unit_id', '')::uuid from jsonb_array_elements(p_lines) l)
+   order by id for update;
+  perform 1 from string_jobs
+   where id in (select nullif(l->>'string_job_id', '')::uuid from jsonb_array_elements(p_lines) l)
+   order by id for update;
+  perform 1 from gift_cards
+   where id in (
+     select nullif(l->>'gift_card_id', '')::uuid from jsonb_array_elements(p_lines) l
+     union
+     select nullif(p->>'gift_card_id', '')::uuid from jsonb_array_elements(coalesce(p_payments, '[]'::jsonb)) p)
+   order by id for update;
+  if p_customer_id is not null and exists (
+       select 1 from jsonb_array_elements(coalesce(p_payments, '[]'::jsonb)) p
+       where p->>'method' = 'store_credit') then
+    perform 1 from customers where id = p_customer_id for update;
+  end if;
+  if p_approval_id is not null then
+    perform 1 from discount_approvals where id = p_approval_id for update;
+  end if;
+  -- Read after the locks above, like everything else this sale checks.
+  v_exempt_id := customer_tax_exempt_id(p_customer_id);
+
+  -- The totals, and which lines are taxed, come from sale_totals: the same
+  -- function quote_sale uses, so the total the register showed before payment
+  -- is the total this sale requires.
+  v_totals   := sale_totals(p_lines, p_ticket, v_exempt_id is not null);
+  v_subtotal := (v_totals->>'subtotal')::numeric;
+  v_tax      := (v_totals->>'tax')::numeric;
+  v_rate     := (v_totals->>'tax_rate')::numeric;
+  v_total    := (v_totals->>'total')::numeric;
+
+  insert into sales (id, customer_id, subtotal, note, ticket_discount, ticket_discount_reason, tax_exempt_id)
+  values (v_sale_id, p_customer_id, 0, nullif(trim(p_note), ''),
+          v_ticket, v_totals->>'ticket_discount_reason', v_exempt_id);
+
+  for v_line, v_index in select value, ordinality - 1 from jsonb_array_elements(p_lines) with ordinality
+  loop
+    v_product := nullif(v_line->>'product_id', '')::uuid;
+    v_unit    := nullif(v_line->>'product_unit_id', '')::uuid;
+    v_job     := nullif(v_line->>'string_job_id', '')::uuid;
+    v_gc      := nullif(v_line->>'gift_card_id', '')::uuid;
+    v_qty     := (v_line->>'qty')::integer;
+    v_price   := (v_line->>'unit_price')::numeric;
+    v_priced  := v_totals->'lines'->v_index;
+    v_taxed   := (v_priced->>'taxable')::boolean;
+    v_list    := (v_priced->>'list_price')::numeric;
+    v_reason  := v_priced->>'price_reason';
+    v_unit_price  := (v_priced->>'unit_price')::numeric;
+    v_line_each   := nullif((v_priced->>'line_discount_each')::numeric, 0);
+    v_ticket_each := nullif((v_priced->>'ticket_discount_each')::numeric, 0);
+    v_line_disc   := nullif(nullif(v_line->>'discount', '')::numeric, 0);
+    v_disc_reason := v_priced->>'discount_reason';
+
+    perform require_sale_line(v_line);
+
+    v_line_total := v_qty * v_unit_price;
+
+    if v_product is not null then
+      select is_serialized into v_serialized from products where id = v_product;
+      if v_serialized is null then
+        raise exception 'Unknown product_id % in sale line', v_product;
+      end if;
+
+      if v_serialized then
+        -- Serialized: sell one specific physical unit; no stock ledger txn.
+        if v_unit is null then
+          raise exception 'Product % is serialized; a product_unit_id is required', v_product;
+        end if;
+        if v_qty <> 1 then
+          raise exception 'Serialized items sell one unit per line (qty must be 1)';
+        end if;
+        select status, product_id into v_unit_status, v_unit_prod
+          from product_units where id = v_unit;
+        if v_unit_status is null then raise exception 'Unknown product_unit_id %', v_unit; end if;
+        if v_unit_prod <> v_product then raise exception 'Unit % does not belong to product %', v_unit, v_product; end if;
+        if v_unit_status <> 'in_stock' then raise exception 'Unit % is not in stock (status %)', v_unit, v_unit_status; end if;
+
+        insert into sale_lines (sale_id, product_id, product_unit_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+        values (v_sale_id, v_product, v_unit, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+        update product_units
+           set status = 'sold', sale_id = v_sale_id, customer_id = p_customer_id, updated_at = now()
+         where id = v_unit;
+      else
+        -- Fungible: quantity ledger, optional oversell block.
+        if v_block then
+          select coalesce(sum(qty), 0) into v_onhand from inventory_txns where product_id = v_product;
+          if v_onhand < v_qty then
+            raise exception 'Not enough stock for product % (% on hand, % requested)', v_product, v_onhand, v_qty;
+          end if;
+        end if;
+        insert into sale_lines (sale_id, product_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+        values (v_sale_id, v_product, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+        insert into inventory_txns (txn_type, product_id, qty, sale_id) values ('sell', v_product, -v_qty, v_sale_id);
+      end if;
+
+    elsif v_job is not null then
+      if v_qty <> 1 then
+        raise exception 'A string job is charged once per line (qty must be 1)';
+      end if;
+      select status, paid_sale_id into v_job_status, v_job_paid from string_jobs where id = v_job;
+      if not found then
+        raise exception 'Unknown string_job_id % in sale line', v_job;
+      end if;
+      if v_job_status = 'cancelled' then
+        raise exception 'String job % was cancelled and can''t be charged', v_job;
+      end if;
+      if v_job_paid = v_sale_id then
+        raise exception 'String job % is on this ticket more than once', v_job;
+      end if;
+      if v_job_paid is not null then
+        raise exception 'String job % is already paid (sale %)', v_job, v_job_paid;
+      end if;
+      insert into sale_lines (sale_id, string_job_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+      values (v_sale_id, v_job, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+      -- The job's price becomes what was actually charged (a register discount
+      -- sticks); the line keeps the job's price before the sale as its list price.
+      update string_jobs set paid_sale_id = v_sale_id, price = v_unit_price where id = v_job;
+
+    else
+      if not exists (select 1 from gift_cards where id = v_gc) then
+        raise exception 'Unknown gift_card_id % in sale line', v_gc;
+      end if;
+      select coalesce(sum(amount), 0) into v_prev from gift_card_txns where gift_card_id = v_gc;
+      insert into sale_lines (sale_id, gift_card_id, qty, unit_price, taxable) values (v_sale_id, v_gc, v_qty, v_price, v_taxed);
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_line_total, 'load', v_sale_id);
+      if v_prev <= 0 then update gift_cards set customer_id = p_customer_id where id = v_gc; end if;
+    end if;
+
+    -- Checked after the line's own rules, so a line that can't be sold says why.
+    if (v_priced->>'price_changed')::boolean and v_reason is null then
+      raise exception 'Price changed from $% on line %: give a reason',
+        to_char(v_list, 'FM999999990.00'), v_index + 1;
+    end if;
+  end loop;
+
+  -- Discounts, checked after each line's own rules: anything over the staff
+  -- limit needs an admin (signed in, or their approval, used up by this sale).
+  v_problem := discount_approval_problem(v_totals, p_approval_id);
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+  if (v_totals->>'max_discount_percent')::numeric > (v_totals->>'staff_discount_cap')::numeric then
+    if is_admin() then
+      v_approved_by := auth.uid();
+    else
+      select approved_by into v_approved_by from discount_approvals where id = p_approval_id;
+      update discount_approvals set sale_id = v_sale_id where id = p_approval_id;
+    end if;
+    update sales set discount_approved_by = v_approved_by where id = v_sale_id;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) the returned items' credit pays
+  -- first, as an 'exchange' payment; the payments cover the rest.
+  v_credit := nullif(current_setting('acestock.exchange_credit', true), '')::numeric;
+  if v_credit is not null and v_credit > 0 then
+    if v_credit > v_total + 0.005 then
+      raise exception 'The return ($%) is more than the new items ($%): give the difference back on the return',
+        to_char(v_credit, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    insert into sale_payments (sale_id, method, amount) values (v_sale_id, 'exchange', v_credit);
+    v_paid := v_credit;
+  end if;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+
+      if v_amount is null or v_amount <= 0 then raise exception 'Payment amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid payment method "%"', v_method; end if;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card payment needs a gift_card_id'; end if;
+        select coalesce(sum(amount), 0) into v_bal from gift_card_txns where gift_card_id = v_gc;
+        if v_bal < v_amount then raise exception 'Gift card balance % is less than %', v_bal, v_amount; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, -v_amount, 'redeem', v_sale_id);
+        insert into sale_payments (sale_id, method, amount, gift_card_id) values (v_sale_id, 'gift_card', v_amount, v_gc);
+        select coalesce(sum(amount), 0) into v_bal from gift_card_txns where gift_card_id = v_gc;
+        if v_bal <= 0 then update gift_cards set customer_id = null where id = v_gc; end if;
+      elsif v_method = 'check' then
+        if not coalesce(v_checks, false) then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+        insert into sale_payments (sale_id, method, amount, check_number) values (v_sale_id, 'check', v_amount, v_check_no);
+      elsif v_method = 'store_credit' then
+        if p_customer_id is null then raise exception 'Store credit needs a customer on the sale'; end if;
+        select coalesce(sum(amount), 0) into v_bal from store_credit_txns where customer_id = p_customer_id;
+        if v_bal < v_amount then raise exception 'Store credit balance % is less than %', v_bal, v_amount; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (p_customer_id, -v_amount, 'redeem', v_sale_id);
+        insert into sale_payments (sale_id, method, amount) values (v_sale_id, 'store_credit', v_amount);
+      else
+        insert into sale_payments (sale_id, method, amount) values (v_sale_id, v_method, v_amount);
+      end if;
+
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Payments ($%) must equal the sale total ($%). The total may have changed: go back and check the ticket.',
+      to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+  end if;
+
+  select count(*) into v_count from sale_payments where sale_id = v_sale_id;
+  update sales
+     set subtotal = v_subtotal,
+         tax = v_tax,
+         tax_rate = v_rate,
+         payment_method = case
+           when v_count = 0 then null
+           when v_count = 1 then (select method from sale_payments where sale_id = v_sale_id limit 1)
+           else 'split'
+         end
+   where id = v_sale_id;
+
+  return v_sale_id;
+end;
+$$;
+
+
+revoke all on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) from public, anon;
+grant execute on function record_sale(jsonb, uuid, jsonb, text, jsonb, uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 4. record_refund — same as 0075; in an exchange what isn't given back is credit
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_ok          boolean;
+  v_approver    uuid;
+  v_rest        numeric;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now(), a.approved_by into v_ok, v_approver
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not coalesce(v_ok, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as an 'exchange' refund payment.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 5. record_exchange
+-- -----------------------------------------------------------------------------
+-- p_return_lines and p_refund_payments are as for record_refund (the money
+-- given back when the return is worth more; empty otherwise); p_new_lines,
+-- p_payments, p_ticket and p_approval_id as for record_sale (the payments
+-- cover what the credit doesn't).
+create or replace function record_exchange(
+  p_sale_id              uuid,
+  p_return_lines         jsonb,
+  p_new_lines            jsonb,
+  p_customer_id          uuid,
+  p_payments             jsonb,
+  p_refund_payments      jsonb,
+  p_reason               text,
+  p_ticket               jsonb default null,
+  p_approval_id          uuid default null,
+  p_method_change_reason text default null,
+  p_refund_approval_id   uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_exchange_id uuid := gen_random_uuid();
+  v_refund_id   uuid;
+  v_sale_id     uuid;
+  v_credit      numeric;
+begin
+  perform require_staff();
+
+  perform set_config('acestock.exchange_id', v_exchange_id::text, true);
+  v_refund_id := record_refund(p_sale_id, p_return_lines, coalesce(p_refund_payments, '[]'::jsonb),
+                               coalesce(nullif(btrim(p_reason), ''), 'Exchange'), null,
+                               p_method_change_reason, p_refund_approval_id);
+  perform set_config('acestock.exchange_id', '', true);
+
+  select coalesce(sum(amount), 0) into v_credit
+    from refund_payments where refund_id = v_refund_id and method = 'exchange';
+
+  perform set_config('acestock.exchange_credit', v_credit::text, true);
+  v_sale_id := record_sale(p_new_lines, p_customer_id, coalesce(p_payments, '[]'::jsonb), 'Exchange',
+                           p_ticket, p_approval_id);
+  perform set_config('acestock.exchange_credit', '', true);
+
+  insert into exchanges (id, refund_id, sale_id, credit) values (v_exchange_id, v_refund_id, v_sale_id, v_credit);
+
+  return jsonb_build_object('exchange_id', v_exchange_id, 'refund_id', v_refund_id, 'sale_id', v_sale_id,
+                            'credit', v_credit);
+end;
+$$;
+
+revoke all on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) from public, anon;
+grant execute on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0078_load_refund_approval_scope.sql
+-- =============================================================================
+-- 0078_load_refund_approval_scope.sql — an admin's approval covers one load
+-- refund (AceStock, Phase 3D review)
+--
+-- Before (0075): an approval from approve_refund() named no sale or amount, so
+-- for its 15 minutes it could refund any load — $500 instead of the $20 the
+-- admin was shown.
+--
+-- Now:
+--   1. refund_approvals.sale_id and .amount: what the admin approved.
+--      approve_refund(p_sale_id, p_amount) records both; the no-argument
+--      version is dropped. Approvals made before this have neither, so they
+--      can't be used (they expire within 15 minutes anyway).
+--   2. record_refund (same as 0077 otherwise) refuses an approval for another
+--      sale, or for a different total of gift card loads.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. What an approval covers
+-- -----------------------------------------------------------------------------
+alter table refund_approvals add column if not exists sale_id uuid references sales (id);
+alter table refund_approvals add column if not exists amount numeric(10, 2);
+comment on column refund_approvals.sale_id is 'The sale whose gift card loads the admin approved refunding';
+comment on column refund_approvals.amount is 'The total of gift card loads the admin approved refunding';
+
+drop policy if exists refund_approvals_admin_insert on refund_approvals;
+create policy refund_approvals_admin_insert on refund_approvals
+  for insert to authenticated
+  with check (is_admin() and approved_by = auth.uid() and refund_id is null
+              and sale_id is not null and amount > 0);
+
+drop function if exists approve_refund();
+create or replace function approve_refund(p_sale_id uuid, p_amount numeric)
+returns uuid
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_id uuid;
+begin
+  if not is_admin() then
+    raise exception 'Only an admin can approve refunding a gift card load' using errcode = '42501';
+  end if;
+  if not exists (select 1 from sales where id = p_sale_id) then
+    raise exception 'Unknown sale %', p_sale_id;
+  end if;
+  if p_amount is null or p_amount <= 0 or p_amount <> round(p_amount, 2) then
+    raise exception 'The approved amount must be a positive amount in cents';
+  end if;
+  insert into refund_approvals (sale_id, amount) values (p_sale_id, p_amount) returning id into v_id;
+  return v_id;
+end;
+$$;
+
+revoke all on function approve_refund(uuid, numeric) from public, anon;
+grant execute on function approve_refund(uuid, numeric) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. record_refund — same as 0077; the approval must match the sale and amount
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_load_total  numeric := 0;
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as an 'exchange' refund payment.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0079_job_charge_refunds.sql
+-- =============================================================================
+-- 0079_job_charge_refunds.sql — a job paid on two sales, and refunds racing a
+-- string change (AceStock, Phase 3D review)
+--
+-- Before (since 0074; record_refund as carried over in 0078):
+--   • A job's strings changed to dearer ones adds a 'string_change' charge on
+--     a second sale (0043). Refunding that charge on its own cancelled the
+--     job, though its main charge was still paid.
+--   • record_refund locked the sale and then the job; change_paid_string_job
+--     locks the job and then its sales. The two at once on the same job could
+--     stop with "deadlock detected" (the data stayed consistent).
+--
+-- Now (record_refund, otherwise the same as 0078):
+--   1. A string change's charge is refunded only after the job's own charge.
+--      The job's page lists any charge still to refund.
+--   2. The jobs a refund touches are locked before the sale.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_load_total  numeric := 0;
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- The jobs whose charges come back are locked before the sale, the order
+  -- change_paid_string_job takes them in (job, then its sales), so a refund
+  -- and a string change on the same job queue instead of deadlocking (0079).
+  perform 1 from string_jobs
+   where id in (select sl.string_job_id from sale_lines sl
+                 where sl.sale_id = p_sale_id and sl.string_job_id is not null
+                   and sl.id in (select nullif(l->>'sale_line_id', '')::uuid
+                                   from jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) l))
+   order by id for update;
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      -- A string change's charge (0043) comes back once the job's own charge
+      -- has: refunding it alone would cancel a job that's still paid for (0079).
+      if v_sl.kind = 'string_change' and v_job.refund_id is null then
+        raise exception 'This is a string change on job J%: refund the job''s own charge first',
+          v_job.job_number;
+      end if;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as an 'exchange' refund payment.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0080_inactive_review_fixes.sql
+-- =============================================================================
+-- 0080_inactive_review_fixes.sql — inactive customers can't be slipped past
+-- (AceStock, Phase 3D review)
+--
+-- Before (0076):
+--   • guard_active_customer read the customer without a lock. A demo or new
+--     string job saved while set_customer_active was making the customer
+--     inactive (it locks the customer, then checks for open jobs and demos)
+--     could get through, leaving an inactive customer with a demo out.
+--   • A racquet could be moved to another customer through the API while it
+--     had an open job, so its old owner could be made inactive with that job
+--     still open (set_customer_active looks for jobs through the racquet).
+--   • search_customers listed inactive customers among active ones by name,
+--     so the home search's Enter could open an inactive duplicate.
+--
+-- Now:
+--   1. guard_active_customer takes a share lock on the customer: it waits for
+--      a deactivation in progress and then sees it; a deactivation that comes
+--      second waits for the new demo or job and then sees that.
+--   2. guard_racket_owner: a racquet with a job open (entered or strung)
+--      stays with its customer until the job is delivered or cancelled.
+--   3. search_customers lists active customers first.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. The customer guard waits for a deactivation in progress
+-- -----------------------------------------------------------------------------
+create or replace function guard_active_customer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_customer uuid;
+  v_use      text;
+  v_name     text;
+  v_active   boolean;
+begin
+  case tg_table_name
+    when 'sales' then
+      v_customer := new.customer_id;
+      v_use := 'be put on a sale';
+    when 'demo_loans' then
+      v_customer := new.customer_id;
+      v_use := 'borrow a demo';
+    when 'store_credit_txns' then
+      v_customer := new.customer_id;
+      v_use := 'use store credit';
+    when 'string_jobs' then
+      select customer_id into v_customer from customer_rackets where id = new.customer_racket_id;
+      v_use := 'have a new string job';
+  end case;
+  -- A share lock waits for set_customer_active (which locks the customer for
+  -- update) and then reads what it saved; it also makes a deactivation that
+  -- starts now wait for this row, so its open-job and demo checks see it.
+  select is_active, first_name || ' ' || last_name into v_active, v_name
+    from customers where id = v_customer
+    for share;
+  if found and not v_active then
+    raise exception '% is inactive, so they can''t %: make them active again first', v_name, v_use;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_active_customer() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. A racquet with an open job stays with its customer
+-- -----------------------------------------------------------------------------
+create or replace function guard_racket_owner()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if exists (select 1 from string_jobs where customer_racket_id = old.id and status in ('entered', 'complete')) then
+    raise exception 'This racquet has a string job open: deliver or cancel it before moving it to another customer';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_racket_owner() from public, anon, authenticated;
+
+drop trigger if exists trg_guard_racket_owner on customer_rackets;
+create trigger trg_guard_racket_owner before update of customer_id on customer_rackets
+  for each row when (new.customer_id is distinct from old.customer_id)
+  execute function guard_racket_owner();
+
+-- -----------------------------------------------------------------------------
+-- 3. search_customers — same as 0076; active customers first
+-- -----------------------------------------------------------------------------
+create or replace function search_customers(p_term text, p_limit integer default 8, p_include_inactive boolean default false)
+returns setof customers
+language sql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+  with input as (
+    select
+      btrim(coalesce(p_term, ''))                              as term,
+      regexp_replace(coalesce(p_term, ''), '\D', '', 'g')      as digits
+  ),
+  pattern as (
+    select
+      term,
+      digits,
+      -- Escape LIKE wildcards so the typed text is matched literally.
+      '%' || replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_') || '%' as contains
+    from input
+  )
+  select c.*
+  from customers c, pattern p
+  where p.term <> ''
+    and (c.is_active or coalesce(p_include_inactive, false))
+    and (
+         c.first_name ilike p.contains
+      or c.last_name  ilike p.contains
+      or (c.first_name || ' '  || c.last_name)  ilike p.contains
+      or (c.last_name  || ', ' || c.first_name) ilike p.contains
+      or c.email ilike p.contains
+      or (
+           p.term ~ '^[0-9()+.\s-]+$'
+           and length(p.digits) >= 3
+           and regexp_replace(coalesce(c.phone_number, ''), '\D', '', 'g') like '%' || p.digits || '%'
+         )
+    )
+  order by c.is_active desc, lower(c.last_name), lower(c.first_name)
+  limit least(greatest(coalesce(p_limit, 8), 1), 50);
+$$;
+revoke all on function search_customers(text, integer, boolean) from public, anon;
+grant execute on function search_customers(text, integer, boolean) to authenticated;
+
+-- >>> supabase/migrations/0081_exchange_refund_rules.sql
+-- =============================================================================
+-- 0081_exchange_refund_rules.sql — an exchange's credit is refunded the way
+-- the original sale was paid (AceStock, Phase 3D review)
+--
+-- Before (0077):
+--   • A later refund of an exchange's new sale counted the part paid by the
+--     return's credit as no payment type at all, so any money back for it was
+--     a payment-type change. With a reason it could then go out as cash even
+--     when the original sale was paid by card.
+--   • record_exchange passed its new lines to record_sale unchecked, so a
+--     call through the API could load a gift card with the return's credit,
+--     turning a card or cash purchase into gift card money without the reason
+--     a refund onto a gift card needs.
+--
+-- Now:
+--   1. sale_refundable_by_method (same as 0054 otherwise): for an exchange's
+--      new sale, each money payment type can also give back up to the
+--      exchange's credit, but no more than the original sale still has left
+--      that way. More than that, or to another type, still needs a reason.
+--      Gift cards keep their own per-card rule (refund_method_overages).
+--   2. record_exchange (same as 0077 otherwise) refuses a gift card load among
+--      the new items.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. sale_refundable_by_method — an exchange's credit counts as the original's
+--    payment types
+-- -----------------------------------------------------------------------------
+create or replace function sale_refundable_by_method(p_sale_id uuid, p_refund_id uuid)
+returns table (method text, refundable numeric)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with exchange_credit as (
+    -- The exchange that paid for this sale with returned items, if any, and
+    -- the sale those items came from.
+    select e.credit, r.sale_id as original_sale_id
+      from exchanges e join refunds r on r.id = e.refund_id
+     where e.sale_id = p_sale_id
+  )
+  select m.method,
+         greatest(
+           coalesce((select sum(sp.amount) from sale_payments sp
+                      where sp.sale_id = p_sale_id and sp.method = m.method), 0)
+         + coalesce((select least(c.credit, greatest(
+                        coalesce((select sum(sp.amount) from sale_payments sp
+                                   where sp.sale_id = c.original_sale_id and sp.method = m.method), 0)
+                      - coalesce((select sum(rp.amount) from refund_payments rp join refunds r on r.id = rp.refund_id
+                                   where r.sale_id = c.original_sale_id and rp.method = m.method), 0),
+                        0))
+                       from exchange_credit c
+                      where m.method <> 'gift_card'), 0)
+         - coalesce((select sum(rp.amount) from refund_payments rp join refunds r on r.id = rp.refund_id
+                      where r.sale_id = p_sale_id and r.id is distinct from p_refund_id and rp.method = m.method), 0),
+           0)
+    from (values ('cash'), ('credit'), ('gift_card'), ('store_credit'), ('check')) as m(method);
+$$;
+
+revoke all on function sale_refundable_by_method(uuid, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. record_exchange — no gift card loads among the new items
+-- -----------------------------------------------------------------------------
+create or replace function record_exchange(
+  p_sale_id              uuid,
+  p_return_lines         jsonb,
+  p_new_lines            jsonb,
+  p_customer_id          uuid,
+  p_payments             jsonb,
+  p_refund_payments      jsonb,
+  p_reason               text,
+  p_ticket               jsonb default null,
+  p_approval_id          uuid default null,
+  p_method_change_reason text default null,
+  p_refund_approval_id   uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_exchange_id uuid := gen_random_uuid();
+  v_refund_id   uuid;
+  v_sale_id     uuid;
+  v_credit      numeric;
+begin
+  perform require_staff();
+
+  -- The return's credit buys goods, not gift card value: a load would turn a
+  -- card or cash purchase into gift card money without the reason a refund
+  -- onto a gift card needs (0081).
+  if jsonb_typeof(p_new_lines) = 'array' and exists (
+       select 1 from jsonb_array_elements(p_new_lines) l where nullif(l->>'gift_card_id', '') is not null) then
+    raise exception 'An exchange can''t load a gift card: refund the items onto the card instead';
+  end if;
+
+  -- record_refund and record_sale read these transaction-local settings.
+  -- Only this function sets them: the API can't call set_config (pg_catalog
+  -- isn't exposed), and nothing else sets acestock.exchange_*.
+  perform set_config('acestock.exchange_id', v_exchange_id::text, true);
+  v_refund_id := record_refund(p_sale_id, p_return_lines, coalesce(p_refund_payments, '[]'::jsonb),
+                               coalesce(nullif(btrim(p_reason), ''), 'Exchange'), null,
+                               p_method_change_reason, p_refund_approval_id);
+  perform set_config('acestock.exchange_id', '', true);
+
+  select coalesce(sum(amount), 0) into v_credit
+    from refund_payments where refund_id = v_refund_id and method = 'exchange';
+
+  perform set_config('acestock.exchange_credit', v_credit::text, true);
+  v_sale_id := record_sale(p_new_lines, p_customer_id, coalesce(p_payments, '[]'::jsonb), 'Exchange',
+                           p_ticket, p_approval_id);
+  perform set_config('acestock.exchange_credit', '', true);
+
+  insert into exchanges (id, refund_id, sale_id, credit) values (v_exchange_id, v_refund_id, v_sale_id, v_credit);
+
+  return jsonb_build_object('exchange_id', v_exchange_id, 'refund_id', v_refund_id, 'sale_id', v_sale_id,
+                            'credit', v_credit);
+end;
+$$;
+
+revoke all on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) from public, anon;
+grant execute on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0082_exchange_credit_sources.sql
+-- =============================================================================
+-- 0082_exchange_credit_sources.sql — an exchange's credit keeps the payment
+-- types it came from (AceStock, Phase 3D second review)
+--
+-- Before (0081): a later refund of an exchange's new sale could send its
+-- credit back the way the original sale was paid, but nothing took that off
+-- the original. One credit could go back twice without a reason: a $30 card
+-- charge could have $40 put back on the card. Two exchanges from one sale
+-- shared the same allowance, and chained exchanges and gift-card-paid
+-- originals always asked for a reason.
+--
+-- Now:
+--   1. refund_payments and sale_payments gain source_method and
+--      source_gift_card_id, set only on 'exchange' payments: the payment type
+--      (a gift card by card) that part of the credit came out of.
+--   2. record_refund, in an exchange, splits the credit across the original
+--      sale's payment types up to what each can still give back (cash, credit,
+--      gift card, store credit, check); record_exchange copies that split onto
+--      the new sale's exchange payments.
+--   3. sale_refundable_by_method and refund_method_overages count an exchange
+--      payment as its source: it uses up the original's room that way and
+--      gives the new sale exactly that room. 0081's allowance is gone.
+--   Exchanges recorded before this have no source, so a later refund of their
+--   new sale needs a reason for that part (as before 0081).
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Where an exchange payment came from
+-- -----------------------------------------------------------------------------
+-- No foreign key on source_gift_card_id: it copies a card already recorded on
+-- the original payment, and a second key to gift_cards would make the API's
+-- existing gift_cards ( ... ) embeds on payments ambiguous.
+alter table sale_payments add column if not exists source_method text;
+alter table sale_payments add column if not exists source_gift_card_id uuid;
+alter table refund_payments add column if not exists source_method text;
+alter table refund_payments add column if not exists source_gift_card_id uuid;
+
+alter table sale_payments drop constraint if exists ck_sale_payments_source;
+alter table sale_payments add constraint ck_sale_payments_source check (
+  (source_method is null or (method = 'exchange'
+     and source_method in ('cash', 'credit', 'gift_card', 'store_credit', 'check')))
+  and ((source_gift_card_id is not null) = (source_method is not distinct from 'gift_card')));
+alter table refund_payments drop constraint if exists ck_refund_payments_source;
+alter table refund_payments add constraint ck_refund_payments_source check (
+  (source_method is null or (method = 'exchange'
+     and source_method in ('cash', 'credit', 'gift_card', 'store_credit', 'check')))
+  and ((source_gift_card_id is not null) = (source_method is not distinct from 'gift_card')));
+
+comment on column sale_payments.source_method is 'For an exchange payment: the payment type of the original sale it came from';
+comment on column sale_payments.source_gift_card_id is 'For an exchange payment from a gift card: that card';
+comment on column refund_payments.source_method is 'For an exchange payment: the payment type of this sale it came out of';
+comment on column refund_payments.source_gift_card_id is 'For an exchange payment from a gift card: that card';
+
+-- -----------------------------------------------------------------------------
+-- 2. sale_refundable_by_method — an exchange payment counts as its source
+-- -----------------------------------------------------------------------------
+create or replace function sale_refundable_by_method(p_sale_id uuid, p_refund_id uuid)
+returns table (method text, refundable numeric)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select m.method,
+         greatest(
+           coalesce((select sum(sp.amount) from sale_payments sp
+                      where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) = m.method), 0)
+         - coalesce((select sum(rp.amount) from refund_payments rp join refunds r on r.id = rp.refund_id
+                      where r.sale_id = p_sale_id and r.id is distinct from p_refund_id
+                        and coalesce(rp.source_method, rp.method) = m.method), 0),
+           0)
+    from (values ('cash'), ('credit'), ('gift_card'), ('store_credit'), ('check')) as m(method);
+$$;
+
+revoke all on function sale_refundable_by_method(uuid, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 3. refund_method_overages — same as 0046; a gift card's room counts the
+--    exchange payments that came from it
+-- -----------------------------------------------------------------------------
+create or replace function refund_method_overages(p_sale_id uuid, p_refund_id uuid)
+returns text[]
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select coalesce(array_agg(x.label order by x.label), '{}')
+    from (
+      select b.method as label
+        from sale_refundable_by_method(p_sale_id, p_refund_id) b
+       where b.method <> 'gift_card'
+         and (select coalesce(sum(rp.amount), 0) from refund_payments rp
+               where rp.refund_id = p_refund_id and rp.method = b.method) > b.refundable + 0.005
+      union all
+      select 'gift card ' || g.code
+        from (select rp.gift_card_id, sum(rp.amount) as sent
+                from refund_payments rp
+               where rp.refund_id = p_refund_id and rp.method = 'gift_card'
+               group by rp.gift_card_id) c
+        join gift_cards g on g.id = c.gift_card_id
+       where c.sent > greatest(
+               coalesce((select sum(sp.amount) from sale_payments sp
+                          where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) = 'gift_card'
+                            and coalesce(sp.source_gift_card_id, sp.gift_card_id) = c.gift_card_id), 0)
+             - coalesce((select sum(rp.amount) from refund_payments rp join refunds r on r.id = rp.refund_id
+                          where r.sale_id = p_sale_id and r.id is distinct from p_refund_id
+                            and coalesce(rp.source_method, rp.method) = 'gift_card'
+                            and coalesce(rp.source_gift_card_id, rp.gift_card_id) = c.gift_card_id), 0),
+               0) + 0.005
+    ) x;
+$$;
+
+revoke all on function refund_method_overages(uuid, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 4. record_refund — same as 0079; an exchange's credit is split by source
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_source      record;
+  v_take        numeric;
+  v_load_total  numeric := 0;
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- The jobs whose charges come back are locked before the sale, the order
+  -- change_paid_string_job takes them in (job, then its sales), so a refund
+  -- and a string change on the same job queue instead of deadlocking (0079).
+  perform 1 from string_jobs
+   where id in (select sl.string_job_id from sale_lines sl
+                 where sl.sale_id = p_sale_id and sl.string_job_id is not null
+                   and sl.id in (select nullif(l->>'sale_line_id', '')::uuid
+                                   from jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) l))
+   order by id for update;
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      -- A string change's charge (0043) comes back once the job's own charge
+      -- has: refunding it alone would cancel a job that's still paid for (0079).
+      if v_sl.kind = 'string_change' and v_job.refund_id is null then
+        raise exception 'This is a string change on job J%: refund the job''s own charge first',
+          v_job.job_number;
+      end if;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as 'exchange' refund payments. Each one records the
+  -- payment type (a gift card by card) it came out of, up to what that type
+  -- can still give back, taken cash, credit, gift card, store credit, check
+  -- (0082). What no type covers stays an 'exchange' payment with no source.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    for v_source in
+      select paid.method, paid.card, greatest(paid.amount - coalesce(back.amount, 0), 0) as left_amount
+        from (select coalesce(sp.source_method, sp.method) as method,
+                     case when coalesce(sp.source_method, sp.method) = 'gift_card'
+                          then coalesce(sp.source_gift_card_id, sp.gift_card_id) end as card,
+                     sum(sp.amount) as amount
+                from sale_payments sp
+               where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) <> 'exchange'
+               group by 1, 2) paid
+        left join (select coalesce(rp.source_method, rp.method) as method,
+                          case when coalesce(rp.source_method, rp.method) = 'gift_card'
+                               then coalesce(rp.source_gift_card_id, rp.gift_card_id) end as card,
+                          sum(rp.amount) as amount
+                     from refund_payments rp join refunds r on r.id = rp.refund_id
+                    where r.sale_id = p_sale_id
+                    group by 1, 2) back
+          on back.method = paid.method and back.card is not distinct from paid.card
+       order by array_position(array['cash', 'credit', 'gift_card', 'store_credit', 'check'], paid.method), paid.card
+    loop
+      exit when v_rest <= 0.005;
+      v_take := least(v_rest, v_source.left_amount);
+      if v_take > 0.005 then
+        insert into refund_payments (refund_id, method, amount, source_method, source_gift_card_id)
+        values (v_refund_id, 'exchange', v_take, v_source.method, v_source.card);
+        v_paid := v_paid + v_take;
+        v_rest := v_rest - v_take;
+      end if;
+    end loop;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 5. record_exchange — same as 0081; the new sale's exchange payments are split
+-- -----------------------------------------------------------------------------
+create or replace function record_exchange(
+  p_sale_id              uuid,
+  p_return_lines         jsonb,
+  p_new_lines            jsonb,
+  p_customer_id          uuid,
+  p_payments             jsonb,
+  p_refund_payments      jsonb,
+  p_reason               text,
+  p_ticket               jsonb default null,
+  p_approval_id          uuid default null,
+  p_method_change_reason text default null,
+  p_refund_approval_id   uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_exchange_id uuid := gen_random_uuid();
+  v_refund_id   uuid;
+  v_sale_id     uuid;
+  v_credit      numeric;
+begin
+  perform require_staff();
+
+  -- The return's credit buys goods, not gift card value: a load would turn a
+  -- card or cash purchase into gift card money without the reason a refund
+  -- onto a gift card needs (0081).
+  if jsonb_typeof(p_new_lines) = 'array' and exists (
+       select 1 from jsonb_array_elements(p_new_lines) l where nullif(l->>'gift_card_id', '') is not null) then
+    raise exception 'An exchange can''t load a gift card: refund the items onto the card instead';
+  end if;
+
+  -- record_refund and record_sale read these transaction-local settings.
+  -- Only this function sets them: the API can't call set_config (pg_catalog
+  -- isn't exposed), and nothing else sets acestock.exchange_*.
+  perform set_config('acestock.exchange_id', v_exchange_id::text, true);
+  v_refund_id := record_refund(p_sale_id, p_return_lines, coalesce(p_refund_payments, '[]'::jsonb),
+                               coalesce(nullif(btrim(p_reason), ''), 'Exchange'), null,
+                               p_method_change_reason, p_refund_approval_id);
+  perform set_config('acestock.exchange_id', '', true);
+
+  select coalesce(sum(amount), 0) into v_credit
+    from refund_payments where refund_id = v_refund_id and method = 'exchange';
+
+  perform set_config('acestock.exchange_credit', v_credit::text, true);
+  v_sale_id := record_sale(p_new_lines, p_customer_id, coalesce(p_payments, '[]'::jsonb), 'Exchange',
+                           p_ticket, p_approval_id);
+  perform set_config('acestock.exchange_credit', '', true);
+
+  -- The credit arrives as one 'exchange' payment (record_sale); it's
+  -- replaced by the refund's split, so each part keeps the payment type it
+  -- came from (0082).
+  delete from sale_payments where sale_id = v_sale_id and method = 'exchange';
+  insert into sale_payments (sale_id, method, amount, source_method, source_gift_card_id)
+  select v_sale_id, 'exchange', rp.amount, rp.source_method, rp.source_gift_card_id
+    from refund_payments rp
+   where rp.refund_id = v_refund_id and rp.method = 'exchange';
+
+  insert into exchanges (id, refund_id, sale_id, credit) values (v_exchange_id, v_refund_id, v_sale_id, v_credit);
+
+  return jsonb_build_object('exchange_id', v_exchange_id, 'refund_id', v_refund_id, 'sale_id', v_sale_id,
+                            'credit', v_credit);
+end;
+$$;
+
+revoke all on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) from public, anon;
+grant execute on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0083_load_refund_approval_lines.sql
+-- =============================================================================
+-- 0083_load_refund_approval_lines.sql — an admin's approval names the loads
+-- (AceStock, Phase 3D second review)
+--
+-- Before (0078):
+--   • An approval covered any loads on its sale that added up to its amount,
+--     so approving one $50 card also covered a different $50 card.
+--   • An admin inserting into refund_approvals directly could set expires_at
+--     as far ahead as they liked.
+--
+-- Now:
+--   1. refund_approvals.sale_line_ids: the load lines the admin was shown.
+--      approve_refund(p_sale_id, p_amount, p_sale_line_ids) checks they're
+--      gift card loads on that sale adding up to the amount; the two-argument
+--      version is dropped. Approvals made before this name no lines, so they
+--      can't be used (they expire within 15 minutes anyway).
+--   2. The insert policy requires the lines and an expiry no more than 15
+--      minutes away.
+--   3. record_refund (same as 0082 otherwise) refuses an approval for other
+--      lines.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Which loads an approval covers
+-- -----------------------------------------------------------------------------
+alter table refund_approvals add column if not exists sale_line_ids uuid[];
+comment on column refund_approvals.sale_line_ids is 'The gift card load lines the admin approved refunding';
+
+-- -----------------------------------------------------------------------------
+-- 2. Inserts name the lines and expire within 15 minutes
+-- -----------------------------------------------------------------------------
+drop policy if exists refund_approvals_admin_insert on refund_approvals;
+create policy refund_approvals_admin_insert on refund_approvals
+  for insert to authenticated
+  with check (is_admin() and approved_by = auth.uid() and refund_id is null
+              and sale_id is not null and amount > 0
+              and cardinality(sale_line_ids) > 0
+              and expires_at <= now() + interval '15 minutes');
+
+drop function if exists approve_refund(uuid, numeric);
+create or replace function approve_refund(p_sale_id uuid, p_amount numeric, p_sale_line_ids uuid[])
+returns uuid
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_id    uuid;
+  v_loads numeric;
+begin
+  if not is_admin() then
+    raise exception 'Only an admin can approve refunding a gift card load' using errcode = '42501';
+  end if;
+  if not exists (select 1 from sales where id = p_sale_id) then
+    raise exception 'Unknown sale %', p_sale_id;
+  end if;
+  if p_amount is null or p_amount <= 0 or p_amount <> round(p_amount, 2) then
+    raise exception 'The approved amount must be a positive amount in cents';
+  end if;
+  if coalesce(cardinality(p_sale_line_ids), 0) = 0
+     or exists (select 1 from unnest(p_sale_line_ids) x
+                 where not exists (select 1 from sale_lines l
+                                    where l.id = x and l.sale_id = p_sale_id and l.gift_card_id is not null)) then
+    raise exception 'Approve gift card loads on this sale';
+  end if;
+  select sum(l.qty * l.unit_price) into v_loads
+    from sale_lines l where l.id in (select distinct unnest(p_sale_line_ids));
+  if abs(v_loads - p_amount) > 0.005 then
+    raise exception 'Those loads come to $%, not $%', to_char(v_loads, 'FM999999990.00'), to_char(p_amount, 'FM999999990.00');
+  end if;
+  insert into refund_approvals (sale_id, amount, sale_line_ids)
+  values (p_sale_id, p_amount, (select array_agg(distinct x) from unnest(p_sale_line_ids) x))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+
+revoke all on function approve_refund(uuid, numeric, uuid[]) from public, anon;
+grant execute on function approve_refund(uuid, numeric, uuid[]) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 3. record_refund — same as 0082; the approval must name the refunded loads
+-- -----------------------------------------------------------------------------
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_source      record;
+  v_take        numeric;
+  v_load_total  numeric := 0;
+  v_load_lines  uuid[] := '{}';
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- The jobs whose charges come back are locked before the sale, the order
+  -- change_paid_string_job takes them in (job, then its sales), so a refund
+  -- and a string change on the same job queue instead of deadlocking (0079).
+  perform 1 from string_jobs
+   where id in (select sl.string_job_id from sale_lines sl
+                 where sl.sale_id = p_sale_id and sl.string_job_id is not null
+                   and sl.id in (select nullif(l->>'sale_line_id', '')::uuid
+                                   from jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) l))
+   order by id for update;
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+      v_load_lines := v_load_lines || v_sl.id;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      -- A string change's charge (0043) comes back once the job's own charge
+      -- has: refunding it alone would cancel a job that's still paid for (0079).
+      if v_sl.kind = 'string_change' and v_job.refund_id is null then
+        raise exception 'This is a string change on job J%: refund the job''s own charge first',
+          v_job.job_number;
+      end if;
+      if v_job.status = 'complete' then
+        raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+      end if;
+      if v_job.status = 'entered' then
+        update string_jobs
+           set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+         where id = v_job.id;
+      end if;
+      if v_job.refund_id is null then
+        update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount,
+           a.sale_line_ids
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    -- ...and the very loads they were shown, not another card for the same amount (0083).
+    if (select coalesce(array_agg(x order by x), '{}') from unnest(v_approved.sale_line_ids) x)
+       is distinct from (select coalesce(array_agg(x order by x), '{}') from unnest(v_load_lines) x) then
+      raise exception 'The admin approved refunding other gift card loads on this sale: ask again';
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as 'exchange' refund payments. Each one records the
+  -- payment type (a gift card by card) it came out of, up to what that type
+  -- can still give back, taken cash, credit, gift card, store credit, check
+  -- (0082). What no type covers stays an 'exchange' payment with no source.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    for v_source in
+      select paid.method, paid.card, greatest(paid.amount - coalesce(back.amount, 0), 0) as left_amount
+        from (select coalesce(sp.source_method, sp.method) as method,
+                     case when coalesce(sp.source_method, sp.method) = 'gift_card'
+                          then coalesce(sp.source_gift_card_id, sp.gift_card_id) end as card,
+                     sum(sp.amount) as amount
+                from sale_payments sp
+               where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) <> 'exchange'
+               group by 1, 2) paid
+        left join (select coalesce(rp.source_method, rp.method) as method,
+                          case when coalesce(rp.source_method, rp.method) = 'gift_card'
+                               then coalesce(rp.source_gift_card_id, rp.gift_card_id) end as card,
+                          sum(rp.amount) as amount
+                     from refund_payments rp join refunds r on r.id = rp.refund_id
+                    where r.sale_id = p_sale_id
+                    group by 1, 2) back
+          on back.method = paid.method and back.card is not distinct from paid.card
+       order by array_position(array['cash', 'credit', 'gift_card', 'store_credit', 'check'], paid.method), paid.card
+    loop
+      exit when v_rest <= 0.005;
+      v_take := least(v_rest, v_source.left_amount);
+      if v_take > 0.005 then
+        insert into refund_payments (refund_id, method, amount, source_method, source_gift_card_id)
+        values (v_refund_id, 'exchange', v_take, v_source.method, v_source.card);
+        v_paid := v_paid + v_take;
+        v_rest := v_rest - v_take;
+      end if;
+    end loop;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
+-- >>> supabase/migrations/0084_job_and_racquet_review_fixes.sql
+-- =============================================================================
+-- 0084_job_and_racquet_review_fixes.sql — a delivered job's string change can
+-- be refunded on its own (AceStock, Phase 3D second review)
+--
+-- Before (0079–0083): record_refund refused a string change's charge until the
+-- job's own charge was refunded, even on a delivered job, where refunding the
+-- extra alone is a fair request and can't cancel anything.
+--
+-- Now (record_refund, otherwise the same as 0083): a string change's charge is
+-- refunded on its own once the job is delivered. A string change's charge
+-- never changes the job: not its status, nor its refund.
+--
+-- (The review also asked for a lock so a racquet can't change owner while a
+-- job is entered for it. guard_string_job_racket, 0042, already locks the
+-- racquet for update on every new job; race 19 in scripts/test-concurrency.sh
+-- shows the move waiting and being refused.)
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function record_refund(
+  p_sale_id              uuid,
+  p_lines                jsonb,
+  p_payments             jsonb,
+  p_reason               text,
+  p_note                 text,
+  p_method_change_reason text default null,
+  p_approval_id          uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_source      record;
+  v_take        numeric;
+  v_load_total  numeric := 0;
+  v_load_lines  uuid[] := '{}';
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- The jobs whose charges come back are locked before the sale, the order
+  -- change_paid_string_job takes them in (job, then its sales), so a refund
+  -- and a string change on the same job queue instead of deadlocking (0079).
+  perform 1 from string_jobs
+   where id in (select sl.string_job_id from sale_lines sl
+                 where sl.sale_id = p_sale_id and sl.string_job_id is not null
+                   and sl.id in (select nullif(l->>'sale_line_id', '')::uuid
+                                   from jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) l))
+   order by id for update;
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+      v_load_lines := v_load_lines || v_sl.id;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_sl.kind = 'string_change' then
+        -- A string change's charge (0043) comes back once the job's own charge
+        -- has (0079), or on its own once the job is delivered (0084). Either
+        -- way it leaves the job as it is: refunding it alone would otherwise
+        -- cancel a job that's still paid for.
+        if v_job.refund_id is null and v_job.status <> 'delivered' then
+          raise exception 'This is a string change on job J%: refund the job''s own charge first, or deliver the job',
+            v_job.job_number;
+        end if;
+      else
+        if v_job.status = 'complete' then
+          raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+        end if;
+        if v_job.status = 'entered' then
+          update string_jobs
+             set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+           where id = v_job.id;
+        end if;
+        if v_job.refund_id is null then
+          update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+        end if;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if v_unit_to = 'retired' and v_unit_reason is null then
+        raise exception 'Say why the returned frame is retired';
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount,
+           a.sale_line_ids
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    -- ...and the very loads they were shown, not another card for the same amount (0083).
+    if (select coalesce(array_agg(x order by x), '{}') from unnest(v_approved.sale_line_ids) x)
+       is distinct from (select coalesce(array_agg(x order by x), '{}') from unnest(v_load_lines) x) then
+      raise exception 'The admin approved refunding other gift card loads on this sale: ask again';
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as 'exchange' refund payments. Each one records the
+  -- payment type (a gift card by card) it came out of, up to what that type
+  -- can still give back, taken cash, credit, gift card, store credit, check
+  -- (0082). What no type covers stays an 'exchange' payment with no source.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    for v_source in
+      select paid.method, paid.card, greatest(paid.amount - coalesce(back.amount, 0), 0) as left_amount
+        from (select coalesce(sp.source_method, sp.method) as method,
+                     case when coalesce(sp.source_method, sp.method) = 'gift_card'
+                          then coalesce(sp.source_gift_card_id, sp.gift_card_id) end as card,
+                     sum(sp.amount) as amount
+                from sale_payments sp
+               where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) <> 'exchange'
+               group by 1, 2) paid
+        left join (select coalesce(rp.source_method, rp.method) as method,
+                          case when coalesce(rp.source_method, rp.method) = 'gift_card'
+                               then coalesce(rp.source_gift_card_id, rp.gift_card_id) end as card,
+                          sum(rp.amount) as amount
+                     from refund_payments rp join refunds r on r.id = rp.refund_id
+                    where r.sale_id = p_sale_id
+                    group by 1, 2) back
+          on back.method = paid.method and back.card is not distinct from paid.card
+       order by array_position(array['cash', 'credit', 'gift_card', 'store_credit', 'check'], paid.method), paid.card
+    loop
+      exit when v_rest <= 0.005;
+      v_take := least(v_rest, v_source.left_amount);
+      if v_take > 0.005 then
+        insert into refund_payments (refund_id, method, amount, source_method, source_gift_card_id)
+        values (v_refund_id, 'exchange', v_take, v_source.method, v_source.card);
+        v_paid := v_paid + v_take;
+        v_rest := v_rest - v_take;
+      end if;
+    end loop;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change and needs a reason.
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    if coalesce(trim(p_method_change_reason), '') = '' then
+      raise exception 'Refunding more to % than the sale took that way is a payment-type change; give a reason',
+        array_to_string(v_changed, ', ');
+    end if;
+    update refunds set method_change_reason = trim(p_method_change_reason) where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$$;
+
+
+revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
+grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
+
 commit;

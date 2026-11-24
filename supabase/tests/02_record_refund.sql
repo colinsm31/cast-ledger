@@ -87,10 +87,10 @@ select throws_like(
   '%Cannot return 1 of line (only 0 remaining)%', 'a line cannot be returned more times than it was sold');
 
 select throws_like(
-  format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":1}]'::jsonb,
-       '[{"method":"cash","amount":30}]'::jsonb, null, null) $$,
+  format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":2}]'::jsonb,
+       '[{"method":"cash","amount":60}]'::jsonb, null, null) $$,
        (select id from original_sale), (select job_line from lines)),
-  '%Only product lines can be returned%', 'stringing lines are not refundable yet');
+  'A stringing charge is refunded whole (qty 1)', 'a stringing line is refunded whole (since 0074, test 44)');
 
 -- Frames can be returned since 0070 (test 40), one per line.
 select throws_like(
