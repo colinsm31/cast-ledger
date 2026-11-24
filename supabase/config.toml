@@ -48,6 +48,14 @@ enable_confirmations = false
 # then checks the caller is an admin.
 verify_jwt = true
 
+[functions.send-notifications]
+# Sends queued customer messages (Phase 3E). Supabase checks the session; the
+# function then checks the caller has staff access. Its email secrets
+# (RESEND_API_KEY, NOTIFY_FROM_EMAIL, NOTIFY_REPLY_TO) come from the gitignored
+# supabase/functions/.env locally and from the dashboard when hosted; without
+# them it runs in test mode and sends nothing.
+verify_jwt = true
+
 [analytics]
 enabled = false
 
