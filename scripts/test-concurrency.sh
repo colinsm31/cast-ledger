@@ -18,8 +18,9 @@
 # the same barcode at once, the same sold frame returned twice, the same
 # demo frame lent twice, the same item exchanged twice, and a job's charge
 # refunded while its strings are changed (which must queue, not deadlock),
-# a demo lent while its customer is being made inactive, and a racquet moved
-# to another customer while a job is entered for it.
+# a demo lent while its customer is being made inactive, a racquet moved
+# to another customer while a job is entered for it, and two senders claiming
+# the same queued customer message (it must be sent once).
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -53,6 +54,8 @@ cleanup() {
     drop function if exists concurrency_test_pause();
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
+    delete from notifications   where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}');
+    delete from customer_opt_in_changes where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}');
     delete from demo_loans      where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}');
     delete from exchanges       where sale_id in (select id from run_sales);
     delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
@@ -421,6 +424,18 @@ check "a racquet moved while a job is entered for it" "$n" \
   "$(psql_run -c "select 'racquet with ' || case when customer_id = '${CUSTOMER}' then 'its owner' else 'the other customer' end ||
     ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_8}' and status = 'entered') || ' job(s) open'
     from customer_rackets where id = '${RACKET_8}'")"
+
+# 20. Two senders claim the same queued message (0086): it's claimed, so sent,
+#     only once (claim_notifications takes rows FOR UPDATE SKIP LOCKED).
+NOTE_ID=$(psql_run -c "insert into notifications (kind, channel, customer_id, string_job_id, to_address, body)
+  values ('job_ready', 'email', '${CUSTOMER}', '${JOB}', 'race@example.com', '${RUN_TAG}') returning id")
+claim_one="do \$\$ begin
+  if not exists (select 1 from claim_notifications(p_string_job_id => '${JOB}') where id = '${NOTE_ID}') then
+    raise exception 'not claimed';
+  end if; end \$\$"
+n=$(race "${claim_one}")
+check "one customer message claimed by two senders at once" "$n" \
+  "$(psql_run -c "select status || ', ' || attempts || ' attempt(s)' from notifications where id = '${NOTE_ID}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

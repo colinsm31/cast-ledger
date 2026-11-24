@@ -32,6 +32,8 @@ select is(
     'record_exchange',
     'record_refund', 'record_sale',
     'require_staff',
+    -- writes: calls require_staff() (0086)
+    'resend_notification',
     -- writes: calls require_staff() (0076)
     'set_customer_active',
     -- writes: call require_staff() (0071, 0076, 0068, 0067)
