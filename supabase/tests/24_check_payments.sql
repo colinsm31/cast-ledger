@@ -80,10 +80,12 @@ create temp table check_line as
 select id from sale_lines where sale_id = (select id from check_sale);
 grant select on check_line to authenticated;
 
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select record_refund((select id from check_sale), jsonb_build_array(jsonb_build_object('sale_line_id', (select id from check_line), 'qty', 1)),
                           '[{"method":"cash","amount":21.65}]'::jsonb, null, null, null) $$,
-  '%more to cash than the sale took that way%', 'cash back for a check sale is a payment-type change, so it needs a reason');
+  'cash back for a check sale needs no reason (0093)');
+rollback to savepoint no_reason;
 select throws_like(
   $$ select record_refund((select id from check_sale), jsonb_build_array(jsonb_build_object('sale_line_id', (select id from check_line), 'qty', 1)),
                           '[{"method":"check","amount":21.65}]'::jsonb, null, null, null) $$,

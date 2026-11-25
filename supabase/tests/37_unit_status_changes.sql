@@ -34,7 +34,11 @@ select lives_ok($$ select set_unit_status((select one from u), 'retired', 'Crack
 select lives_ok($$ select set_unit_status((select one from u), 'in_stock', 'Repaired by the maker') $$,
                 'and a retired one put back in stock');
 
-select throws_like($$ select set_unit_status((select two from u), 'retired', '   ') $$, 'Give a reason', 'a reason is needed');
+savepoint no_reason;
+select lives_ok(
+  $$ select set_unit_status((select two from u), 'retired', '   ') $$,
+  'no reason is needed (0093)');
+rollback to savepoint no_reason;
 select throws_like($$ select set_unit_status((select two from u), 'retired', repeat('x', 201)) $$,
                    'Keep the reason to 200 characters', 'of at most 200 characters');
 select throws_like($$ select set_unit_status((select two from u), 'in_stock', 'Already here') $$,

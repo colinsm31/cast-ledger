@@ -23,7 +23,7 @@ values ('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000
 create temp table card as select ensure_gift_card('PO-CARD-1', null) as id;
 
 -- ---------------------------------------------------------------------------
--- The quote: list prices, and changed prices that need a reason
+-- The quote: list prices, and changed prices (a reason is optional, 0093)
 -- ---------------------------------------------------------------------------
 create temp table q1 as
 select quote_sale(jsonb_build_array(
@@ -38,21 +38,21 @@ select is((select q->'problems' from q1), '[]'::jsonb,
           'list prices, a gift card at any amount and an unpriced item need no reason');
 
 select is(quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":15}]'::jsonb, null)->'problems',
-          '[{"line": 0, "message": "Price changed from $20.00: give a reason"}]'::jsonb,
-          'a lower price without a reason is a problem');
+          '[]'::jsonb,
+          'a lower price without a reason is no problem (0093)');
 select is(quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":22.50}]'::jsonb, null)->'problems',
-          '[{"line": 0, "message": "Price changed from $20.00: give a reason"}]'::jsonb,
-          'so is a higher one');
+          '[]'::jsonb,
+          'nor is a higher one');
 select is(quote_sale('[{"string_job_id":"00000000-0000-0000-0000-000000000f01","qty":1,"unit_price":25}]'::jsonb, null)->'problems',
-          '[{"line": 0, "message": "Price changed from $30.00: give a reason"}]'::jsonb,
-          'so is a string job charged at a different price than the job''s');
+          '[]'::jsonb,
+          'nor a string job charged at a different price than the job''s');
 select is(quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":15,"price_reason":"   "}]'::jsonb, null)->'problems',
-          '[{"line": 0, "message": "Price changed from $20.00: give a reason"}]'::jsonb,
-          'a blank reason is no reason');
+          '[]'::jsonb,
+          'nor a blank reason');
 
 create temp table q2 as
 select quote_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":15,"price_reason":"  Price match "}]'::jsonb, null) as q;
-select is((select q->'problems' from q2), '[]'::jsonb, 'a reason clears the problem');
+select is((select q->'problems' from q2), '[]'::jsonb, 'a reason is no problem either');
 select is((select q->'lines'->0 from q2),
           '{"line_total": 15, "taxable": true, "list_price": 20.00, "price_changed": true, "price_reason": "Price match",
             "price_before_discount": 15, "line_discount_each": 0, "ticket_discount_each": 0, "unit_price": 15,
@@ -72,12 +72,15 @@ select throws_like(
 -- ---------------------------------------------------------------------------
 -- Recording the sale
 -- ---------------------------------------------------------------------------
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20},
                           {"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":15}]'::jsonb,
                         null, '[{"method":"cash","amount":37.89}]'::jsonb, null) $$,
-  'Price changed from $20.00 on line 2: give a reason', 'a sale with a changed price and no reason is refused, naming the line');
-select is((select count(*) from sales), 0::bigint, '... and nothing is saved');
+  'a sale with a changed price goes through with no reason (0093)');
+select results_eq($$ select list_price, unit_price, price_reason from sale_lines where unit_price = 15 $$,
+  $$ values (20::numeric, 15::numeric, null::text) $$, '... keeping the list price, with no reason');
+rollback to savepoint no_reason;
 
 create temp table sale1 as
 select record_sale(jsonb_build_array(

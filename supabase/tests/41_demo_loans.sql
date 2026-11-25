@@ -104,8 +104,11 @@ select throws_like($$ select check_in_demo((select first from l)) $$, 'Demo D% h
 select throws_like($$ select set_demo_due((select first from l), now() + interval '1 day') $$,
                    'Demo D% has already been checked in', 'or extended once it''s back');
 
-select throws_like($$ select check_in_demo('00000000-0000-0000-0000-00000000dead', 'retired') $$,
-                   'Say why the frame is retired', 'a damaged demo needs a reason');
+savepoint no_reason;
+select lives_ok(
+  $$ select check_in_demo((select id from demo_loans where product_unit_id = (select two from u) and back_at is null), 'retired') $$,
+  'a damaged demo can be retired with no reason (0093)');
+rollback to savepoint no_reason;
 select throws_like($$ select check_in_demo('00000000-0000-0000-0000-00000000dead', 'in_stock') $$,
                    'A demo comes back to the demo fleet or is retired (not "in_stock")', 'it goes back to demo or is retired');
 select is(check_in_demo((select id from demo_loans where product_unit_id = (select two from u) and back_at is null),
