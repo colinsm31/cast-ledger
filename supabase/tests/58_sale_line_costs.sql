@@ -2,7 +2,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(9);
+select plan(6);
 
 create function tests.line(p_product uuid, p_qty integer, p_price numeric)
 returns jsonb language sql immutable as $$ select jsonb_build_object('product_id', p_product, 'qty', p_qty, 'unit_price', p_price) $$;
@@ -50,25 +50,9 @@ values ('00000000-0000-0000-0000-0000000005b3', '00000000-0000-0000-0000-0000000
 select is((select unit_cost from sale_lines where sale_id = '00000000-0000-0000-0000-0000000005b3'), null::numeric,
           'a gift card load has no cost');
 
--- Lines sold before 0094: the migration fills them from today's cost, marked
--- estimated. Simulate one, then run the migration's backfill again.
-alter table sale_lines disable trigger trg_sale_lines_unit_cost;
-insert into sales (id, subtotal, tax, tax_rate) values ('00000000-0000-0000-0000-0000000005b4', 20, 0, 0);
-insert into sale_lines (sale_id, product_id, qty, unit_price)
-values ('00000000-0000-0000-0000-0000000005b4', '00000000-0000-0000-0000-0000000000b1', 1, 20);
-alter table sale_lines enable trigger trg_sale_lines_unit_cost;
-select is(fill_estimated_sale_line_costs(), 1, 'the backfill fills in the one line without a cost');
-
-select results_eq(
-  $$ select unit_cost, unit_cost_estimated from sale_lines where sale_id = '00000000-0000-0000-0000-0000000005b4' $$,
-  $$ values (9.50::numeric, true) $$,
-  'an older line gets today''s cost, marked estimated');
-select results_eq(
-  $$ select unit_cost, unit_cost_estimated from sale_lines where sale_id = (select id from s) $$,
-  $$ values (8.00::numeric, false) $$,
-  'running it again leaves lines that already have a cost alone');
-select is((select unit_cost from sale_lines where sale_id = '00000000-0000-0000-0000-0000000005b2'), null::numeric,
-          'and a product with no cost stays without one');
+-- The one-time backfill (0094) has run and is gone, so it can't mark newer
+-- lines as estimated (0103).
+select hasnt_function('public', 'fill_estimated_sale_line_costs', 'the one-time cost backfill is gone');
 
 select * from finish();
 rollback;
