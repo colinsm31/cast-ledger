@@ -30,8 +30,11 @@ grant select on s to authenticated;
 select throws_like($$ update customers set is_active = false where id = '00000000-0000-0000-0000-0000000000c2' $$,
                    'Make a record inactive or active again from its page (it keeps the reason)',
                    'staff can''t flip the flag directly');
-select throws_like($$ select set_customer_active('00000000-0000-0000-0000-0000000000c2', false, '  ') $$,
-                   'Say why the customer is inactive', 'a reason is needed');
+savepoint no_reason;
+select lives_ok(
+  $$ select set_customer_active('00000000-0000-0000-0000-0000000000c2', false, '  ') $$,
+  'no reason is needed (0093)');
+rollback to savepoint no_reason;
 select throws_like($$ select set_customer_active('00000000-0000-0000-0000-0000000000c2', false, repeat('x', 201)) $$,
                    'Keep the reason to 200 characters', 'of at most 200 characters');
 select lives_ok($$ select set_customer_active('00000000-0000-0000-0000-0000000000c2', false, ' Moved away ') $$,
@@ -101,8 +104,11 @@ select results_eq(
 -- ---------------------------------------------------------------------------
 -- A lost gift card
 -- ---------------------------------------------------------------------------
-select throws_like($$ select set_gift_card_active('00000000-0000-0000-0000-0000000000e1', false, null) $$,
-                   'Say why the gift card is inactive', 'a card needs a reason too');
+savepoint no_reason;
+select lives_ok(
+  $$ select set_gift_card_active('00000000-0000-0000-0000-0000000000e1', false, null) $$,
+  'nor for a card (0093)');
+rollback to savepoint no_reason;
 select lives_ok($$ select set_gift_card_active('00000000-0000-0000-0000-0000000000e1', false, 'Lost') $$,
                 'the lost card is made inactive');
 select results_eq(

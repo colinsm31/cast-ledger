@@ -5,7 +5,7 @@
 begin;
 \ir helpers/setup.psql
 
-select plan(28);
+select plan(29);
 
 -- Fixtures (as the test superuser):
 --   cards GC-A (...e1) and GC-B (...e2), $200 each
@@ -60,44 +60,57 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 -- ---------------------------------------------------------------------------
 -- #5 Adding value needs a reason
 -- ---------------------------------------------------------------------------
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select adjust_gift_card('00000000-0000-0000-0000-0000000000e2', 10, null) $$,
-  '%A reason is required to add value to a gift card%', 'adding value to a gift card needs a reason');
-select throws_like(
+  'adding value to a gift card needs no reason (0093)');
+rollback to savepoint no_reason;
+savepoint no_reason;
+select lives_ok(
   $$ select adjust_gift_card('00000000-0000-0000-0000-0000000000e2', 10, '   ') $$,
-  '%A reason is required%', '... and a blank one doesn''t count');
+  '... and a blank one is fine');
+rollback to savepoint no_reason;
 select is(adjust_gift_card('00000000-0000-0000-0000-0000000000e2', 10, 'promo'), 210::numeric,
           'with a reason, the value is added');
 select is(adjust_gift_card('00000000-0000-0000-0000-0000000000e2', -10, null), 200::numeric,
           'taking value off still needs no reason');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select add_store_credit('00000000-0000-0000-0000-0000000000c1', 10, null) $$,
-  '%A reason is required to add store credit%', 'manual store credit needs a reason');
+  'manual store credit needs no reason (0093)');
+select is((select reason from store_credit_txns where customer_id = '00000000-0000-0000-0000-0000000000c1' and sale_id is null),
+          'adjust', '... and is recorded as an adjustment, as on gift cards');
+rollback to savepoint no_reason;
 select is(add_store_credit('00000000-0000-0000-0000-0000000000c1', 10, ' goodwill '), 10::numeric,
           'with a reason, the credit is added');
 
 -- ---------------------------------------------------------------------------
 -- #6 Gift card refunds go back to the card that paid
 -- ---------------------------------------------------------------------------
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select pg_temp.refund_one('card_a', '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e2"}]') $$,
-  '%Refunding more to gift card GC-B than the sale took that way%give a reason%',
-  'refunding to a different card than the one that paid needs a reason');
+  'refunding to a different card than the one that paid needs no reason (0093)');
+rollback to savepoint no_reason;
 select lives_ok(
   $$ select pg_temp.refund_one('card_a', '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e2"}]',
                               'customer lost card A') $$,
   '... and with a reason it goes through');
 select is((select method_change_reason from refunds where sale_id = (select id from t_sales where k = 'card_a')),
           'customer lost card A', '... and the reason is kept');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select pg_temp.refund_one('cash', '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e1"}]') $$,
-  '%gift card GC-A%', 'refunding a cash sale to a card names the card');
+  'a cash sale can be refunded to a gift card with no reason (0093)');
+rollback to savepoint no_reason;
 select lives_ok(
   $$ select pg_temp.refund_one('split', '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e1"}]') $$,
   'refunding to the card that paid needs no reason');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select pg_temp.refund_one('split', '[{"method":"gift_card","amount":21.65,"gift_card_id":"00000000-0000-0000-0000-0000000000e1"}]') $$,
-  '%gift card GC-A%', '... until what that card paid has been given back');
+  '... and more than that card paid can go back to it, with no reason (0093)');
+rollback to savepoint no_reason;
 
 -- ---------------------------------------------------------------------------
 -- #7 Customer history can't be deleted

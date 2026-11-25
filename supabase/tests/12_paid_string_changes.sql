@@ -131,11 +131,12 @@ select is(
   and jsonb_array_length(string_change_quote('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000b6',
                        '00000000-0000-0000-0000-0000000000b6') -> 'allocations') = 2,
   true, '$43 → $10 gives back $33: $23 from the string-change sale, then $10 from the original');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select change_paid_string_job('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000b6',
        '00000000-0000-0000-0000-0000000000b6', 55, 53, '[{"method":"cash","amount":33}]'::jsonb) $$,
-  '%Giving back more as cash than the sale took%',
-  'giving back more cash than a sale took that way needs a reason');
+  'giving back more cash than a sale took that way needs no reason (0093)');
+rollback to savepoint no_reason;
 select lives_ok(
   $$ select change_paid_string_job('00000000-0000-0000-0000-000000000f01', '00000000-0000-0000-0000-0000000000b6',
        '00000000-0000-0000-0000-0000000000b6', 55, 53,
@@ -177,10 +178,12 @@ select is(
   (string_change_quote('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000000b6',
                        '00000000-0000-0000-0000-0000000000b6') ->> 'total')::numeric,
   10.83::numeric, '$10 less gives back $10.83 with its tax');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select change_paid_string_job('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000000b6',
        '00000000-0000-0000-0000-0000000000b6', 50, 50, '[{"method":"credit","amount":10.83}]'::jsonb) $$,
-  '%more as credit than the sale took%', 'giving back to a card on a cash sale needs a reason');
+  'giving back to a card on a cash sale needs no reason (0093)');
+rollback to savepoint no_reason;
 select lives_ok(
   $$ select change_paid_string_job('00000000-0000-0000-0000-000000000f03', '00000000-0000-0000-0000-0000000000b6',
        '00000000-0000-0000-0000-0000000000b6', 50, 50, '[{"method":"credit","amount":10.83}]'::jsonb,

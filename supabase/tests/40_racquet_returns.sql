@@ -67,8 +67,11 @@ select throws_like($$ select tests.refund_frame((select pair from s), (select on
 -- ---------------------------------------------------------------------------
 -- Damaged: retired
 -- ---------------------------------------------------------------------------
-select throws_like($$ select tests.refund_frame((select pair from s), (select two from l), 270.62, '{"unit_status":"retired"}') $$,
-                   'Say why the returned frame is retired', 'a damaged frame needs a reason');
+savepoint no_reason;
+select lives_ok(
+  $$ select tests.refund_frame((select pair from s), (select two from l), 270.62, '{"unit_status":"retired"}') $$,
+  'a damaged frame can be retired with no reason (0093)');
+rollback to savepoint no_reason;
 select throws_like($$ select tests.refund_frame((select pair from s), (select two from l), 270.62, '{"unit_status":"demo"}') $$,
                    'A returned frame goes back in stock or is retired (not "demo")', 'it goes back in stock or is retired');
 select lives_ok(

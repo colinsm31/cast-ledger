@@ -91,12 +91,14 @@ select throws_like(
        jsonb_build_array(tests.line('00000000-0000-0000-0000-0000000000b1', 1, 20)),
        '00000000-0000-0000-0000-0000000000c1', '[]'::jsonb, '[{"method":"credit","amount":70}]'::jsonb, null) $$,
   'The money back ($70.00) is more than the return ($64.95)', 'never more than the return');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select record_exchange(
        (select strings from s), tests.return_of((select strings from s), '00000000-0000-0000-0000-0000000000b1', 3),
        jsonb_build_array(tests.line('00000000-0000-0000-0000-0000000000b1', 1, 20)),
        '00000000-0000-0000-0000-0000000000c1', '[]'::jsonb, '[{"method":"cash","amount":43.30}]'::jsonb, null) $$,
-  '%payment-type change; give a reason', 'cash back on a card sale still needs a reason');
+  'cash back on a card sale needs no reason (0093)');
+rollback to savepoint no_reason;
 create temp table e3 as select record_exchange(
   (select strings from s), tests.return_of((select strings from s), '00000000-0000-0000-0000-0000000000b1', 3),
   jsonb_build_array(tests.line('00000000-0000-0000-0000-0000000000b1', 1, 20)),

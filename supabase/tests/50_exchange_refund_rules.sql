@@ -68,11 +68,12 @@ select lives_ok(
 -- ---------------------------------------------------------------------------
 -- The new sale ($32.48: $21.65 credit from cash + $10.83 cash)
 -- ---------------------------------------------------------------------------
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select tests.refund_of((select id from b), '00000000-0000-0000-0000-0000000000b7', 1,
        '[{"method":"credit","amount":10},{"method":"cash","amount":22.48}]') $$,
-  'Refunding more to credit than the sale took that way is a payment-type change; give a reason',
-  'the new sale can''t send its credit to the card: it came out of cash');
+  'the new sale can send its credit to the card with no reason (0093)');
+rollback to savepoint no_reason;
 create temp table rb as select tests.refund_of((select id from b), '00000000-0000-0000-0000-0000000000b7', 1,
   '[{"method":"cash","amount":32.48}]') as id;
 grant select on rb to authenticated;
@@ -82,16 +83,18 @@ select is((select method_change_reason from refunds where id = (select id from r
 -- ---------------------------------------------------------------------------
 -- The original's last string ($21.65): the credit was counted there too
 -- ---------------------------------------------------------------------------
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select tests.refund_of((select id from a), '00000000-0000-0000-0000-0000000000b1', 1,
        '[{"method":"credit","amount":10.01},{"method":"cash","amount":11.64}]') $$,
-  'Refunding more to credit than the sale took that way is a payment-type change; give a reason',
-  'no more than the $10 left goes back to the card');
-select throws_like(
+  'more than the $10 left can go back to the card with no reason (0093)');
+rollback to savepoint no_reason;
+savepoint no_reason;
+select lives_ok(
   $$ select tests.refund_of((select id from a), '00000000-0000-0000-0000-0000000000b1', 1,
        '[{"method":"cash","amount":21.65}]') $$,
-  'Refunding more to cash than the sale took that way is a payment-type change; give a reason',
-  'nor more than the $11.65 cash left (the exchange used the rest)');
+  'and more than the $11.65 cash left (0093)');
+rollback to savepoint no_reason;
 select lives_ok(
   $$ select tests.refund_of((select id from a), '00000000-0000-0000-0000-0000000000b1', 1,
        '[{"method":"credit","amount":10},{"method":"cash","amount":11.65}]') $$,
@@ -121,11 +124,12 @@ select results_eq(
   $$ select source_method, source_gift_card_id, amount from sale_payments where sale_id = (select id from g2) $$,
   $$ values ('gift_card'::text, '00000000-0000-0000-0000-0000000000e2'::uuid, 32.48::numeric) $$,
   'after two exchanges the credit still says it came off card GC-50B');
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   $$ select tests.refund_of((select id from g2), '00000000-0000-0000-0000-0000000000b7', 1,
        '[{"method":"gift_card","amount":32.48,"gift_card_id":"00000000-0000-0000-0000-0000000000e3"}]') $$,
-  'Refunding more to gift card GC-50C than the sale took that way is a payment-type change; give a reason',
-  'it can''t go onto another card without a reason');
+  'it can go onto another card with no reason (0093)');
+rollback to savepoint no_reason;
 create temp table rg as select tests.refund_of((select id from g2), '00000000-0000-0000-0000-0000000000b7', 1,
   '[{"method":"gift_card","amount":32.48,"gift_card_id":"00000000-0000-0000-0000-0000000000e2"}]') as id;
 grant select on rg to authenticated;

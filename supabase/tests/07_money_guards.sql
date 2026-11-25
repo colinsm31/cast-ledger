@@ -81,17 +81,20 @@ select record_refund((select id from mixed_sale),
 select is((select method_change_reason from refunds where id = (select id from same_type_refund)), null,
           'refunding to the payment types the sale used needs no reason');
 
-select throws_like(
+savepoint no_reason;
+select lives_ok(
   format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":1}]'::jsonb,
          '[{"method":"cash","amount":21.65}]'::jsonb, null, null) $$,
          (select id from mixed_sale), (select id from mixed_line)),
-  '%payment-type change; give a reason%',
-  'refunding more cash than the sale took (net of earlier refunds) needs a reason');
-select throws_like(
+  'refunding more cash than the sale took goes through with no reason (0093)');
+rollback to savepoint no_reason;
+savepoint no_reason;
+select lives_ok(
   format($$ select record_refund('%s', '[{"sale_line_id":"%s","qty":1}]'::jsonb,
          '[{"method":"cash","amount":21.65}]'::jsonb, null, null, '   ') $$,
          (select id from mixed_sale), (select id from mixed_line)),
-  '%give a reason%', 'a blank reason does not count');
+  '... or a blank one');
+rollback to savepoint no_reason;
 
 create temp table changed_refund as
 select record_refund((select id from mixed_sale),
