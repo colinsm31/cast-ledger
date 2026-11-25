@@ -58,7 +58,11 @@ grant execute on function pg_temp.refund_one(text, jsonb, text) to authenticated
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 -- ---------------------------------------------------------------------------
--- #5 Adding value needs a reason
+-- #5 Adding value needs a reason (no longer, 0093); adding value is an
+-- admin's (0104), so these run as the admin.
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
+-- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
 savepoint no_reason;
 select lives_ok(
@@ -83,6 +87,8 @@ select is((select reason from store_credit_txns where customer_id = '00000000-00
 rollback to savepoint no_reason;
 select is(add_store_credit('00000000-0000-0000-0000-0000000000c1', 10, ' goodwill '), 10::numeric,
           'with a reason, the credit is added');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 -- ---------------------------------------------------------------------------
 -- #6 Gift card refunds go back to the card that paid
