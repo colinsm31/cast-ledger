@@ -18,8 +18,10 @@
 # the same barcode at once, the same sold frame returned twice, the same
 # demo frame lent twice, the same item exchanged twice, and a job's charge
 # refunded while its strings are changed (which must queue, not deadlock),
-# a demo lent while its customer is being made inactive, and a racquet moved
-# to another customer while a job is entered for it.
+# a demo lent while its customer is being made inactive, a racquet moved
+# to another customer while a job is entered for it, two senders claiming
+# the same queued customer message (it must be sent once), and a racquet being
+# moved to an inactive customer when a job is entered for it.
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -38,6 +40,7 @@ GIFT_CARD=$(new_id); RACKET=$(new_id); JOB=$(new_id); RACKET_2=$(new_id); JOB_2=
 RACKET_3=$(new_id); RACKET_4=$(new_id); LAST_STRING=$(new_id); STAFF=$(new_id)
 RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING_A=$(new_id); STRING_B=$(new_id)
 RACKET_7=$(new_id); JOB_7=$(new_id); CUSTOMER_2=$(new_id); CUSTOMER_3=$(new_id); RACKET_8=$(new_id)
+CUSTOMER_4=$(new_id); RACKET_9=$(new_id)
 ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id); HELD=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
@@ -53,6 +56,8 @@ cleanup() {
     drop function if exists concurrency_test_pause();
     create temp table run_sales as
       select id from sales where customer_id = '${CUSTOMER}' or note = '${RUN_TAG}';
+    delete from notifications   where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}', '${CUSTOMER_4}');
+    delete from customer_opt_in_changes where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}', '${CUSTOMER_4}');
     delete from demo_loans      where customer_id in ('${CUSTOMER}', '${CUSTOMER_2}');
     delete from exchanges       where sale_id in (select id from run_sales);
     delete from unit_status_changes where product_unit_id in (select id from product_units where product_id = '${UNIT_PRODUCT}');
@@ -71,12 +76,12 @@ cleanup() {
     delete from product_units   where product_id = '${UNIT_PRODUCT}';
     delete from string_jobs     where id in ('${JOB}', '${JOB_2}')
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}',
-                                                             '${RACKET_7}', '${RACKET_8}');
+                                                             '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from sales           where id in (select id from run_sales);
     delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
-                                             '${RACKET_5}', '${RACKET_6}', '${RACKET_7}', '${RACKET_8}');
+                                             '${RACKET_5}', '${RACKET_6}', '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from gift_cards      where id = '${GIFT_CARD}';
-    delete from customers       where id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}');
+    delete from customers       where id in ('${CUSTOMER}', '${CUSTOMER_2}', '${CUSTOMER_3}', '${CUSTOMER_4}');
     delete from products        where id in ('${PRODUCT}', '${LAST_UNIT_PRODUCT}', '${LAST_STRING}',
                                              '${STRING_A}', '${STRING_B}', '${ADJUST_PRODUCT}', '${UNIT_PRODUCT}');
     delete from categories      where id in ('${CATEGORY}', '${RACQUET_CATEGORY}');
@@ -421,6 +426,36 @@ check "a racquet moved while a job is entered for it" "$n" \
   "$(psql_run -c "select 'racquet with ' || case when customer_id = '${CUSTOMER}' then 'its owner' else 'the other customer' end ||
     ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_8}' and status = 'entered') || ' job(s) open'
     from customer_rackets where id = '${RACKET_8}'")"
+
+# 20. Two senders claim the same queued message (0086, 0088): it's claimed, so
+#     sent, only once (claim_notifications takes rows FOR UPDATE SKIP LOCKED).
+#     A receipt email, so the ready-message checks (0088) don't come into it.
+NOTE_ID=$(psql_run -c "insert into notifications (kind, channel, customer_id, to_address, subject, body)
+  values ('receipt', 'email', '${CUSTOMER}', 'race@example.com', 'Receipt', '${RUN_TAG}') returning id")
+claim_one="do \$\$ begin
+  if not exists (select 1 from claim_notifications(p_id => '${NOTE_ID}')) then
+    raise exception 'not claimed';
+  end if; end \$\$"
+n=$(race "${claim_one}")
+check "one customer message claimed by two senders at once" "$n" \
+  "$(psql_run -c "select status || ', ' || attempts || ' attempt(s)' from notifications where id = '${NOTE_ID}'")"
+
+# 21. The other order from 19 (0091): the racquet is being moved to an
+#     inactive customer when a job is entered for it. The job waits for the
+#     move (guard_active_customer locks the racquet before reading its owner)
+#     and is refused, so no job is open under an inactive customer.
+psql_run <<SQL >/dev/null
+  insert into customers (id, first_name, last_name) values ('${CUSTOMER_4}', 'Concurrency', 'Gone');
+  insert into customer_rackets (id, customer_id, model) values ('${RACKET_9}', '${CUSTOMER}', 'Ninth frame');
+SQL
+psql_run -c "${AS_STAFF}; select set_customer_active('${CUSTOMER_4}', false, 'Moved away')" >/dev/null
+n=$(race "update customer_rackets set customer_id = '${CUSTOMER_4}' where id = '${RACKET_9}'" \
+         "${AS_STAFF}; insert into string_jobs (customer_racket_id, main_product_id, cross_product_id, main_tension,
+           cross_tension, price) values ('${RACKET_9}', '${STRING_A}', '${STRING_A}', 52, 52, 20)")
+check "a job entered while its racquet moves to an inactive customer" "$n" \
+  "$(psql_run -c "select 'racquet with ' || case when r.customer_id = '${CUSTOMER_4}' then 'the inactive customer' else 'its owner' end ||
+    ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_9}' and status = 'entered') || ' job(s) open'
+    from customer_rackets r where r.id = '${RACKET_9}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

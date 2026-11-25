@@ -33,3 +33,16 @@ jobs:
       # Two real connections racing for the same balance, line, job or unit.
       - name: Run concurrency checks
         run: ./scripts/test-concurrency.sh
+
+      # Edge Functions: unit tests (fakes stand in for the network and the
+      # database) and a type check of each function.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.6
+
+      # Exact versions, held by supabase/functions/deno.lock (frozen).
+      - name: Run Edge Function tests
+        working-directory: supabase/functions
+        run: |
+          deno test
+          deno check */index.ts

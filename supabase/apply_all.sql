@@ -19005,4 +19005,1500 @@ $$;
 revoke all on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) from public, anon;
 grant execute on function record_refund(uuid, jsonb, jsonb, text, text, text, uuid) to authenticated;
 
+-- >>> supabase/migrations/0085_customer_notification_opt_in.sql
+-- =============================================================================
+-- 0085_customer_notification_opt_in.sql — a customer's say on being told
+-- when their stringing is ready (AceStock, Phase 3E)
+--
+-- Before:
+--   • customers had a phone_number and an email (0012) but no record of
+--     whether they wanted to hear from the shop.
+--
+-- Now:
+--   1. customers.email_opt_in / sms_opt_in, each with when and by whom it was
+--      last changed. Staff tick them on the customer's form, as today's
+--      customer edits work (direct update under RLS).
+--   2. A trigger stamps who and when, refuses an opt-in with no usable email
+--      or phone, and turns an opt-in off when its email or phone is cleared.
+--   3. customer_opt_in_changes keeps every change (customer, channel, on or
+--      off, who, when, why), so the shop can show when consent was given.
+--   4. phone_e164 / is_valid_email: the forms a message can be sent to.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Usable contact details
+-- -----------------------------------------------------------------------------
+-- A phone number a text can go to: a US number of 10 digits (with or without
+-- a leading 1, any punctuation) becomes +1XXXXXXXXXX; a number typed with a
+-- leading + keeps its 8–15 digits. Anything else (an extension, too short) is
+-- null.
+create or replace function phone_e164(p_phone text)
+returns text
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_text   text := btrim(coalesce(p_phone, ''));
+  v_digits text := regexp_replace(v_text, '\D', '', 'g');
+begin
+  if v_text ~ '^\+' and v_text !~ '^\+1' then
+    if v_text ~ '^\+[0-9 ().-]+$' and length(v_digits) between 8 and 15 then
+      return '+' || v_digits;
+    end if;
+    return null;
+  end if;
+  if v_text !~ '^\+?[0-9 ().-]+$' then
+    return null;
+  end if;
+  if length(v_digits) = 11 and left(v_digits, 1) = '1' then
+    v_digits := substr(v_digits, 2);
+  end if;
+  if length(v_digits) = 10 and left(v_digits, 1) between '2' and '9' then
+    return '+1' || v_digits;
+  end if;
+  return null;
+end;
+$$;
+grant execute on function phone_e164(text) to authenticated;
+
+create or replace function is_valid_email(p_email text)
+returns boolean
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select coalesce(btrim(p_email) ~ '^[^\s@]+@[^\s@]+\.[^\s@]+$' and char_length(btrim(p_email)) <= 254, false)
+$$;
+grant execute on function is_valid_email(text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. Columns and history
+-- -----------------------------------------------------------------------------
+alter table customers add column if not exists email_opt_in        boolean not null default false;
+alter table customers add column if not exists email_opt_in_at     timestamptz;
+alter table customers add column if not exists email_opt_in_by     uuid references profiles (id);
+alter table customers add column if not exists sms_opt_in          boolean not null default false;
+alter table customers add column if not exists sms_opt_in_at       timestamptz;
+alter table customers add column if not exists sms_opt_in_by       uuid references profiles (id);
+
+comment on column customers.email_opt_in is 'The customer agreed to be emailed when their stringing is ready';
+comment on column customers.sms_opt_in   is 'The customer agreed to be texted when their stringing is ready';
+comment on column customers.email_opt_in_at is 'When email_opt_in last changed';
+comment on column customers.sms_opt_in_at   is 'When sms_opt_in last changed';
+
+create table if not exists customer_opt_in_changes (
+  id          uuid primary key default gen_random_uuid(),
+  customer_id uuid not null references customers (id) on delete cascade,
+  channel     text not null check (channel in ('email', 'sms')),
+  opted_in    boolean not null,
+  reason      text not null check (char_length(reason) between 1 and 200),
+  changed_by  uuid references profiles (id),
+  changed_at  timestamptz not null default now()
+);
+create index if not exists customer_opt_in_changes_customer_idx
+  on customer_opt_in_changes (customer_id, changed_at desc);
+comment on table customer_opt_in_changes is
+  'Every change to a customer''s email/SMS opt-in: proof of when consent was given or withdrawn';
+
+alter table customer_opt_in_changes enable row level security;
+drop policy if exists customer_opt_in_changes_staff_read on customer_opt_in_changes;
+create policy customer_opt_in_changes_staff_read on customer_opt_in_changes
+  for select to authenticated using (is_staff());
+revoke all on customer_opt_in_changes from anon, authenticated;
+grant select on customer_opt_in_changes to authenticated;
+-- Every table refuses writes from accounts without staff access (0041, 0073).
+drop trigger if exists trg_enforce_staff_writer on customer_opt_in_changes;
+create trigger trg_enforce_staff_writer before insert or update or delete on customer_opt_in_changes
+  for each statement execute function enforce_staff_writer();
+
+-- -----------------------------------------------------------------------------
+-- 3. Stamping and checking opt-ins
+-- -----------------------------------------------------------------------------
+-- Runs as the caller: it only fills in the row being saved.
+create or replace function stamp_customer_opt_in()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  -- Clearing the address or number turns its opt-in off rather than failing
+  -- the edit; the history says why.
+  if tg_op = 'UPDATE' and new.email_opt_in and nullif(btrim(coalesce(new.email, '')), '') is null then
+    new.email_opt_in := false;
+  end if;
+  if tg_op = 'UPDATE' and new.sms_opt_in and nullif(btrim(coalesce(new.phone_number, '')), '') is null then
+    new.sms_opt_in := false;
+  end if;
+
+  if new.email_opt_in and not is_valid_email(new.email) then
+    raise exception 'Add a valid email address before opting in to emails';
+  end if;
+  if new.sms_opt_in and phone_e164(new.phone_number) is null then
+    raise exception 'Add a mobile number (10 digits) before opting in to texts';
+  end if;
+
+  if tg_op = 'INSERT' then
+    new.email_opt_in_at := case when new.email_opt_in then now() end;
+    new.email_opt_in_by := case when new.email_opt_in then auth.uid() end;
+    new.sms_opt_in_at   := case when new.sms_opt_in then now() end;
+    new.sms_opt_in_by   := case when new.sms_opt_in then auth.uid() end;
+    return new;
+  end if;
+
+  if new.email_opt_in is distinct from old.email_opt_in then
+    new.email_opt_in_at := now();
+    new.email_opt_in_by := auth.uid();
+  else
+    new.email_opt_in_at := old.email_opt_in_at;
+    new.email_opt_in_by := old.email_opt_in_by;
+  end if;
+  if new.sms_opt_in is distinct from old.sms_opt_in then
+    new.sms_opt_in_at := now();
+    new.sms_opt_in_by := auth.uid();
+  else
+    new.sms_opt_in_at := old.sms_opt_in_at;
+    new.sms_opt_in_by := old.sms_opt_in_by;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function stamp_customer_opt_in() from public, anon, authenticated;
+
+drop trigger if exists trg_stamp_customer_opt_in on customers;
+create trigger trg_stamp_customer_opt_in before insert or update on customers
+  for each row execute function stamp_customer_opt_in();
+
+-- The history row is written after the change, once the customer row exists.
+-- (Not an UPDATE OF trigger: clearing a phone turns sms_opt_in off without
+-- the edit naming that column.)
+-- Security definer only so it can write the history table, which staff can't
+-- write directly. A function that turns an opt-in off for a reason of its own
+-- (a refused address, later) sets acestock.opt_in_reason first.
+create or replace function log_customer_opt_in()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_reason text := coalesce(nullif(current_setting('acestock.opt_in_reason', true), ''),
+                            case when tg_op = 'INSERT' then 'Opted in when the customer was added'
+                                 else 'Changed on the customer''s record' end);
+begin
+  if new.email_opt_in is distinct from (case when tg_op = 'INSERT' then false else old.email_opt_in end) then
+    insert into customer_opt_in_changes (customer_id, channel, opted_in, reason, changed_by)
+    values (new.id, 'email', new.email_opt_in,
+            case when tg_op = 'UPDATE' and not new.email_opt_in and nullif(btrim(coalesce(new.email, '')), '') is null
+                      and old.email is not null then 'Email address removed' else v_reason end,
+            auth.uid());
+  end if;
+  if new.sms_opt_in is distinct from (case when tg_op = 'INSERT' then false else old.sms_opt_in end) then
+    insert into customer_opt_in_changes (customer_id, channel, opted_in, reason, changed_by)
+    values (new.id, 'sms', new.sms_opt_in,
+            case when tg_op = 'UPDATE' and not new.sms_opt_in and nullif(btrim(coalesce(new.phone_number, '')), '') is null
+                      and old.phone_number is not null then 'Phone number removed' else v_reason end,
+            auth.uid());
+  end if;
+  return null;
+end;
+$$;
+revoke all on function log_customer_opt_in() from public, anon, authenticated;
+
+drop trigger if exists trg_log_customer_opt_in on customers;
+create trigger trg_log_customer_opt_in after insert or update on customers
+  for each row execute function log_customer_opt_in();
+
+-- >>> supabase/migrations/0086_notification_log.sql
+-- =============================================================================
+-- 0086_notification_log.sql — the customer message log and the "ready" queue
+-- (AceStock, Phase 3E)
+--
+-- Before:
+--   • Marking a string job complete (advance_string_job, 0064) told nobody;
+--     staff phoned the customer.
+--
+-- Now:
+--   1. notifications: one row per message to a customer — what kind (a job is
+--      ready; a receipt, from 0087), by email or text, to which address, the
+--      words sent, and where it stands: queued → sending → sent, failed or
+--      skipped (texting isn't set up; test mode). Staff can read it; only the
+--      functions below write it.
+--   2. Settings hold the "ready" templates an admin edits, with {first_name},
+--      {last_name}, {job_number}, {racquet} and {shop_name} filled in.
+--   3. When a job becomes complete, queue_job_ready queues one message per
+--      channel the customer opted into (0085), in the same transaction, so a
+--      message is queued exactly when the job is complete.
+--   4. claim_notifications / finish_notification are for the server-side
+--      sender (the send-notifications Edge Function, service role only): a
+--      claim takes queued rows (SKIP LOCKED, so two senders never take the
+--      same one) and marks them sending; finish records the outcome.
+--   5. resend_notification: staff put a failed or skipped message back in the
+--      queue. A ready message is only resent while the customer is still
+--      opted in, to their current address.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Templates
+-- -----------------------------------------------------------------------------
+alter table settings add column if not exists ready_email_subject text not null
+  default 'Your racquet is ready at {shop_name}';
+alter table settings add column if not exists ready_email_body text not null
+  default E'Hi {first_name},\n\nYour {racquet} is strung and ready to pick up (job {job_number}).\n\nThanks,\n{shop_name}';
+alter table settings add column if not exists ready_sms_body text not null
+  default 'Hi {first_name}, your {racquet} is strung and ready at {shop_name} (job {job_number}). Reply STOP to opt out.';
+
+alter table settings drop constraint if exists ck_settings_ready_templates;
+alter table settings add constraint ck_settings_ready_templates check (
+  char_length(btrim(ready_email_subject)) between 1 and 150
+  and char_length(btrim(ready_email_body)) between 1 and 2000
+  and char_length(btrim(ready_sms_body)) between 1 and 320
+);
+
+comment on column settings.ready_email_subject is 'Subject of the "stringing ready" email; placeholders like {first_name}';
+comment on column settings.ready_email_body    is 'Body of the "stringing ready" email';
+comment on column settings.ready_sms_body      is 'The "stringing ready" text message';
+
+-- Fills {name} placeholders from p_values; an unknown placeholder is left as
+-- typed so a typo shows in the preview.
+create or replace function render_template(p_template text, p_values jsonb)
+returns text
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_text text := coalesce(p_template, '');
+  v_key  text;
+  v_val  text;
+begin
+  for v_key, v_val in select key, value from jsonb_each_text(coalesce(p_values, '{}'::jsonb)) loop
+    v_text := replace(v_text, '{' || v_key || '}', coalesce(v_val, ''));
+  end loop;
+  return v_text;
+end;
+$$;
+grant execute on function render_template(text, jsonb) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. The log
+-- -----------------------------------------------------------------------------
+create table if not exists notifications (
+  id             uuid primary key default gen_random_uuid(),
+  kind           text not null check (kind in ('job_ready', 'receipt')),
+  channel        text not null check (channel in ('email', 'sms')),
+  customer_id    uuid references customers (id) on delete set null,
+  string_job_id  uuid references string_jobs (id) on delete set null,
+  sale_id        uuid references sales (id) on delete set null,
+  to_address     text not null check (char_length(to_address) between 3 and 254),
+  subject        text,
+  body           text not null,
+  html           text,
+  status         text not null default 'queued'
+                   check (status in ('queued', 'sending', 'sent', 'failed', 'skipped')),
+  provider_id    text,
+  error          text,
+  attempts       integer not null default 0,
+  created_by     uuid references profiles (id) default auth.uid(),
+  created_at     timestamptz not null default now(),
+  sending_at     timestamptz,
+  finished_at    timestamptz,
+  check (channel = 'email' or (subject is null and html is null))
+);
+create index if not exists notifications_customer_idx on notifications (customer_id, created_at desc);
+create index if not exists notifications_job_idx on notifications (string_job_id) where string_job_id is not null;
+create index if not exists notifications_sale_idx on notifications (sale_id, created_at desc) where sale_id is not null;
+create index if not exists notifications_queued_idx on notifications (created_at) where status in ('queued', 'sending');
+comment on table notifications is
+  'Every message sent (or tried) to a customer: ready notices and emailed receipts';
+
+alter table notifications enable row level security;
+drop policy if exists notifications_staff_read on notifications;
+create policy notifications_staff_read on notifications
+  for select to authenticated using (is_staff());
+revoke all on notifications from anon, authenticated;
+grant select on notifications to authenticated;
+drop trigger if exists trg_enforce_staff_writer on notifications;
+create trigger trg_enforce_staff_writer before insert or update or delete on notifications
+  for each statement execute function enforce_staff_writer();
+
+-- -----------------------------------------------------------------------------
+-- 3. Queueing the "ready" message
+-- -----------------------------------------------------------------------------
+-- The values a ready template fills in, for one job.
+create or replace function job_ready_values(p_job_id uuid)
+returns jsonb
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select jsonb_build_object(
+           'first_name', c.first_name,
+           'last_name',  c.last_name,
+           'job_number', 'J' || j.job_number,
+           'racquet',    coalesce(nullif(btrim(concat_ws(' ', r.brand, r.model)), ''), 'racquet'),
+           'shop_name',  coalesce(nullif(btrim(s.shop_name), ''), 'the shop'))
+    from string_jobs j
+    join customer_rackets r on r.id = j.customer_racket_id
+    join customers c on c.id = r.customer_id
+    cross join settings s
+   where j.id = p_job_id
+$$;
+revoke all on function job_ready_values(uuid) from public, anon;
+grant execute on function job_ready_values(uuid) to authenticated;
+
+-- Security definer so the trigger can write the log, which staff can't.
+create or replace function queue_job_ready()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_customer customers%rowtype;
+  v_values   jsonb;
+  v_settings settings%rowtype;
+begin
+  if new.status <> 'complete' or old.status = 'complete' then
+    return null;
+  end if;
+  select c.* into v_customer
+    from customer_rackets r join customers c on c.id = r.customer_id
+   where r.id = new.customer_racket_id;
+  if not found or not v_customer.is_active then
+    return null;
+  end if;
+  select * into v_settings from settings where id;
+  v_values := job_ready_values(new.id);
+
+  if v_customer.email_opt_in and is_valid_email(v_customer.email) then
+    insert into notifications (kind, channel, customer_id, string_job_id, to_address, subject, body)
+    values ('job_ready', 'email', v_customer.id, new.id, btrim(v_customer.email),
+            render_template(v_settings.ready_email_subject, v_values),
+            render_template(v_settings.ready_email_body, v_values));
+  end if;
+  if v_customer.sms_opt_in and phone_e164(v_customer.phone_number) is not null then
+    insert into notifications (kind, channel, customer_id, string_job_id, to_address, body)
+    values ('job_ready', 'sms', v_customer.id, new.id, phone_e164(v_customer.phone_number),
+            render_template(v_settings.ready_sms_body, v_values));
+  end if;
+  return null;
+end;
+$$;
+revoke all on function queue_job_ready() from public, anon, authenticated;
+
+drop trigger if exists trg_queue_job_ready on string_jobs;
+create trigger trg_queue_job_ready after update of status on string_jobs
+  for each row execute function queue_job_ready();
+
+-- -----------------------------------------------------------------------------
+-- 4. The sender's side (service role only)
+-- -----------------------------------------------------------------------------
+-- Takes up to p_limit queued messages — for one job, one sale, or the oldest
+-- of any — and marks them sending. A message left "sending" for 10 minutes
+-- (a sender that died) is taken again.
+create or replace function claim_notifications(
+  p_string_job_id uuid default null,
+  p_sale_id       uuid default null,
+  p_limit         integer default 20
+)
+returns setof notifications
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  return query
+  with picked as (
+    select n.id
+      from notifications n
+     where (n.status = 'queued' or (n.status = 'sending' and n.sending_at < now() - interval '10 minutes'))
+       and (p_string_job_id is null or n.string_job_id = p_string_job_id)
+       and (p_sale_id is null or n.sale_id = p_sale_id)
+     order by n.created_at
+     limit least(greatest(coalesce(p_limit, 20), 1), 100)
+     for update skip locked
+  )
+  update notifications n
+     set status = 'sending', sending_at = now(), attempts = n.attempts + 1, error = null
+    from picked
+   where n.id = picked.id
+  returning n.*;
+end;
+$$;
+revoke all on function claim_notifications(uuid, uuid, integer) from public, anon, authenticated;
+grant execute on function claim_notifications(uuid, uuid, integer) to service_role;
+
+-- Records how a claimed message went. A text refused because the customer
+-- replied STOP (p_opted_out) also turns their text opt-in off.
+create or replace function finish_notification(
+  p_id          uuid,
+  p_status      text,
+  p_provider_id text default null,
+  p_error       text default null,
+  p_opted_out   boolean default false
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row notifications%rowtype;
+begin
+  if p_status not in ('sent', 'failed', 'skipped') then
+    raise exception 'A message finishes as sent, failed or skipped';
+  end if;
+  select * into v_row from notifications where id = p_id for update;
+  if not found then
+    raise exception 'Unknown message %', p_id;
+  end if;
+  if v_row.status <> 'sending' then
+    raise exception 'This message isn''t being sent (it is %)', v_row.status;
+  end if;
+  update notifications
+     set status      = p_status,
+         provider_id = left(p_provider_id, 200),
+         error       = left(nullif(btrim(coalesce(p_error, '')), ''), 500),
+         finished_at = now()
+   where id = p_id;
+
+  if p_opted_out and v_row.channel = 'sms' and v_row.customer_id is not null then
+    perform set_config('acestock.opt_in_reason', 'The customer replied STOP', true);
+    update customers set sms_opt_in = false where id = v_row.customer_id and sms_opt_in;
+    perform set_config('acestock.opt_in_reason', '', true);
+  end if;
+end;
+$$;
+revoke all on function finish_notification(uuid, text, text, text, boolean) from public, anon, authenticated;
+grant execute on function finish_notification(uuid, text, text, text, boolean) to service_role;
+
+-- -----------------------------------------------------------------------------
+-- 5. Sending again
+-- -----------------------------------------------------------------------------
+create or replace function resend_notification(p_id uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row      notifications%rowtype;
+  v_customer customers%rowtype;
+  v_to       text;
+begin
+  perform require_staff();
+  select * into v_row from notifications where id = p_id for update;
+  if not found then
+    raise exception 'Unknown message %', p_id;
+  end if;
+  if v_row.status not in ('failed', 'skipped') then
+    raise exception 'Only a message that failed or wasn''t sent can be sent again';
+  end if;
+  v_to := v_row.to_address;
+
+  if v_row.kind = 'job_ready' then
+    select * into v_customer from customers where id = v_row.customer_id;
+    if not found or not v_customer.is_active then
+      raise exception 'This customer is inactive, so they aren''t sent messages';
+    end if;
+    if v_row.channel = 'email' then
+      if not v_customer.email_opt_in or not is_valid_email(v_customer.email) then
+        raise exception '% has opted out of emails', v_customer.first_name;
+      end if;
+      v_to := btrim(v_customer.email);
+    else
+      if not v_customer.sms_opt_in or phone_e164(v_customer.phone_number) is null then
+        raise exception '% has opted out of texts', v_customer.first_name;
+      end if;
+      v_to := phone_e164(v_customer.phone_number);
+    end if;
+  end if;
+
+  update notifications
+     set status = 'queued', to_address = v_to, error = null, provider_id = null,
+         sending_at = null, finished_at = null
+   where id = p_id;
+  return p_id;
+end;
+$$;
+revoke all on function resend_notification(uuid) from public, anon;
+grant execute on function resend_notification(uuid) to authenticated;
+
+-- >>> supabase/migrations/0087_receipt_emails.sql
+-- =============================================================================
+-- 0087_receipt_emails.sql — emailing a sale's receipt (AceStock, Phase 3E;
+-- moved here from 2C)
+--
+-- Before:
+--   • A receipt could only be printed (2C, /sales/:id/receipt).
+--
+-- Now:
+--   queue_receipt_email puts a receipt email in the message log (0086) for the
+--   send-notifications Edge Function to send. The web app draws the email from
+--   the same receipt data as the printed letter layout; here the request is
+--   checked:
+--     • staff only (require_staff);
+--     • a valid address, and a sale that exists;
+--     • the subject is set here ("Your receipt from <shop> (<number>)"), not
+--       taken from the request;
+--     • the HTML is at most 200 KB with no script or javascript: link, and the
+--       plain-text copy at most 20,000 characters;
+--     • at most 5 receipt emails per sale per hour, counted with the sale row
+--       locked, so a stuck button can't flood an inbox.
+--   A receipt is sent because the customer asked at the counter, so it needs
+--   no opt-in (0085 is for ready notices).
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function queue_receipt_email(
+  p_sale_id uuid,
+  p_to      text,
+  p_html    text,
+  p_text    text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_to       text := btrim(coalesce(p_to, ''));
+  v_customer uuid;
+  v_shop     text;
+  v_recent   integer;
+  v_id       uuid;
+begin
+  perform require_staff();
+  if not is_valid_email(v_to) then
+    raise exception 'Enter a valid email address for the receipt';
+  end if;
+  select customer_id into v_customer from sales where id = p_sale_id for update;
+  if not found then
+    raise exception 'Unknown sale %', p_sale_id;
+  end if;
+  if nullif(btrim(coalesce(p_text, '')), '') is null or char_length(p_text) > 20000 then
+    raise exception 'The receipt''s text is missing or too long';
+  end if;
+  if nullif(btrim(coalesce(p_html, '')), '') is null or octet_length(p_html) > 200000 then
+    raise exception 'The receipt''s page is missing or too large';
+  end if;
+  if p_html ~* '<\s*script|javascript\s*:' then
+    raise exception 'The receipt''s page can''t contain scripts';
+  end if;
+
+  select count(*) into v_recent
+    from notifications
+   where sale_id = p_sale_id and kind = 'receipt' and created_at > now() - interval '1 hour';
+  if v_recent >= 5 then
+    raise exception 'This receipt was already emailed 5 times in the last hour; try again later';
+  end if;
+
+  select coalesce(nullif(btrim(shop_name), ''), 'us') into v_shop from settings where id;
+  insert into notifications (kind, channel, customer_id, sale_id, to_address, subject, body, html)
+  values ('receipt', 'email', v_customer, p_sale_id, v_to,
+          format('Your receipt from %s (%s)', coalesce(v_shop, 'us'),
+                 upper(left(replace(p_sale_id::text, '-', ''), 8))),
+          p_text, p_html)
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function queue_receipt_email(uuid, text, text, text) from public, anon;
+grant execute on function queue_receipt_email(uuid, text, text, text) to authenticated;
+
+-- >>> supabase/migrations/0088_notification_sending_fixes.sql
+-- =============================================================================
+-- 0088_notification_sending_fixes.sql — sending customer messages, review fixes
+-- (AceStock, Phase 3E review)
+--
+-- Before (0086):
+--   • Send again (resend_notification) took only failed or skipped messages.
+--     A message left waiting (the sender was down) or stuck "sending" could
+--     never be sent, and nothing else sent it (review #1).
+--   • The sender's duplicate-protection key was the message id plus its try
+--     count. A message that went out but wasn't recorded was taken again
+--     after 10 minutes with a new key, so the email service sent it twice
+--     (review #3).
+--   • A queued ready message was sent even if the customer had since opted
+--     out, changed address, been made inactive or deleted, or the job had
+--     moved on (review #5); Send again also allowed a ready message for a job
+--     already delivered or cancelled (review #10).
+--   • Send again then asked the sender for "this job's or sale's" messages;
+--     when that job or sale had been deleted, the request named neither and
+--     the whole shop's queue went (review #9).
+--   • A message stuck "sending" was taken again forever (review #15).
+--
+-- Now:
+--   1. notifications.resend_count: raised only when Send again puts a
+--      finished (failed or not-sent) message back. The sender's key is the
+--      message id plus this count, so a retry of the same send is never
+--      delivered twice, and only Send again makes a new send.
+--   2. claim_notifications takes an optional message id (p_id) so Send again
+--      sends exactly that message. Before handing a ready message to the
+--      sender it checks again that the job is still complete and the
+--      customer still exists, is active, is opted in to that channel and has
+--      the same address; if not, the message is recorded as not sent, with
+--      the reason. A message already tried 5 times is recorded as failed.
+--   3. resend_notification also takes a waiting message, or one stuck
+--      "sending" for 10 minutes; a ready message only while its job is
+--      complete (waiting for pickup).
+--
+-- Re-runnable.
+-- =============================================================================
+
+alter table notifications add column if not exists resend_count integer not null default 0;
+comment on column notifications.resend_count is
+  'Times staff used Send again on a finished message; part of the sender''s duplicate-protection key';
+
+-- The most times a message is handed to the sender before it is given up.
+create or replace function notification_max_attempts()
+returns integer
+language sql
+immutable
+set search_path = public, pg_temp
+as $$ select 5 $$;
+revoke all on function notification_max_attempts() from public, anon, authenticated;
+
+-- Why a ready message should no longer go, or null when it still should.
+create or replace function job_ready_stale_reason(p_message notifications)
+returns text
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_customer customers%rowtype;
+  v_status   text;
+begin
+  if p_message.kind <> 'job_ready' then
+    return null;
+  end if;
+  select status into v_status from string_jobs where id = p_message.string_job_id;
+  if v_status is null then
+    return 'The job was deleted, so the message wasn''t sent';
+  end if;
+  if v_status <> 'complete' then
+    return format('The job is %s, so the ready message wasn''t sent', v_status);
+  end if;
+  select * into v_customer from customers where id = p_message.customer_id;
+  if not found then
+    return 'The customer was deleted, so the message wasn''t sent';
+  end if;
+  if not v_customer.is_active then
+    return 'The customer is inactive, so the message wasn''t sent';
+  end if;
+  if p_message.channel = 'email' then
+    if not v_customer.email_opt_in then
+      return 'The customer opted out of emails, so the message wasn''t sent';
+    end if;
+    if btrim(coalesce(v_customer.email, '')) is distinct from p_message.to_address then
+      return 'The customer''s email address changed, so the message wasn''t sent';
+    end if;
+  else
+    if not v_customer.sms_opt_in then
+      return 'The customer opted out of texts, so the message wasn''t sent';
+    end if;
+    if phone_e164(v_customer.phone_number) is distinct from p_message.to_address then
+      return 'The customer''s mobile number changed, so the message wasn''t sent';
+    end if;
+  end if;
+  return null;
+end;
+$$;
+revoke all on function job_ready_stale_reason(notifications) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- The sender's claim (service role only)
+-- -----------------------------------------------------------------------------
+drop function if exists claim_notifications(uuid, uuid, integer);
+create or replace function claim_notifications(
+  p_string_job_id uuid default null,
+  p_sale_id       uuid default null,
+  p_limit         integer default 20,
+  p_id            uuid default null
+)
+returns setof notifications
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row    notifications%rowtype;
+  v_reason text;
+begin
+  for v_row in
+    select n.*
+      from notifications n
+     where (n.status = 'queued' or (n.status = 'sending' and n.sending_at < now() - interval '10 minutes'))
+       and (p_string_job_id is null or n.string_job_id = p_string_job_id)
+       and (p_sale_id is null or n.sale_id = p_sale_id)
+       and (p_id is null or n.id = p_id)
+     order by n.created_at
+     limit least(greatest(coalesce(p_limit, 20), 1), 100)
+     for update skip locked
+  loop
+    if v_row.attempts >= notification_max_attempts() then
+      update notifications
+         set status = 'failed', finished_at = now(),
+             error = format('Gave up after %s tries; use Send again to try once more', v_row.attempts)
+       where id = v_row.id;
+      continue;
+    end if;
+    v_reason := job_ready_stale_reason(v_row);
+    if v_reason is not null then
+      update notifications
+         set status = 'skipped', finished_at = now(), error = v_reason
+       where id = v_row.id;
+      continue;
+    end if;
+    update notifications
+       set status = 'sending', sending_at = now(), attempts = attempts + 1, error = null
+     where id = v_row.id
+    returning * into v_row;
+    return next v_row;
+  end loop;
+end;
+$$;
+revoke all on function claim_notifications(uuid, uuid, integer, uuid) from public, anon, authenticated;
+grant execute on function claim_notifications(uuid, uuid, integer, uuid) to service_role;
+
+-- -----------------------------------------------------------------------------
+-- Sending again (staff)
+-- -----------------------------------------------------------------------------
+create or replace function resend_notification(p_id uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row      notifications%rowtype;
+  v_customer customers%rowtype;
+  v_status   text;
+  v_to       text;
+  v_finished boolean;
+begin
+  perform require_staff();
+  select * into v_row from notifications where id = p_id for update;
+  if not found then
+    raise exception 'Unknown message %', p_id;
+  end if;
+  if v_row.status = 'sent' then
+    raise exception 'This message was already sent';
+  end if;
+  if v_row.status = 'sending' and v_row.sending_at >= now() - interval '10 minutes' then
+    raise exception 'This message is being sent now; try again in a few minutes';
+  end if;
+  v_finished := v_row.status in ('failed', 'skipped');
+  v_to := v_row.to_address;
+
+  if v_row.kind = 'job_ready' then
+    select status into v_status from string_jobs where id = v_row.string_job_id;
+    if v_status is null then
+      raise exception 'The job was deleted, so there''s nothing to tell the customer';
+    end if;
+    if v_status <> 'complete' then
+      raise exception 'The job is %, so the ready message can''t be sent', v_status;
+    end if;
+    select * into v_customer from customers where id = v_row.customer_id;
+    if not found or not v_customer.is_active then
+      raise exception 'This customer is inactive, so they aren''t sent messages';
+    end if;
+    if v_row.channel = 'email' then
+      if not v_customer.email_opt_in or not is_valid_email(v_customer.email) then
+        raise exception '% has opted out of emails', v_customer.first_name;
+      end if;
+      v_to := btrim(v_customer.email);
+    else
+      if not v_customer.sms_opt_in or phone_e164(v_customer.phone_number) is null then
+        raise exception '% has opted out of texts', v_customer.first_name;
+      end if;
+      v_to := phone_e164(v_customer.phone_number);
+    end if;
+  end if;
+
+  -- A finished message is a new send (new key); a waiting or stuck one is the
+  -- same send, so if it did go out, the email service drops the repeat.
+  update notifications
+     set status = 'queued', to_address = v_to, error = null, provider_id = null,
+         sending_at = null, finished_at = null, attempts = 0,
+         resend_count = resend_count + case when v_finished then 1 else 0 end
+   where id = p_id;
+  return p_id;
+end;
+$$;
+revoke all on function resend_notification(uuid) from public, anon;
+grant execute on function resend_notification(uuid) to authenticated;
+
+-- >>> supabase/migrations/0089_opt_in_review_fixes.sql
+-- =============================================================================
+-- 0089_opt_in_review_fixes.sql — consent follows the address (AceStock,
+-- Phase 3E review)
+--
+-- Before (0085):
+--   • Changing a customer's email or mobile number kept their opt-in, so
+--     messages went to the new address with no consent recorded for it
+--     (review #7). An opted-in customer whose address was changed to an
+--     unusable one couldn't be saved at all (review #11).
+--   • Deleting a customer deleted their consent history (on delete cascade),
+--     while the log of messages sent to them was kept (review #8).
+--
+-- Now:
+--   1. stamp_customer_opt_in: an edit that changes the email (ignoring case
+--      and spaces) or the mobile number (ignoring formatting) turns that
+--      opt-in off; the history says "Email address changed" / "Mobile number
+--      changed". To keep sending, staff ask the customer again and tick the
+--      box, which is recorded as a new opt-in for the new address.
+--   2. customer_opt_in_changes keeps its rows when the customer is deleted
+--      (customer_id is set to null), like the message log.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Consent follows the address
+-- -----------------------------------------------------------------------------
+create or replace function stamp_customer_opt_in()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'UPDATE' then
+    -- A new (or removed) address or number needs the customer's say again,
+    -- so its opt-in is turned off rather than carried over (0089). Clearing
+    -- one is a change too.
+    if old.email_opt_in
+       and lower(btrim(coalesce(new.email, ''))) is distinct from lower(btrim(coalesce(old.email, ''))) then
+      new.email_opt_in := false;
+    end if;
+    if old.sms_opt_in
+       and phone_e164(new.phone_number) is distinct from phone_e164(old.phone_number) then
+      new.sms_opt_in := false;
+    end if;
+  end if;
+
+  if new.email_opt_in and not is_valid_email(new.email) then
+    raise exception 'Add a valid email address before opting in to emails';
+  end if;
+  if new.sms_opt_in and phone_e164(new.phone_number) is null then
+    raise exception 'Add a mobile number (10 digits) before opting in to texts';
+  end if;
+
+  if tg_op = 'INSERT' then
+    new.email_opt_in_at := case when new.email_opt_in then now() end;
+    new.email_opt_in_by := case when new.email_opt_in then auth.uid() end;
+    new.sms_opt_in_at   := case when new.sms_opt_in then now() end;
+    new.sms_opt_in_by   := case when new.sms_opt_in then auth.uid() end;
+    return new;
+  end if;
+
+  if new.email_opt_in is distinct from old.email_opt_in then
+    new.email_opt_in_at := now();
+    new.email_opt_in_by := auth.uid();
+  else
+    new.email_opt_in_at := old.email_opt_in_at;
+    new.email_opt_in_by := old.email_opt_in_by;
+  end if;
+  if new.sms_opt_in is distinct from old.sms_opt_in then
+    new.sms_opt_in_at := now();
+    new.sms_opt_in_by := auth.uid();
+  else
+    new.sms_opt_in_at := old.sms_opt_in_at;
+    new.sms_opt_in_by := old.sms_opt_in_by;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function stamp_customer_opt_in() from public, anon, authenticated;
+
+-- The history's reason for a change the edit didn't ask for.
+create or replace function log_customer_opt_in()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_reason text := coalesce(nullif(current_setting('acestock.opt_in_reason', true), ''),
+                            case when tg_op = 'INSERT' then 'Opted in when the customer was added'
+                                 else 'Changed on the customer''s record' end);
+begin
+  if new.email_opt_in is distinct from (case when tg_op = 'INSERT' then false else old.email_opt_in end) then
+    insert into customer_opt_in_changes (customer_id, channel, opted_in, reason, changed_by)
+    values (new.id, 'email', new.email_opt_in,
+            case when tg_op = 'UPDATE' and not new.email_opt_in
+                      and nullif(current_setting('acestock.opt_in_reason', true), '') is null
+                      and lower(btrim(coalesce(new.email, ''))) is distinct from lower(btrim(coalesce(old.email, ''))) then
+                   case when nullif(btrim(coalesce(new.email, '')), '') is null then 'Email address removed'
+                        else 'Email address changed' end
+                 else v_reason end,
+            auth.uid());
+  end if;
+  if new.sms_opt_in is distinct from (case when tg_op = 'INSERT' then false else old.sms_opt_in end) then
+    insert into customer_opt_in_changes (customer_id, channel, opted_in, reason, changed_by)
+    values (new.id, 'sms', new.sms_opt_in,
+            case when tg_op = 'UPDATE' and not new.sms_opt_in
+                      and nullif(current_setting('acestock.opt_in_reason', true), '') is null
+                      and phone_e164(new.phone_number) is distinct from phone_e164(old.phone_number) then
+                   case when nullif(btrim(coalesce(new.phone_number, '')), '') is null then 'Phone number removed'
+                        else 'Mobile number changed' end
+                 else v_reason end,
+            auth.uid());
+  end if;
+  return null;
+end;
+$$;
+revoke all on function log_customer_opt_in() from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. The history outlives the customer
+-- -----------------------------------------------------------------------------
+alter table customer_opt_in_changes alter column customer_id drop not null;
+alter table customer_opt_in_changes drop constraint if exists customer_opt_in_changes_customer_id_fkey;
+alter table customer_opt_in_changes add constraint customer_opt_in_changes_customer_id_fkey
+  foreign key (customer_id) references customers (id) on delete set null;
+
+-- >>> supabase/migrations/0090_server_built_receipt_email.sql
+-- =============================================================================
+-- 0090_server_built_receipt_email.sql — the receipt email is built here, from
+-- the sale (AceStock, Phase 3E review #2)
+--
+-- Before (0087):
+--   queue_receipt_email took the email's HTML and text from the browser and
+--   only refused <script> and javascript: links. Links, forms and images got
+--   through, so a stolen staff login could send any email to anyone from the
+--   shop's address; the limit was 5 per sale per hour, so working through
+--   many sales got around it.
+--
+-- Now:
+--   1. receipt_email_content(sale, time zone) builds the email from the saved
+--      sale and the shop's receipt settings, in the printed letter receipt's
+--      layout (web ReceiptView / lib/receipt.ts): shop name and address;
+--      receipt number, time, who served, customer; each line with its
+--      discount note; savings, subtotal, tax, total, payments, refunds since;
+--      gift card balances; return policy and footer. Every value is escaped.
+--      A plain-text copy goes with it.
+--   2. queue_receipt_email(sale, address, time zone) takes only those: the
+--      browser can no longer supply any of the email's content. The time zone
+--      only sets how the sale's time is written (an unknown one is UTC).
+--   3. Besides 5 per sale per hour, at most 30 receipt emails an hour for the
+--      whole shop, counted with the settings row locked.
+--
+--   Keep this in step with the printed receipt: a change to its layout is
+--   made in both (receipt_email_content and web lib/receipt.ts).
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Small helpers (internal: no signed-in user calls them)
+-- -----------------------------------------------------------------------------
+create or replace function html_escape(p_text text)
+returns text
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select replace(replace(replace(replace(replace(coalesce(p_text, ''),
+           '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), '''', '&#39;')
+$$;
+revoke all on function html_escape(text) from public, anon, authenticated;
+
+-- "$12.50" (amounts are rounded to the cent, as the web's toCents does).
+create or replace function receipt_dollars(p_amount numeric)
+returns text
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select case when round(coalesce(p_amount, 0), 2) < 0 then '-' else '' end
+         || '$' || to_char(abs(round(coalesce(p_amount, 0), 2)), 'FM999999999990.00')
+$$;
+revoke all on function receipt_dollars(numeric) from public, anon, authenticated;
+
+-- A discount as entered (above 1 = dollars, else a fraction): "$3.00 off each",
+-- "12.5% off" (web describeDiscount).
+create or replace function receipt_discount_words(p_discount numeric, p_scope text default 'each')
+returns text
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select case when p_discount > 1 then receipt_dollars(p_discount) || ' off ' || p_scope
+              else trim(trailing '.' from trim(trailing '0' from to_char(round(p_discount * 100, 2), 'FM999990.00')))
+                   || '% off' end
+$$;
+revoke all on function receipt_discount_words(numeric, text) from public, anon, authenticated;
+
+-- A gift card code with all but its last 4 characters hidden.
+create or replace function mask_gift_card_code(p_code text)
+returns text
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select case when char_length(p_code) > 4 then '••••' else '' end || right(p_code, 4)
+$$;
+revoke all on function mask_gift_card_code(text) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 1. The email, built from the sale
+-- -----------------------------------------------------------------------------
+create or replace function receipt_email_content(p_sale_id uuid, p_time_zone text default 'UTC')
+returns jsonb
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_sale        sales%rowtype;
+  v_settings    settings%rowtype;
+  v_zone        text := 'UTC';
+  v_number      text := upper(left(replace(p_sale_id::text, '-', ''), 8));
+  v_customer    text;
+  v_served_by   text;
+  v_address     text[];
+  v_head        text[];
+  v_line        record;
+  v_label       text;
+  v_note        text;
+  v_parts       text[];
+  v_line_html   text := '';
+  v_line_text   text[] := '{}';
+  v_saved       numeric := 0;
+  v_ticket_note text;
+  v_totals      text[][] := '{}';  -- {label, value, strong}
+  v_payment     record;
+  v_refunded    numeric;
+  v_cards       text[][] := '{}';  -- {label, balance}
+  v_totals_html text := '';
+  v_cards_html  text := '';
+  v_text        text[] := '{}';
+  v_html        text;
+  i             integer;
+begin
+  select * into v_sale from sales where id = p_sale_id;
+  if not found then
+    raise exception 'Unknown sale %', p_sale_id;
+  end if;
+  select * into v_settings from settings where id;
+  if exists (select 1 from pg_timezone_names where name = p_time_zone) then
+    v_zone := p_time_zone;
+  end if;
+
+  select nullif(btrim(c.first_name || ' ' || coalesce(c.last_name, '')), '') into v_customer
+    from customers c where c.id = v_sale.customer_id;
+  select nullif(split_part(btrim(p.email), '@', 1), '') into v_served_by
+    from profiles p where p.id = v_sale.user_id;
+  select coalesce(array_agg(btrim(l) order by n), '{}') into v_address
+    from unnest(string_to_array(coalesce(v_settings.shop_address, ''), E'\n')) with ordinality as a(l, n)
+   where btrim(l) <> '';
+  v_head := array['Receipt ' || v_number,
+                  to_char(v_sale.sold_at at time zone v_zone, 'Mon FMDD, YYYY, FMHH12:MI AM')]
+            || case when v_served_by is not null then array['Served by ' || v_served_by] else '{}'::text[] end
+            || case when v_customer is not null then array['Customer: ' || v_customer] else '{}'::text[] end;
+
+  -- Lines, in the order they were rung up.
+  for v_line in
+    select sl.*, gc.code as card_code, p.brand, p.name as product_name, p.attributes
+      from sale_lines sl
+      left join gift_cards gc on gc.id = sl.gift_card_id
+      left join products p on p.id = sl.product_id
+     where sl.sale_id = p_sale_id
+     order by sl.created_at, sl.ctid
+  loop
+    v_label := case
+      when v_line.card_code is not null then 'Gift card ' || mask_gift_card_code(v_line.card_code)
+      when v_line.product_name is not null then
+        array_to_string(array_remove(array[nullif(v_line.brand, ''), v_line.product_name]
+          || coalesce((select array_agg(value) from jsonb_each_text(coalesce(v_line.attributes, '{}'::jsonb))
+                        where value is not null and value <> ''), '{}'), null), ' ')
+      when v_line.kind = 'string_change' then 'String change'
+      else 'Stringing' end;
+
+    v_note := null;
+    if v_line.price_before_discount is not null
+       and round(v_line.price_before_discount, 2) <> round(v_line.unit_price, 2) then
+      v_parts := '{}';
+      if coalesce(v_line.line_discount, 0) <> 0 then
+        v_parts := v_parts || array_to_string(array_remove(array[receipt_discount_words(v_line.line_discount),
+                                                                  nullif(v_line.discount_reason, '')], null), ' · ');
+      end if;
+      if round(coalesce(v_line.ticket_discount_each, 0), 2) > 0 then
+        v_parts := v_parts || 'ticket discount'::text;
+      end if;
+      v_note := receipt_dollars(v_line.price_before_discount) || ' → ' || receipt_dollars(v_line.unit_price)
+                || coalesce(' · ' || nullif(array_to_string(v_parts, ' + '), ''), '');
+      v_saved := v_saved + v_line.qty * (round(v_line.price_before_discount, 2) - round(v_line.unit_price, 2));
+    end if;
+
+    v_line_html := v_line_html || format(
+      E'<tr style="vertical-align:top;border-bottom:1px solid #cbd5e1;">\n'
+      || E'<td style="padding:4px 0;">%s%s</td>\n'
+      || E'<td style="padding:4px 0;text-align:right;white-space:nowrap;">%s</td>\n'
+      || E'<td style="padding:4px 0;text-align:right;white-space:nowrap;">%s</td>\n'
+      || E'<td style="padding:4px 0;text-align:right;white-space:nowrap;">%s</td></tr>\n',
+      html_escape(v_label),
+      coalesce('<div style="font-size:12px;color:#475569;">' || html_escape(v_note) || '</div>', ''),
+      v_line.qty, receipt_dollars(v_line.unit_price), receipt_dollars(v_line.qty * round(v_line.unit_price, 2)));
+    v_line_text := v_line_text || v_label
+      || (rpad('  ' || v_line.qty || ' × ' || receipt_dollars(v_line.unit_price),
+               greatest(char_length('  ' || v_line.qty || ' × ' || receipt_dollars(v_line.unit_price)) + 1,
+                        44 - char_length(receipt_dollars(v_line.qty * round(v_line.unit_price, 2)))))
+          || receipt_dollars(v_line.qty * round(v_line.unit_price, 2)))
+      || case when v_note is not null then array['  ' || v_note] else '{}'::text[] end;
+  end loop;
+
+  -- Totals, as the printed receipt shows them.
+  if coalesce(v_sale.ticket_discount, 0) <> 0 then
+    v_ticket_note := array_to_string(array_remove(array[receipt_discount_words(v_sale.ticket_discount, 'the ticket'),
+                                                        nullif(v_sale.ticket_discount_reason, '')], null), ' · ');
+  end if;
+  if v_saved > 0 then
+    v_totals := v_totals || array[[coalesce('You saved (incl. ' || v_ticket_note || ')', 'You saved'),
+                                   receipt_dollars(v_saved), '']];
+  end if;
+  v_totals := v_totals
+    || array[['Subtotal', receipt_dollars(v_sale.subtotal), '']]
+    || array[[case when v_sale.tax_exempt_id is not null then 'Tax exempt · ' || v_sale.tax_exempt_id
+                   else 'Tax (' || trim(trailing '.' from trim(trailing '0' from to_char(coalesce(v_sale.tax_rate, 0), 'FM999990.0000'))) || '%)' end,
+              receipt_dollars(v_sale.tax), '']]
+    || array[['Total', receipt_dollars(round(v_sale.subtotal, 2) + round(v_sale.tax, 2)), 'strong']];
+  for v_payment in
+    select sp.method, sp.amount, sp.check_number, b.code as card_code
+      from sale_payments sp
+      left join gift_card_balance b on b.gift_card_id = sp.gift_card_id
+     where sp.sale_id = p_sale_id
+     order by sp.created_at, sp.ctid
+  loop
+    v_totals := v_totals || array[[
+      case when v_payment.card_code is not null then 'Gift card ' || mask_gift_card_code(v_payment.card_code)
+           when v_payment.method = 'exchange' then 'Exchange credit'
+           when v_payment.method = 'check' and v_payment.check_number is not null then 'Check #' || v_payment.check_number
+           else coalesce((jsonb_build_object('cash', 'Cash', 'credit', 'Credit', 'gift_card', 'Gift Card',
+                                             'store_credit', 'Store Credit', 'check', 'Check') ->> v_payment.method),
+                         v_payment.method) end,
+      receipt_dollars(v_payment.amount), '']];
+  end loop;
+  select sum(round(subtotal, 2) + round(tax, 2)) into v_refunded from refunds where sale_id = p_sale_id;
+  if coalesce(v_refunded, 0) > 0 then
+    v_totals := v_totals || array[['Refunded since', '−' || receipt_dollars(v_refunded), '']];
+  end if;
+
+  -- Each gift card the sale loaded or paid with, once, and what's left on it.
+  select coalesce(array_agg(array['Gift card ' || mask_gift_card_code(b.code) || ' balance', receipt_dollars(b.balance)]
+                            order by u.first_seen), '{}')
+    into v_cards
+    from (select gift_card_id, min(seen) as first_seen
+            from (select sl.gift_card_id, row_number() over (order by sl.created_at, sl.ctid) as seen
+                    from sale_lines sl where sl.sale_id = p_sale_id and sl.gift_card_id is not null
+                  union all
+                  select sp.gift_card_id, 100000 + row_number() over (order by sp.created_at, sp.ctid)
+                    from sale_payments sp where sp.sale_id = p_sale_id and sp.gift_card_id is not null) t
+           group by gift_card_id) u
+    join gift_card_balance b on b.gift_card_id = u.gift_card_id;
+
+  for i in 1 .. coalesce(array_length(v_totals, 1), 0) loop
+    v_totals_html := v_totals_html || format(
+      E'<tr%s><td style="padding:2px 16px 2px 0;">%s</td><td style="padding:2px 0;text-align:right;white-space:nowrap;">%s</td></tr>\n',
+      case when v_totals[i][3] = 'strong' then ' style="font-weight:bold;"' else '' end,
+      html_escape(v_totals[i][1]), html_escape(v_totals[i][2]));
+  end loop;
+  for i in 1 .. coalesce(array_length(v_cards, 1), 0) loop
+    v_cards_html := v_cards_html || format(
+      E'<tr><td style="padding:2px 16px 2px 0;">%s</td><td style="text-align:right;white-space:nowrap;">%s</td></tr>\n',
+      html_escape(v_cards[i][1]), html_escape(v_cards[i][2]));
+  end loop;
+
+  v_html := format(
+    E'<!doctype html>\n'
+    || E'<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Receipt %s</title></head>\n'
+    || E'<body style="margin:0;padding:16px;background:#ffffff;color:#000000;font-family:Helvetica,Arial,sans-serif;font-size:14px;">\n'
+    || E'<div style="max-width:640px;margin:0 auto;">\n'
+    || E'<table role="presentation" style="width:100%%;border-collapse:collapse;margin-bottom:20px;"><tr>\n'
+    || E'<td style="vertical-align:top;">%s%s</td>\n'
+    || E'<td style="vertical-align:top;text-align:right;">%s</td>\n'
+    || E'</tr></table>\n'
+    || E'<table style="width:100%%;border-collapse:collapse;">\n'
+    || E'<thead><tr style="border-bottom:1px solid #000;text-align:left;">\n'
+    || '<th style="padding:4px 0;">Item</th><th style="padding:4px 0;text-align:right;white-space:nowrap;">Qty</th>'
+    || '<th style="padding:4px 0;text-align:right;white-space:nowrap;">Each</th>'
+    || E'<th style="padding:4px 0;text-align:right;white-space:nowrap;">Total</th>\n'
+    || E'</tr></thead>\n<tbody>\n%s</tbody></table>\n'
+    || E'<table role="presentation" style="margin:16px 0 0 auto;border-collapse:collapse;">\n%s</table>\n'
+    || E'%s%s</div>\n</body></html>',
+    v_number,
+    coalesce('<h1 style="font-size:22px;margin:0 0 4px;">' || html_escape(nullif(btrim(v_settings.shop_name), '')) || '</h1>', ''),
+    (select coalesce(string_agg('<div>' || html_escape(l) || '</div>', '' order by n), '')
+       from unnest(v_address) with ordinality as a(l, n)),
+    (select string_agg('<div>' || html_escape(l) || '</div>', '' order by n)
+       from unnest(v_head) with ordinality as a(l, n)),
+    v_line_html,
+    v_totals_html,
+    case when v_cards_html <> '' then
+      E'<table role="presentation" style="margin:12px 0 0 auto;border-collapse:collapse;">\n' || v_cards_html || E'</table>\n'
+    else '' end,
+    case when v_settings.return_policy is not null or v_settings.receipt_footer is not null then
+      E'<div style="border-top:1px solid #000;margin-top:20px;padding-top:12px;">\n'
+      || coalesce('<p style="white-space:pre-line;margin:0 0 8px;">' || html_escape(v_settings.return_policy) || E'</p>\n', '')
+      || coalesce('<p style="font-weight:bold;margin:0;">' || html_escape(v_settings.receipt_footer) || E'</p>\n', '')
+      || E'</div>\n'
+    else '' end);
+
+  -- The plain-text copy: label and amount on one 44-character line.
+  if nullif(btrim(v_settings.shop_name), '') is not null then
+    v_text := v_text || btrim(v_settings.shop_name);
+  end if;
+  v_text := v_text || v_address || ''::text || v_head || ''::text || v_line_text || ''::text;
+  for i in 1 .. coalesce(array_length(v_totals, 1), 0) loop
+    v_text := v_text || (rpad(v_totals[i][1], greatest(char_length(v_totals[i][1]) + 1, 44 - char_length(v_totals[i][2])))
+                         || v_totals[i][2]);
+  end loop;
+  if coalesce(array_length(v_cards, 1), 0) > 0 then
+    v_text := v_text || ''::text;
+    for i in 1 .. array_length(v_cards, 1) loop
+      v_text := v_text || (rpad(v_cards[i][1], greatest(char_length(v_cards[i][1]) + 1, 44 - char_length(v_cards[i][2])))
+                           || v_cards[i][2]);
+    end loop;
+  end if;
+  if v_settings.return_policy is not null then
+    v_text := v_text || ''::text || v_settings.return_policy;
+  end if;
+  if v_settings.receipt_footer is not null then
+    v_text := v_text || ''::text || v_settings.receipt_footer;
+  end if;
+
+  return jsonb_build_object('text', array_to_string(v_text, E'\n'), 'html', v_html);
+end;
+$$;
+revoke all on function receipt_email_content(uuid, text) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2–3. Queueing: only the sale and the address come from the browser
+-- -----------------------------------------------------------------------------
+drop function if exists queue_receipt_email(uuid, text, text, text);
+create or replace function queue_receipt_email(p_sale_id uuid, p_to text, p_time_zone text default null)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_to       text := btrim(coalesce(p_to, ''));
+  v_customer uuid;
+  v_shop     text;
+  v_recent   integer;
+  v_content  jsonb;
+  v_id       uuid;
+begin
+  perform require_staff();
+  if not is_valid_email(v_to) then
+    raise exception 'Enter a valid email address for the receipt';
+  end if;
+  select customer_id into v_customer from sales where id = p_sale_id for update;
+  if not found then
+    raise exception 'Unknown sale %', p_sale_id;
+  end if;
+
+  select count(*) into v_recent
+    from notifications
+   where sale_id = p_sale_id and kind = 'receipt' and created_at > now() - interval '1 hour';
+  if v_recent >= 5 then
+    raise exception 'This receipt was already emailed 5 times in the last hour; try again later';
+  end if;
+  -- The whole shop's hourly cap, counted with the settings row locked so two
+  -- sales at once can't both take the last one.
+  select coalesce(nullif(btrim(shop_name), ''), 'us') into v_shop from settings where id for update;
+  select count(*) into v_recent
+    from notifications
+   where kind = 'receipt' and created_at > now() - interval '1 hour';
+  if v_recent >= 30 then
+    raise exception 'The shop has emailed 30 receipts in the last hour; try again later';
+  end if;
+
+  v_content := receipt_email_content(p_sale_id, coalesce(p_time_zone, 'UTC'));
+  insert into notifications (kind, channel, customer_id, sale_id, to_address, subject, body, html)
+  values ('receipt', 'email', v_customer, p_sale_id, v_to,
+          format('Your receipt from %s (%s)', coalesce(v_shop, 'us'),
+                 upper(left(replace(p_sale_id::text, '-', ''), 8))),
+          v_content ->> 'text', v_content ->> 'html')
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function queue_receipt_email(uuid, text, text) from public, anon;
+grant execute on function queue_receipt_email(uuid, text, text) to authenticated;
+
+-- >>> supabase/migrations/0091_new_job_locks_racquet_first.sql
+-- =============================================================================
+-- 0091_new_job_locks_racquet_first.sql — a new job reads its racquet's owner
+-- with the racquet locked (AceStock, Phase 3E review #4; second review #7)
+--
+-- Before (0080, 0084):
+--   A new string job's triggers run in name order. guard_active_customer
+--   (trg_guard_active_customer) read the racquet's owner without a lock, and
+--   only then did guard_string_job_racket (trg_guard_string_job_racket, 0042)
+--   lock the racquet. If the racquet was being moved to an inactive customer
+--   at that moment, the check saw the old, active owner, then waited for the
+--   move, and the job was entered under the inactive customer. Race 19 only
+--   tried the other order (the job first), which was already safe.
+--
+-- Now: guard_active_customer locks the racquet (for update, the same lock the
+-- racquet guard takes next, so two new jobs queue rather than deadlock)
+-- before reading its owner. A move that started first is waited for, and the
+-- new owner is the one checked. Race 21 starts the move first.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function guard_active_customer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_customer uuid;
+  v_use      text;
+  v_name     text;
+  v_active   boolean;
+begin
+  case tg_table_name
+    when 'sales' then
+      v_customer := new.customer_id;
+      v_use := 'be put on a sale';
+    when 'demo_loans' then
+      v_customer := new.customer_id;
+      v_use := 'borrow a demo';
+    when 'store_credit_txns' then
+      v_customer := new.customer_id;
+      v_use := 'use store credit';
+    when 'string_jobs' then
+      -- The racquet is locked first, so a move to another customer that is
+      -- under way finishes before its owner is read (0091).
+      select customer_id into v_customer from customer_rackets where id = new.customer_racket_id for update;
+      v_use := 'have a new string job';
+  end case;
+  -- A share lock waits for set_customer_active (which locks the customer for
+  -- update) and then reads what it saved; it also makes a deactivation that
+  -- starts now wait for this row, so its open-job and demo checks see it.
+  select is_active, first_name || ' ' || last_name into v_active, v_name
+    from customers where id = v_customer
+    for share;
+  if found and not v_active then
+    raise exception '% is inactive, so they can''t %: make them active again first', v_name, v_use;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_active_customer() from public, anon, authenticated;
+
+-- >>> supabase/migrations/0092_exchange_split_payment_type.sql
+-- =============================================================================
+-- 0092_exchange_split_payment_type.sql — an exchange whose credit came from
+-- more than one payment type is a split sale (AceStock, Phase 3E review #17)
+--
+-- Before (0082): record_exchange replaced the new sale's one 'exchange'
+-- payment with one per payment type the credit came from (cash, card, ...),
+-- but left the sale's payment type as record_sale had set it for one
+-- payment: 'exchange'. A sale with two payments read as paid one way.
+--
+-- Now: record_exchange (otherwise the same as 0082) works the payment type out
+-- again after that split, as record_sale does: one payment, its type; more
+-- than one, 'split'. Sales already saved that way are corrected.
+--
+-- Re-runnable.
+-- =============================================================================
+
+create or replace function record_exchange(
+  p_sale_id              uuid,
+  p_return_lines         jsonb,
+  p_new_lines            jsonb,
+  p_customer_id          uuid,
+  p_payments             jsonb,
+  p_refund_payments      jsonb,
+  p_reason               text,
+  p_ticket               jsonb default null,
+  p_approval_id          uuid default null,
+  p_method_change_reason text default null,
+  p_refund_approval_id   uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_exchange_id uuid := gen_random_uuid();
+  v_refund_id   uuid;
+  v_sale_id     uuid;
+  v_credit      numeric;
+begin
+  perform require_staff();
+
+  -- The return's credit buys goods, not gift card value: a load would turn a
+  -- card or cash purchase into gift card money without the reason a refund
+  -- onto a gift card needs (0081).
+  if jsonb_typeof(p_new_lines) = 'array' and exists (
+       select 1 from jsonb_array_elements(p_new_lines) l where nullif(l->>'gift_card_id', '') is not null) then
+    raise exception 'An exchange can''t load a gift card: refund the items onto the card instead';
+  end if;
+
+  -- record_refund and record_sale read these transaction-local settings.
+  -- Only this function sets them: the API can't call set_config (pg_catalog
+  -- isn't exposed), and nothing else sets acestock.exchange_*.
+  perform set_config('acestock.exchange_id', v_exchange_id::text, true);
+  v_refund_id := record_refund(p_sale_id, p_return_lines, coalesce(p_refund_payments, '[]'::jsonb),
+                               coalesce(nullif(btrim(p_reason), ''), 'Exchange'), null,
+                               p_method_change_reason, p_refund_approval_id);
+  perform set_config('acestock.exchange_id', '', true);
+
+  select coalesce(sum(amount), 0) into v_credit
+    from refund_payments where refund_id = v_refund_id and method = 'exchange';
+
+  perform set_config('acestock.exchange_credit', v_credit::text, true);
+  v_sale_id := record_sale(p_new_lines, p_customer_id, coalesce(p_payments, '[]'::jsonb), 'Exchange',
+                           p_ticket, p_approval_id);
+  perform set_config('acestock.exchange_credit', '', true);
+
+  -- The credit arrives as one 'exchange' payment (record_sale); it's
+  -- replaced by the refund's split, so each part keeps the payment type it
+  -- came from (0082).
+  delete from sale_payments where sale_id = v_sale_id and method = 'exchange';
+  insert into sale_payments (sale_id, method, amount, source_method, source_gift_card_id)
+  select v_sale_id, 'exchange', rp.amount, rp.source_method, rp.source_gift_card_id
+    from refund_payments rp
+   where rp.refund_id = v_refund_id and rp.method = 'exchange';
+
+  -- With the credit split by where it came from, the payment type is worked
+  -- out again as record_sale does: one payment, its type; more, 'split' (0092).
+  update sales
+     set payment_method = (select case count(*) when 0 then null
+                                                 when 1 then min(method)
+                                                 else 'split' end
+                             from sale_payments where sale_id = v_sale_id)
+   where id = v_sale_id;
+
+  insert into exchanges (id, refund_id, sale_id, credit) values (v_exchange_id, v_refund_id, v_sale_id, v_credit);
+
+  return jsonb_build_object('exchange_id', v_exchange_id, 'refund_id', v_refund_id, 'sale_id', v_sale_id,
+                            'credit', v_credit);
+end;
+$$;
+
+revoke all on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) from public, anon;
+grant execute on function record_exchange(uuid, jsonb, jsonb, uuid, jsonb, jsonb, text, jsonb, uuid, text, uuid) to authenticated;
+
+-- Exchanges already saved with more than one payment.
+update sales s
+   set payment_method = 'split'
+ where s.payment_method = 'exchange'
+   and (select count(*) from sale_payments sp where sp.sale_id = s.id) > 1;
+
 commit;
