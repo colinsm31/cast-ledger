@@ -32,8 +32,9 @@ returns uuid language sql as $$
           case when p_channel = 'email' then 'Ready' end, 'Your racquet is ready')
   returning id
 $$;
+-- How many the sender takes to send (skips and give-ups come back finished, 0106).
 create function pg_temp.claim(p_id uuid) returns integer language sql as $$
-  select count(*)::int from claim_notifications(p_id => p_id)
+  select count(*)::int from claim_notifications(p_id => p_id) where status = 'sending'
 $$;
 create function pg_temp.outcome(p_id uuid) returns text language sql as $$
   select status || ': ' || coalesce(error, '') from notifications where id = p_id

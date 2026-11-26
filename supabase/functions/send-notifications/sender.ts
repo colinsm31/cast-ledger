@@ -13,6 +13,12 @@ export interface ClaimedMessage {
   attempts: number;
   /** Raised only by Send again on a finished message (0088). */
   resend_count: number;
+  /**
+   * 'sending' for a message to send. A message the claim skipped or gave up on
+   * comes back 'skipped' or 'failed' with its reason (0106): reported, not sent.
+   */
+  status?: 'sending' | 'skipped' | 'failed';
+  error?: string | null;
 }
 
 export type Outcome = 'sent' | 'failed' | 'skipped';
@@ -35,7 +41,8 @@ export interface SendFilter {
 
 export interface SenderDeps {
   claim(filter: SendFilter): Promise<ClaimedMessage[]>;
-  finish(id: string, status: Outcome, providerId: string | null, error: string | null): Promise<void>;
+  /** `attempt` is the try this answers for, so a late answer from an earlier try is ignored (0106). */
+  finish(id: string, status: Outcome, providerId: string | null, error: string | null, attempt: number): Promise<void>;
   /** Missing when email isn't set up (test mode): nothing leaves, the log says so. */
   sendEmail?: EmailSender;
 }
@@ -72,6 +79,11 @@ export async function sendQueued(
   const messages = await deps.claim(filter);
   const results: SendResult[] = [];
   for (const message of messages) {
+    if (message.status === 'skipped' || message.status === 'failed') {
+      // Already finished by the claim: tell staff why, send nothing.
+      results.push({ id: message.id, status: message.status, ...(message.error ? { error: message.error } : {}) });
+      continue;
+    }
     let result: SendResult;
     let providerId: string | null = null;
     if (message.channel === 'sms') {
@@ -86,7 +98,7 @@ export async function sendQueued(
         result = { id: message.id, status: 'failed', error: err instanceof Error ? err.message : String(err) };
       }
     }
-    await deps.finish(message.id, result.status, providerId, result.error ?? null);
+    await deps.finish(message.id, result.status, providerId, result.error ?? null, message.attempts);
     results.push(result);
   }
   return results;

@@ -92,7 +92,7 @@ Deno.test('Send again claims just its message; test mode records it as not sent'
   assertEquals(calls.slice(1), [
     { client: 'service(service)', fn: 'claim_notifications', args: { p_string_job_id: null, p_sale_id: null, p_id: JOB } },
     { client: 'service(service)', fn: 'finish_notification',
-      args: { p_id: 'n1', p_status: 'skipped', p_provider_id: null, p_error: TEST_MODE_MESSAGE } },
+      args: { p_id: 'n1', p_status: 'skipped', p_provider_id: null, p_error: TEST_MODE_MESSAGE, p_attempt: 1 } },
   ]);
 });
 

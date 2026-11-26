@@ -79,12 +79,13 @@ export function createHandler(deps: HandlerDeps): (req: Request) => Promise<Resp
           }
           return (data ?? []) as ClaimedMessage[];
         },
-        finish: async (id, status, providerId, error) => {
+        finish: async (id, status, providerId, error, attempt) => {
           const { error: finishError } = await serviceClient.rpc('finish_notification', {
             p_id: id,
             p_status: status,
             p_provider_id: providerId,
             p_error: error,
+            p_attempt: attempt,
           });
           // The message stays "sending" and is taken again after 10 minutes,
           // with the same key, so it isn't delivered twice.
