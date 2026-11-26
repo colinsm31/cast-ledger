@@ -124,3 +124,42 @@ Deno.test('a body that isn\'t JSON sends the oldest waiting', async () => {
   assertEquals(response.status, 200);
   assertEquals(calls[1].args, { p_string_job_id: null, p_sale_id: null, p_id: null });
 });
+
+Deno.test('the database\'s schedule sends the oldest waiting, with its secret (0107)', async () => {
+  const { handle, calls } = setup({
+    service: (fn, args) =>
+      fn === 'notification_sweep_allowed' ? { data: args?.p_secret === 'right', error: null } : { data: [], error: null },
+  });
+  const response = await handle(
+    new Request('http://fn.test/send-notifications', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer anon', 'x-acestock-sweep': 'right' },
+      body: JSON.stringify({ sweep: true }),
+    }),
+  );
+  assertEquals(response.status, 200);
+  assertEquals(calls, [
+    { client: 'service(service)', fn: 'notification_sweep_allowed', args: { p_secret: 'right' } },
+    { client: 'service(service)', fn: 'claim_notifications', args: { p_string_job_id: null, p_sale_id: null, p_id: null } },
+  ]);
+});
+
+Deno.test('a sweep with the wrong secret is refused (0107)', async () => {
+  const { handle, calls, logged } = setup({
+    service: (fn) =>
+      fn === 'notification_sweep_allowed' ? { data: false, error: null } : { data: [], error: null },
+  });
+  const response = await handle(
+    new Request('http://fn.test/send-notifications', { method: 'POST', headers: { 'x-acestock-sweep': 'guess' } }),
+  );
+  assertEquals([response.status, await response.json()], [403, { error: 'Not a message sweep from this database' }]);
+  assertEquals(calls.length, 1);
+  assertEquals(logged, []);
+
+  const broken = setup({ service: () => ({ data: null, error: { message: 'vault unavailable' } }) });
+  const failed = await broken.handle(
+    new Request('http://fn.test/send-notifications', { method: 'POST', headers: { 'x-acestock-sweep': 'x' } }),
+  );
+  assertEquals(failed.status, 403);
+  assertEquals(broken.logged, ['notification_sweep_allowed: vault unavailable']);
+});

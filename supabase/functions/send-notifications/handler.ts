@@ -1,7 +1,7 @@
 // The request handling for send-notifications, with the Supabase client passed
 // in, so handler_test.ts can run every path (refusals and failures included)
 // with fakes. index.ts wires it to the real client and Deno.serve.
-import { parseRequest, resendEmailSender, sendQueued, summarize, type ClaimedMessage } from './sender.ts';
+import { parseRequest, resendEmailSender, sendQueued, summarize, type ClaimedMessage, type SendFilter } from './sender.ts';
 
 /** The one thing the handler needs from a Supabase client. */
 export interface RpcClient {
@@ -47,19 +47,32 @@ export function createHandler(deps: HandlerDeps): (req: Request) => Promise<Resp
       return json({ error: 'Server is missing its Supabase configuration' }, 500);
     }
 
-    // 1. Staff only — checked with the caller's own session.
-    const callerClient = deps.makeClient(supabaseUrl, anonKey, req.headers.get('Authorization') ?? '');
-    const { data: isStaff, error: staffError } = await callerClient.rpc('is_staff');
-    if (staffError) logError(`is_staff: ${staffError.message}`);
-    if (staffError || isStaff !== true) {
-      return json({ error: 'Only staff can send customer messages' }, 403);
+    const serviceClient = deps.makeClient(supabaseUrl, serviceRoleKey);
+    let filter: SendFilter;
+    const sweepSecret = req.headers.get('x-acestock-sweep');
+    if (sweepSecret) {
+      // 1a. The database's schedule (0107): its secret, checked with the
+      // service role, sends whatever has been waiting longest.
+      const { data: allowed, error: sweepError } = await serviceClient.rpc('notification_sweep_allowed', {
+        p_secret: sweepSecret,
+      });
+      if (sweepError) logError(`notification_sweep_allowed: ${sweepError.message}`);
+      if (sweepError || allowed !== true) return json({ error: 'Not a message sweep from this database' }, 403);
+      filter = { stringJobId: null, saleId: null, notificationId: null };
+    } else {
+      // 1b. Staff only — checked with the caller's own session.
+      const callerClient = deps.makeClient(supabaseUrl, anonKey, req.headers.get('Authorization') ?? '');
+      const { data: isStaff, error: staffError } = await callerClient.rpc('is_staff');
+      if (staffError) logError(`is_staff: ${staffError.message}`);
+      if (staffError || isStaff !== true) {
+        return json({ error: 'Only staff can send customer messages' }, 403);
+      }
+      const parsed = parseRequest(await req.json().catch(() => ({})));
+      if ('error' in parsed) return json({ error: parsed.error }, 400);
+      filter = parsed;
     }
 
-    const filter = parseRequest(await req.json().catch(() => ({})));
-    if ('error' in filter) return json({ error: filter.error }, 400);
-
     // 2–3. Claim and send with the service role.
-    const serviceClient = deps.makeClient(supabaseUrl, serviceRoleKey);
     const apiKey = deps.env('RESEND_API_KEY');
     const from = deps.env('NOTIFY_FROM_EMAIL');
     const replyTo = deps.env('NOTIFY_REPLY_TO') || undefined;
