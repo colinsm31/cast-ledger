@@ -25,7 +25,7 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 -- 10 Nov: the cash sale.
 select is(report_day('2026-11-10') -> 'sales',
-          '{"count": 1, "items": 50.00, "gift_cards": 0, "tax": 4.13}'::jsonb,
+          '{"count": 1, "items": 50.00, "gift_cards": 0, "tax": 4.13, "total": 54.13}'::jsonb,
           'sales: count, items, gift cards and tax');
 select is(report_day('2026-11-10') -> 'payments',
           '[{"method": "cash", "label": "Cash", "taken": 54.13, "given_back": 0, "net": 54.13}]'::jsonb,
@@ -41,7 +41,7 @@ select is((report_day('2026-11-10') -> 'drawers' -> 0) - 'opened_at' - 'closed_a
 
 -- 11 Nov: card for stringing and a gift card; a drawer still open.
 select is(report_day('2026-11-11') -> 'sales',
-          '{"count": 1, "items": 30.00, "gift_cards": 25.00, "tax": 0}'::jsonb,
+          '{"count": 1, "items": 30.00, "gift_cards": 25.00, "tax": 0, "total": 55.00}'::jsonb,
           'gift cards sold are apart from items');
 select is(report_day('2026-11-11') -> 'categories' -> 0 ->> 'name', 'Stringing', 'stringing is its own line');
 select is((report_day('2026-11-11') -> 'drawers' -> 0) - 'opened_at' - 'closed_at',
@@ -51,7 +51,7 @@ select is((report_day('2026-11-11') -> 'drawers' -> 0) - 'opened_at' - 'closed_a
 
 -- 12 Nov: the cash refund.
 select is(report_day('2026-11-12') -> 'refunds',
-          '{"count": 1, "items": 20.00, "gift_cards": 0, "tax": 1.65}'::jsonb,
+          '{"count": 1, "items": 20.00, "gift_cards": 0, "tax": 1.65, "total": 21.65}'::jsonb,
           'refunds: count, items and tax given back');
 select is(report_day('2026-11-12') -> 'payments' -> 0,
           '{"method": "cash", "label": "Cash", "taken": 0, "given_back": 21.65, "net": -21.65}'::jsonb,
