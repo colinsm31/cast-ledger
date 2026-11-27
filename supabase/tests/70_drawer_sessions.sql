@@ -9,7 +9,10 @@ select throws_ok($$ update settings set time_zone = 'Mars/Olympus' where id $$, 
                  'Unknown time zone: Mars/Olympus', 'an unknown time zone is refused');
 select lives_ok($$ update settings set time_zone = 'America/Chicago' where id $$, 'a real time zone is saved');
 select is(shop_day('2026-11-13 03:00Z'), '2026-11-12'::date, 'business days follow the shop''s time zone');
+-- Clearing the time zone is refused (0115); the trigger is set aside to test no time zone.
+alter table settings disable trigger trg_settings_time_zone;
 update settings set time_zone = null where id;
+alter table settings enable trigger trg_settings_time_zone;
 select throws_ok($$ select shop_day(now()) $$, '22023',
                  'An admin needs to set the shop''s time zone in Settings first',
                  'with no time zone set, there is no business day');

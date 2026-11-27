@@ -61,7 +61,10 @@ select is(report_day('2026-11-12') -> 'exchanges', '{"count": 0, "credit": 0}'::
 -- Checks ------------------------------------------------------------------------
 select throws_ok($$ select report_day(null) $$, '22023', 'Choose a day', 'a day is needed');
 select tests.clear_authentication();
+-- Clearing the time zone is refused (0115); the trigger is set aside to test no time zone.
+alter table settings disable trigger trg_settings_time_zone;
 update settings set time_zone = null where id;
+alter table settings enable trigger trg_settings_time_zone;
 select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select throws_ok($$ select report_day('2026-11-10') $$, '22023',
                  'An admin needs to set the shop''s time zone in Settings first',

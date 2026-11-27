@@ -57,8 +57,12 @@ RACE_DIR=$(mktemp -d)
 
 cleanup() {
   psql_run <<SQL >/dev/null
+    -- Putting back an empty time zone is refused once one is set (0115), so the
+    -- check is set aside for this restore only.
+    alter table settings disable trigger trg_settings_time_zone;
     update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP},
                         cash_needs_drawer = ${ORIGINAL_CASH_NEEDS_DRAWER}, time_zone = ${ORIGINAL_TIME_ZONE} where id;
+    alter table settings enable trigger trg_settings_time_zone;
     set client_min_messages = warning;
     drop trigger if exists trg_concurrency_pause on refunds;
     drop function if exists concurrency_test_pause();
@@ -115,6 +119,9 @@ SPEND_TOTAL=$(psql_run -c "select round(20 * (1 + ${TAX_RATE} / 100.0), 2)")
 # a signed-in user are checked for availability).
 # The races take cash without a drawer; the drawer race turns the check back on.
 psql_run -c "update settings set cash_needs_drawer = false where id" >/dev/null
+# A close left by a run that was stopped partway (real closes always have a
+# staff member; this script's have none) would block today's races.
+psql_run -c "delete from day_closes where closed_by is null" >/dev/null
 psql_run <<SQL >/dev/null
   insert into categories (id, name) values ('${CATEGORY}', '${RUN_TAG}');
   insert into products (id, category_id, name, sell_price) values
