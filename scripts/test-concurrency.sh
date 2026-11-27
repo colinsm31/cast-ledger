@@ -21,7 +21,8 @@
 # a demo lent while its customer is being made inactive, a racquet moved
 # to another customer while a job is entered for it, two senders claiming
 # the same queued customer message (it must be sent once), and a racquet being
-# moved to an inactive customer when a job is entered for it.
+# moved to an inactive customer when a job is entered for it, and a cash sale
+# rung while its drawer is being closed (it's counted, or refused, never lost).
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -42,15 +43,19 @@ RACKET_5=$(new_id); RACKET_6=$(new_id); JOB_5=$(new_id); JOB_6=$(new_id); STRING
 RACKET_7=$(new_id); JOB_7=$(new_id); CUSTOMER_2=$(new_id); CUSTOMER_3=$(new_id); RACKET_8=$(new_id)
 CUSTOMER_4=$(new_id); RACKET_9=$(new_id)
 ADJUST_PRODUCT=$(new_id); UNIT_PRODUCT=$(new_id); RACQUET_CATEGORY=$(new_id); APPROVAL=$(new_id); HELD=$(new_id)
+DRAWER=$(new_id)
 RUN_TAG="concurrency-$(date +%s)"
 # "false" if the setting is somehow missing, so cleanup can always restore it.
 ORIGINAL_BLOCK_OVERSELL=$(psql_run -c "select coalesce((select block_oversell from settings where id), false)::text")
 ORIGINAL_DISCOUNT_CAP=$(psql_run -c "select coalesce((select staff_discount_cap from settings where id), 20)")
+ORIGINAL_CASH_NEEDS_DRAWER=$(psql_run -c "select coalesce((select cash_needs_drawer from settings where id), true)::text")
+ORIGINAL_TIME_ZONE=$(psql_run -c "select coalesce(quote_literal(time_zone), 'null') from settings where id")
 RACE_DIR=$(mktemp -d)
 
 cleanup() {
   psql_run <<SQL >/dev/null
-    update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP} where id;
+    update settings set block_oversell = ${ORIGINAL_BLOCK_OVERSELL}, staff_discount_cap = ${ORIGINAL_DISCOUNT_CAP},
+                        cash_needs_drawer = ${ORIGINAL_CASH_NEEDS_DRAWER}, time_zone = ${ORIGINAL_TIME_ZONE} where id;
     set client_min_messages = warning;
     drop trigger if exists trg_concurrency_pause on refunds;
     drop function if exists concurrency_test_pause();
@@ -78,6 +83,8 @@ cleanup() {
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}',
                                                              '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from sales           where id in (select id from run_sales);
+    delete from drawer_sessions where drawer_id = '${DRAWER}';
+    delete from drawers         where id = '${DRAWER}';
     delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
                                              '${RACKET_5}', '${RACKET_6}', '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from gift_cards      where id = '${GIFT_CARD}';
@@ -101,6 +108,8 @@ SPEND_TOTAL=$(psql_run -c "select round(20 * (1 + ${TAX_RATE} / 100.0), 2)")
 # unpaid $30 string job, a second job strung with the $20 product, a string
 # with exactly one unit, and a temporary staff account (string jobs entered by
 # a signed-in user are checked for availability).
+# The races take cash without a drawer; the drawer race turns the check back on.
+psql_run -c "update settings set cash_needs_drawer = false where id" >/dev/null
 psql_run <<SQL >/dev/null
   insert into categories (id, name) values ('${CATEGORY}', '${RUN_TAG}');
   insert into products (id, category_id, name, sell_price) values
@@ -456,6 +465,22 @@ check "a job entered while its racquet moves to an inactive customer" "$n" \
   "$(psql_run -c "select 'racquet with ' || case when r.customer_id = '${CUSTOMER_4}' then 'the inactive customer' else 'its owner' end ||
     ', ' || (select count(*) from string_jobs where customer_racket_id = '${RACKET_9}' and status = 'entered') || ' job(s) open'
     from customer_rackets r where r.id = '${RACKET_9}'")"
+
+# 22. A cash sale rung while its drawer is being closed (0109): the sale waits
+#     for the close and is refused (the drawer is no longer open), so the
+#     closing count's expected cash never misses a sale.
+psql_run <<SQL >/dev/null
+  update settings set cash_needs_drawer = true, time_zone = coalesce(time_zone, 'UTC') where id;
+  insert into drawers (id, name) values ('${DRAWER}', '${RUN_TAG}');
+  select open_drawer('${DRAWER}', '{"20": 5}');
+SQL
+DRAWER_HEADER="select set_config('request.headers', '{\"x-acestock-drawer\":\"${DRAWER}\"}', true)"
+n=$(race "select close_drawer((select id from drawer_sessions where drawer_id = '${DRAWER}'), '{\"20\": 5}')" \
+         "${DRAWER_HEADER}; select record_sale('[{\"product_id\":\"${PRODUCT}\",\"qty\":1,\"unit_price\":20}]'::jsonb, null,
+           '[{\"method\":\"cash\",\"amount\":${SPEND_TOTAL}}]'::jsonb, '${RUN_TAG}')")
+check "a cash sale rung while its drawer is closed" "$n" \
+  "$(psql_run -c "select 'expected ' || expected_cash || ', ' || (select count(*) from sales where drawer_session_id = ds.id) ||
+    ' sale(s) in the drawer' from drawer_sessions ds where drawer_id = '${DRAWER}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
