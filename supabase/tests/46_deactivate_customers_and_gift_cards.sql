@@ -67,8 +67,12 @@ select throws_like(
      values ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000b1',
              '00000000-0000-0000-0000-0000000000b1', 50, 50) $$,
   'Sam Gone is inactive, so they can''t have a new string job%', 'no new string job');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
 select throws_like($$ select add_store_credit('00000000-0000-0000-0000-0000000000c2', 5, 'Goodwill') $$,
-                   'Sam Gone is inactive, so they can''t use store credit%', 'no store credit added');
+                   'Sam Gone is inactive, so they can''t use store credit%', 'no store credit added, even by an admin');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select throws_like(
   $$ select record_refund((select sam from s),
        jsonb_build_array(jsonb_build_object('sale_line_id', (select id from sale_lines where sale_id = (select sam from s)), 'qty', 1)),

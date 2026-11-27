@@ -21686,4 +21686,2209 @@ $function$;
 revoke all on function set_gift_card_active(p_gift_card_id uuid, p_active boolean, p_reason text) from public, anon;
 grant execute on function set_gift_card_active(p_gift_card_id uuid, p_active boolean, p_reason text) to authenticated;
 
+-- >>> supabase/migrations/0094_sale_line_costs.sql
+-- =============================================================================
+-- 0094_sale_line_costs.sql — each sale line keeps its cost (AceStock, Phase 4A)
+--
+-- Before: a sale recorded what the customer paid, but not what the item cost
+-- the shop. The only cost was the product's current cost, which changes, so a
+-- margin report would rewrite past months every time a cost was edited.
+--
+-- Now:
+--   1. sale_lines.unit_cost — the product's cost when the line was sold. Set by
+--      the database as the line is saved (trigger below), whatever the caller
+--      sends, so record_sale and record_exchange don't change. Stringing
+--      charges and gift card loads have no cost (null). A product with no cost
+--      recorded gives null too: reports count it as "no cost", never as $0.
+--   2. sale_lines.unit_cost_estimated — true for lines sold before this
+--      migration, whose cost is filled in from the product's cost today
+--      (fill_estimated_sale_line_costs, run once below). Reports mark margins
+--      that use them as estimated.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. Columns ------------------------------------------------------------------
+alter table sale_lines add column if not exists unit_cost numeric(12, 2);
+alter table sale_lines add column if not exists unit_cost_estimated boolean not null default false;
+alter table sale_lines drop constraint if exists ck_sale_lines_unit_cost;
+alter table sale_lines add constraint ck_sale_lines_unit_cost
+  check (unit_cost >= 0 and unit_cost <> 'NaN');
+
+comment on column sale_lines.unit_cost is
+  'The product''s cost when the line was sold (null: not a product line, or no cost recorded). Set by trg_sale_lines_unit_cost (0094).';
+comment on column sale_lines.unit_cost_estimated is
+  'True when unit_cost was filled in later from the product''s cost at the time (lines sold before 0094).';
+
+-- 2. Keep the cost as each line is saved -------------------------------------
+create or replace function set_sale_line_unit_cost()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  new.unit_cost := case
+    when new.product_id is null then null
+    else (select p.cost from products p where p.id = new.product_id)
+  end;
+  new.unit_cost_estimated := false;
+  return new;
+end;
+$$;
+
+revoke all on function set_sale_line_unit_cost() from public, anon, authenticated;
+
+drop trigger if exists trg_sale_lines_unit_cost on sale_lines;
+create trigger trg_sale_lines_unit_cost
+  before insert on sale_lines
+  for each row execute function set_sale_line_unit_cost();
+
+-- 3. Lines sold before now: today's cost, marked estimated -------------------
+-- A function so the tests can run exactly what the migration runs. Internal:
+-- nobody signed in can call it.
+create or replace function fill_estimated_sale_line_costs()
+returns integer
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_count integer;
+begin
+  update sale_lines sl
+     set unit_cost = p.cost,
+         unit_cost_estimated = true
+    from products p
+   where p.id = sl.product_id
+     and sl.unit_cost is null
+     and not sl.unit_cost_estimated
+     and p.cost is not null;
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+revoke all on function fill_estimated_sale_line_costs() from public, anon, authenticated;
+
+select fill_estimated_sale_line_costs();
+
+-- >>> supabase/migrations/0095_report_sales_by.sql
+-- =============================================================================
+-- 0095_report_sales_by.sql — sales, best-sellers and margin reports (AceStock, Phase 4A)
+--
+-- Adds:
+--   1. require_admin() — refuses a signed-in account that isn't an admin, the
+--      way require_staff() refuses one without staff access. Reports show
+--      costs and margins, so only admins can run them.
+--   2. require_report_range(from, to) — a report's period must have a start
+--      before its end.
+--   3. report_sales_by(from, to, group) — what sold in [from, to), grouped by
+--      'category', 'brand', 'product' or 'staff':
+--        * sales: what customers paid before tax, after discounts, for items
+--          and stringing. Gift card loads aren't sales (they count when the
+--          card is spent), so they're left out, as in sales_summary.
+--        * returns: refunds made in the period, at the price refunded, counted
+--          against the line's original category, brand, product and the staff
+--          member who rang the sale.
+--        * cost and margin: from each line's recorded cost (0094). Lines with
+--          no cost are counted in uncosted_qty and left out of margin;
+--          cost_estimated says some cost came from the 0094 backfill.
+--      Stringing charges have no product: they're one "Stringing" row (no cost).
+--
+-- All three run with the caller's rights (row-level security applies).
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. require_admin ------------------------------------------------------------
+create or replace function require_admin()
+returns void
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+begin
+  if auth.uid() is not null and not is_admin() then
+    raise exception 'Only an admin can see reports'
+      using errcode = '42501';
+  end if;
+end;
+$$;
+
+revoke all on function require_admin() from public, anon;
+grant execute on function require_admin() to authenticated;
+
+-- 2. require_report_range -----------------------------------------------------
+create or replace function require_report_range(p_from timestamptz, p_to timestamptz)
+returns void
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+begin
+  if p_from is null or p_to is null or p_to <= p_from then
+    raise exception 'A report needs a start before its end'
+      using errcode = '22023';
+  end if;
+end;
+$$;
+
+revoke all on function require_report_range(timestamptz, timestamptz) from public, anon;
+grant execute on function require_report_range(timestamptz, timestamptz) to authenticated;
+
+-- 3. report_sales_by ----------------------------------------------------------
+drop function if exists report_sales_by(timestamptz, timestamptz, text);
+create or replace function report_sales_by(p_from timestamptz, p_to timestamptz, p_group text)
+returns table (
+  group_key      text,
+  label          text,
+  detail         text,
+  tickets        integer,
+  qty_sold       integer,
+  sales          numeric,
+  discounts      numeric,
+  qty_returned   integer,
+  returns        numeric,
+  net_qty        integer,
+  net_sales      numeric,
+  costed_sales   numeric,
+  cost           numeric,
+  margin         numeric,
+  margin_pct     numeric,
+  uncosted_qty   integer,
+  cost_estimated boolean
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+  if p_group is null or p_group not in ('category', 'brand', 'product', 'staff') then
+    raise exception 'A sales report is by category, brand, product or staff, not %', coalesce(p_group, '(nothing)')
+      using errcode = '22023';
+  end if;
+
+  return query
+  with moves as (
+    -- Sold in the period. Only a line's first charge counts as items sold; a
+    -- later string change adds money, not another job.
+    select s.id as sale_id, s.user_id, sl.product_id,
+           case when sl.kind = 'charge' then sl.qty else 0 end as qty,
+           sl.qty * sl.unit_price as amount,
+           sl.qty * (coalesce(sl.price_before_discount, sl.unit_price) - sl.unit_price) as discount,
+           sl.qty as cost_qty, sl.unit_cost, sl.unit_cost_estimated,
+           false as is_return
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+     where s.sold_at >= p_from and s.sold_at < p_to
+       and sl.gift_card_id is null
+    union all
+    -- Refunded in the period, against the line's original sale.
+    select s.id, s.user_id, sl.product_id,
+           case when rl.kind = 'return' then rl.qty else 0 end,
+           rl.qty * rl.unit_price,
+           0::numeric,
+           -rl.qty, sl.unit_cost, sl.unit_cost_estimated,
+           true
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join sale_lines sl on sl.id = rl.sale_line_id
+      join sales s on s.id = sl.sale_id
+     where r.refunded_at >= p_from and r.refunded_at < p_to
+       and sl.gift_card_id is null
+  ),
+  keyed as (
+    select m.*,
+           case
+             when p_group = 'staff'   then coalesce(m.user_id::text, '')
+             when m.product_id is null then 'stringing'
+             when p_group = 'category' then p.category_id::text
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '')
+             else p.id::text
+           end as k,
+           case
+             when p_group = 'staff'   then coalesce(pr.email, '(not recorded)')
+             when m.product_id is null then 'Stringing'
+             when p_group = 'category' then c.name
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '(no brand)')
+             else trim(coalesce(p.brand, '') || ' ' || p.name)
+           end as lbl,
+           case
+             when p_group = 'product' and m.product_id is not null then c.name
+           end as dtl
+      from moves m
+      left join products p   on p.id = m.product_id
+      left join categories c on c.id = p.category_id
+      left join profiles pr  on pr.id = m.user_id
+  ),
+  grouped as (
+    select k, min(lbl) as lbl, min(dtl) as dtl,
+           count(distinct sale_id) filter (where not is_return)::int                 as tickets,
+           coalesce(sum(qty) filter (where not is_return), 0)::int                   as qty_sold,
+           coalesce(sum(amount) filter (where not is_return), 0)                     as sales,
+           coalesce(sum(discount), 0)                                                as discounts,
+           coalesce(sum(qty) filter (where is_return), 0)::int                       as qty_returned,
+           coalesce(sum(amount) filter (where is_return), 0)                         as returns,
+           coalesce(sum(case when is_return then -amount else amount end)
+                    filter (where unit_cost is not null), 0)                         as costed_sales,
+           coalesce(sum(cost_qty * unit_cost), 0)                                    as cost,
+           count(*) filter (where unit_cost is not null) > 0                         as has_cost,
+           coalesce(sum(cost_qty) filter (where product_id is not null and unit_cost is null), 0)::int
+                                                                                     as uncosted_qty,
+           coalesce(bool_or(unit_cost_estimated), false)                             as cost_estimated
+      from keyed
+     group by k
+  )
+  select g.k, g.lbl, g.dtl, g.tickets, g.qty_sold, g.sales, g.discounts, g.qty_returned, g.returns,
+         g.qty_sold - g.qty_returned,
+         g.sales - g.returns,
+         g.costed_sales,
+         g.cost,
+         case when g.has_cost then g.costed_sales - g.cost end,
+         case when g.has_cost and g.costed_sales <> 0
+              then round(100 * (g.costed_sales - g.cost) / g.costed_sales, 1) end,
+         g.uncosted_qty,
+         g.cost_estimated
+    from grouped g
+   order by g.sales - g.returns desc, g.lbl;
+end;
+$$;
+
+revoke all on function report_sales_by(timestamptz, timestamptz, text) from public, anon;
+grant execute on function report_sales_by(timestamptz, timestamptz, text) to authenticated;
+
+-- >>> supabase/migrations/0096_report_price_changes.sql
+-- =============================================================================
+-- 0096_report_price_changes.sql — discounts and price changes by who (AceStock, Phase 4A)
+--
+-- Phase 2 reported how many price changes and discounts there were and their
+-- total (sales_summary). The per-person breakdown was left for 4A.
+--
+-- Adds report_price_changes(from, to): every price change and discount on a
+-- sale made in [from, to), one row each, with
+--   * kind: 'price_change' (list price to the price charged before discounts),
+--     'line_discount' or 'ticket_discount' (a line's share of the ticket's);
+--   * made_by: who rang the sale (the person at the register);
+--   * approved_by: the admin who approved the ticket's discount, if one did
+--     (price changes have no approval);
+--   * amount: qty x (from_price - to_price) — what was taken off; negative
+--     when a price was raised;
+--   * reason: what was typed, or "(none)". Reasons are optional (0093), and a
+--     report shows that none was given rather than leaving the row out.
+-- The screen totals it per person.
+--
+-- Admins only; runs with the caller's rights. Re-runnable.
+-- =============================================================================
+
+drop function if exists report_price_changes(timestamptz, timestamptz);
+create or replace function report_price_changes(p_from timestamptz, p_to timestamptz)
+returns table (
+  kind        text,
+  sold_at     timestamptz,
+  sale_id     uuid,
+  made_by     text,
+  approved_by text,
+  item        text,
+  qty         integer,
+  from_price  numeric,
+  to_price    numeric,
+  amount      numeric,
+  reason      text
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with lines as (
+    select s.id as sid, s.sold_at as at, s.ticket_discount_reason,
+           coalesce(maker.email, '(not recorded)') as maker,
+           approver.email as approver,
+           sl.id as line_id, sl.qty as n, sl.unit_price, sl.list_price, sl.price_reason, sl.discount_reason,
+           coalesce(sl.price_before_discount, sl.unit_price) as before_discount,
+           coalesce(sl.line_discount_each, 0) as line_each,
+           coalesce(sl.ticket_discount_each, 0) as ticket_each,
+           case
+             when sl.product_id is not null then trim(coalesce(p.brand, '') || ' ' || p.name)
+             when sl.string_job_id is not null then 'Stringing'
+             else 'Gift card'
+           end as item_name
+      from sales s
+      join sale_lines sl on sl.sale_id = s.id
+      left join products p on p.id = sl.product_id
+      left join profiles maker on maker.id = s.user_id
+      left join profiles approver on approver.id = s.discount_approved_by
+     where s.sold_at >= p_from and s.sold_at < p_to
+  ),
+  changes as (
+    select 'price_change'::text as k, 1 as ord, l.*, l.list_price as was, l.before_discount as now_price,
+           l.price_reason as why, null::text as ok_by
+      from lines l
+     where l.list_price is not null and l.before_discount <> l.list_price
+    union all
+    select 'line_discount', 2, l.*, l.before_discount, l.before_discount - l.line_each,
+           l.discount_reason, l.approver
+      from lines l
+     where l.line_each > 0
+    union all
+    select 'ticket_discount', 3, l.*, l.before_discount - l.line_each, l.unit_price,
+           l.ticket_discount_reason, l.approver
+      from lines l
+     where l.ticket_each > 0
+  )
+  select c.k, c.at, c.sid, c.maker, c.ok_by, c.item_name, c.n, c.was, c.now_price,
+         c.n * (c.was - c.now_price),
+         coalesce(nullif(trim(c.why), ''), '(none)')
+    from changes c
+   order by c.at, c.sid, c.item_name, c.line_id, c.ord;
+end;
+$$;
+
+revoke all on function report_price_changes(timestamptz, timestamptz) from public, anon;
+grant execute on function report_price_changes(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0097_report_inventory_value.sql
+-- =============================================================================
+-- 0097_report_inventory_value.sql — inventory value at cost (AceStock, Phase 4A)
+--
+-- Adds report_inventory_value(): what's in stock now, product by product:
+--   * on_hand: as product_stock counts it (frames in stock for racquets, the
+--     stock history's sum for everything else). Shown as recorded, so an
+--     oversold item shows below zero, but it's valued at zero, not less.
+--   * value_at_cost: on hand x the product's cost; null when no cost is
+--     recorded (the screen counts those rather than valuing them at $0).
+--   * retail_value: on hand x the selling price.
+--   * demo_frames / demo_value_at_cost: frames in the demo fleet (in the demo
+--     rack or lent out), kept apart from stock for sale.
+-- Products with nothing on hand and no demo frames are left out.
+--
+-- Admins only; runs with the caller's rights. Re-runnable.
+-- =============================================================================
+
+drop function if exists report_inventory_value();
+create or replace function report_inventory_value()
+returns table (
+  product_id         uuid,
+  product            text,
+  category           text,
+  brand              text,
+  is_serialized      boolean,
+  on_hand            numeric,
+  cost               numeric,
+  sell_price         numeric,
+  value_at_cost      numeric,
+  retail_value       numeric,
+  demo_frames        integer,
+  demo_value_at_cost numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+
+  return query
+  with demo as (
+    select u.product_id as pid, count(*)::int as frames
+      from product_units u
+     where u.status in ('demo', 'assigned')
+     group by u.product_id
+  )
+  select p.id,
+         trim(coalesce(p.brand, '') || ' ' || p.name),
+         c.name,
+         nullif(trim(p.brand), ''),
+         p.is_serialized,
+         ps.on_hand,
+         p.cost,
+         p.sell_price,
+         greatest(ps.on_hand, 0) * p.cost,
+         greatest(ps.on_hand, 0) * p.sell_price,
+         coalesce(d.frames, 0),
+         case when d.frames is not null then d.frames * p.cost end
+    from products p
+    join product_stock ps on ps.product_id = p.id
+    left join categories c on c.id = p.category_id
+    left join demo d on d.pid = p.id
+   where ps.on_hand <> 0 or d.frames is not null
+   order by c.sort_order nulls last, c.name, nullif(trim(p.brand), '') nulls last, p.name;
+end;
+$$;
+
+revoke all on function report_inventory_value() from public, anon;
+grant execute on function report_inventory_value() to authenticated;
+
+-- >>> supabase/migrations/0098_report_balances.sql
+-- =============================================================================
+-- 0098_report_balances.sql — gift card and store credit liability (AceStock, Phase 4A)
+--
+-- Adds report_balances(as_of): what the shop owes on gift cards and store
+-- credit at a moment — every card or customer with a balance then, summed from
+-- its history before that moment (a balance is always the sum of its
+-- history). One row each:
+--   * kind: 'gift_card' or 'store_credit';
+--   * code: the card's code (gift cards);
+--   * customer: last name, first name, when there is one;
+--   * balance, last_activity (the latest entry before the moment);
+--   * is_active: an inactive card or customer still owes its balance, so it's
+--     listed and marked.
+-- Cards and customers at zero are left out.
+--
+-- Admins only; runs with the caller's rights. Re-runnable.
+-- =============================================================================
+
+drop function if exists report_balances(timestamptz);
+create or replace function report_balances(p_as_of timestamptz)
+returns table (
+  kind          text,
+  holder_id     uuid,
+  code          text,
+  customer      text,
+  balance       numeric,
+  last_activity timestamptz,
+  is_active     boolean
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  if p_as_of is null then
+    raise exception 'Choose the moment to report balances at'
+      using errcode = '22023';
+  end if;
+
+  return query
+  with cards as (
+    select t.gift_card_id as id, sum(t.amount) as bal, max(t.created_at) as last_at
+      from gift_card_txns t
+     where t.created_at < p_as_of
+     group by t.gift_card_id
+    having sum(t.amount) <> 0
+  ),
+  credit as (
+    select t.customer_id as id, sum(t.amount) as bal, max(t.created_at) as last_at
+      from store_credit_txns t
+     where t.created_at < p_as_of
+     group by t.customer_id
+    having sum(t.amount) <> 0
+  )
+  select 'gift_card'::text, gc.id, gc.code,
+         case when cu.id is not null then cu.last_name || ', ' || cu.first_name end,
+         c.bal, c.last_at, gc.is_active
+    from cards c
+    join gift_cards gc on gc.id = c.id
+    left join customers cu on cu.id = gc.customer_id
+  union all
+  select 'store_credit'::text, cu.id, null::text,
+         cu.last_name || ', ' || cu.first_name,
+         c.bal, c.last_at, cu.is_active
+    from credit c
+    join customers cu on cu.id = c.id
+  order by 1, 4 nulls last, 3;
+end;
+$$;
+
+revoke all on function report_balances(timestamptz) from public, anon;
+grant execute on function report_balances(timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0099_report_stringing.sql
+-- =============================================================================
+-- 0099_report_stringing.sql — stringing volume and revenue (AceStock, Phase 4A)
+--
+-- Adds, for a period [from, to):
+--   1. report_stringing_summary(from, to) — one row:
+--        * jobs entered (and how many were rush), completed, delivered and
+--          cancelled in the period, and jobs waiting now;
+--        * revenue: stringing charges on sales in the period (string changes
+--          included), refunds of stringing made in the period, and net;
+--        * strings_revenue: the part of each charge that was the shop's
+--          strings (the job's strings price, never more than the charge);
+--          labor_revenue is the rest.
+--   2. report_stringing(from, to) — jobs completed in the period by stringer
+--      (as recorded on the job, "(not recorded)" otherwise): how many, rush,
+--      customer's own string, finished by the promised time or after, and the
+--      average hours from entered to complete.
+--
+-- Admins only; run with the caller's rights. Re-runnable.
+-- =============================================================================
+
+-- 1. report_stringing_summary -------------------------------------------------
+drop function if exists report_stringing_summary(timestamptz, timestamptz);
+create or replace function report_stringing_summary(p_from timestamptz, p_to timestamptz)
+returns table (
+  jobs_entered    integer,
+  rush_entered    integer,
+  jobs_completed  integer,
+  jobs_delivered  integer,
+  jobs_cancelled  integer,
+  jobs_waiting    integer,
+  revenue         numeric,
+  strings_revenue numeric,
+  labor_revenue   numeric,
+  refunds         numeric,
+  net_revenue     numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with charges as (
+    select sl.qty * sl.unit_price as amount,
+           case when sl.kind = 'charge'
+                then least(coalesce(j.strings_price, 0) * sl.qty, sl.qty * sl.unit_price)
+                else sl.qty * sl.unit_price  -- a string change is a strings difference
+           end as strings_part
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+      join string_jobs j on j.id = sl.string_job_id
+     where s.sold_at >= p_from and s.sold_at < p_to
+  ),
+  given_back as (
+    select rl.qty * rl.unit_price as amount
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join sale_lines sl on sl.id = rl.sale_line_id
+     where sl.string_job_id is not null
+       and r.refunded_at >= p_from and r.refunded_at < p_to
+  ),
+  totals as (
+    select coalesce((select sum(amount) from charges), 0)       as rev,
+           coalesce((select sum(strings_part) from charges), 0) as strings_rev,
+           coalesce((select sum(amount) from given_back), 0)    as back
+  )
+  select
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to and j.is_rush)::int,
+    (select count(*) from string_jobs j where j.completed_at >= p_from and j.completed_at < p_to)::int,
+    (select count(*) from string_jobs j where j.delivered_at >= p_from and j.delivered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.cancelled_at >= p_from and j.cancelled_at < p_to)::int,
+    (select count(*) from string_jobs j where j.status = 'entered')::int,
+    t.rev,
+    t.strings_rev,
+    t.rev - t.strings_rev,
+    t.back,
+    t.rev - t.back
+  from totals t;
+end;
+$$;
+
+revoke all on function report_stringing_summary(timestamptz, timestamptz) from public, anon;
+grant execute on function report_stringing_summary(timestamptz, timestamptz) to authenticated;
+
+-- 2. report_stringing ---------------------------------------------------------
+drop function if exists report_stringing(timestamptz, timestamptz);
+create or replace function report_stringing(p_from timestamptz, p_to timestamptz)
+returns table (
+  stringer          text,
+  jobs_completed    integer,
+  rush              integer,
+  customer_supplied integer,
+  on_time           integer,
+  late              integer,
+  avg_hours         numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  select coalesce(nullif(trim(j.strung_by), ''), '(not recorded)') as who,
+         count(*)::int,
+         count(*) filter (where j.is_rush)::int,
+         count(*) filter (where j.main_customer_supplied or j.cross_customer_supplied)::int,
+         count(*) filter (where j.promised_at is not null and j.completed_at <= j.promised_at)::int,
+         count(*) filter (where j.promised_at is not null and j.completed_at > j.promised_at)::int,
+         round((avg(extract(epoch from (j.completed_at - j.entered_at))) / 3600)::numeric, 1)
+    from string_jobs j
+   where j.completed_at >= p_from and j.completed_at < p_to
+   group by 1
+   order by 2 desc, 1;
+end;
+$$;
+
+revoke all on function report_stringing(timestamptz, timestamptz) from public, anon;
+grant execute on function report_stringing(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0100_report_demos.sql
+-- =============================================================================
+-- 0100_report_demos.sql — demo program activity (AceStock, Phase 4A)
+--
+-- Adds report_demos(from, to): the demo program by racquet model:
+--   * loans: demos lent in [from, to);
+--   * led_to_sale: of those, how many the borrower then bought a frame of the
+--     same racquet (demo_loans.sale_id, set within 30 days; 0072), and the
+--     conversion % (led_to_sale / loans);
+--   * returned: demos checked back in during the period, retired: of those,
+--     how many were retired on the way back; avg_days_out: their average
+--     time out;
+--   * out_now / overdue_now: demos lent out at this moment, and of those, how
+--     many are past their due-back time.
+-- Models with nothing in any column are left out.
+--
+-- Admins only; runs with the caller's rights. Re-runnable.
+-- =============================================================================
+
+drop function if exists report_demos(timestamptz, timestamptz);
+create or replace function report_demos(p_from timestamptz, p_to timestamptz)
+returns table (
+  product_id     uuid,
+  racquet        text,
+  loans          integer,
+  led_to_sale    integer,
+  conversion_pct numeric,
+  returned       integer,
+  retired        integer,
+  avg_days_out   numeric,
+  out_now        integer,
+  overdue_now    integer
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with loans as (
+    select u.product_id as pid, l.*
+      from demo_loans l
+      join product_units u on u.id = l.product_unit_id
+  ),
+  by_model as (
+    select pid,
+           count(*) filter (where out_at >= p_from and out_at < p_to)::int                         as lent,
+           count(*) filter (where out_at >= p_from and out_at < p_to and sale_id is not null)::int as sold,
+           count(*) filter (where back_at >= p_from and back_at < p_to)::int                       as back,
+           count(*) filter (where back_at >= p_from and back_at < p_to and back_status = 'retired')::int
+                                                                                                   as gone,
+           avg(extract(epoch from (back_at - out_at)) / 86400)
+             filter (where back_at >= p_from and back_at < p_to)                                   as days,
+           count(*) filter (where back_at is null)::int                                            as open,
+           count(*) filter (where back_at is null and due_back_at < now())::int                    as late
+      from loans
+     group by pid
+  )
+  select b.pid,
+         trim(coalesce(p.brand, '') || ' ' || p.name),
+         b.lent,
+         b.sold,
+         case when b.lent > 0 then round(100.0 * b.sold / b.lent, 1) end,
+         b.back,
+         b.gone,
+         round(b.days::numeric, 1),
+         b.open,
+         b.late
+    from by_model b
+    join products p on p.id = b.pid
+   where b.lent + b.back + b.open > 0
+   order by b.lent desc, b.open desc, 2;
+end;
+$$;
+
+revoke all on function report_demos(timestamptz, timestamptz) from public, anon;
+grant execute on function report_demos(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0101_quickbooks_daily_summary.sql
+-- =============================================================================
+-- 0101_quickbooks_daily_summary.sql — a daily summary for QuickBooks (AceStock, Phase 4A)
+--
+-- Adds:
+--   1. Settings for the QuickBooks account each figure posts to, with defaults
+--      the shop can rename to match its chart of accounts (Settings, admins):
+--      cash, card and check takings; gift card and store credit liability;
+--      sales tax payable; sales income; stringing income.
+--   2. report_daily_summary(from, to, time_zone) — one balanced journal entry
+--      per day in [from, to), days counted in the shop's time zone:
+--        debits:  what was taken by cash, card and check (less what was given
+--                 back that way), and gift cards and store credit spent;
+--        credits: sales by category and stringing (less returns), sales tax
+--                 (less tax refunded) and gift cards sold.
+--      A figure that nets the other way (e.g. more cash refunded than taken)
+--      moves to the other column. An exchange's credit is on both its return
+--      and its sale, so it nets out and isn't listed. Each line names its
+--      account and a memo; lines that net to zero are left out. Each day's
+--      debits equal its credits, because each sale's payments equal its lines
+--      plus tax, and each refund's likewise.
+--   Gift card and store credit changes made outside a sale or refund
+--   (adjustments) aren't sales activity and aren't included.
+--
+-- Admins only; runs with the caller's rights. Re-runnable.
+-- =============================================================================
+
+-- 1. Account names --------------------------------------------------------------
+alter table settings add column if not exists qb_cash_account         text not null default 'Undeposited Funds';
+alter table settings add column if not exists qb_card_account         text not null default 'Undeposited Funds';
+alter table settings add column if not exists qb_check_account        text not null default 'Undeposited Funds';
+alter table settings add column if not exists qb_gift_card_account    text not null default 'Gift Card Liability';
+alter table settings add column if not exists qb_store_credit_account text not null default 'Store Credit Liability';
+alter table settings add column if not exists qb_sales_tax_account    text not null default 'Sales Tax Payable';
+alter table settings add column if not exists qb_sales_account        text not null default 'Sales';
+alter table settings add column if not exists qb_stringing_account    text not null default 'Stringing Income';
+
+alter table settings drop constraint if exists ck_settings_qb_accounts;
+alter table settings add constraint ck_settings_qb_accounts check (
+  char_length(btrim(qb_cash_account)) between 1 and 100
+  and char_length(btrim(qb_card_account)) between 1 and 100
+  and char_length(btrim(qb_check_account)) between 1 and 100
+  and char_length(btrim(qb_gift_card_account)) between 1 and 100
+  and char_length(btrim(qb_store_credit_account)) between 1 and 100
+  and char_length(btrim(qb_sales_tax_account)) between 1 and 100
+  and char_length(btrim(qb_sales_account)) between 1 and 100
+  and char_length(btrim(qb_stringing_account)) between 1 and 100
+);
+
+comment on column settings.qb_cash_account is 'QuickBooks account for cash taken (daily summary export, 0101)';
+comment on column settings.qb_card_account is 'QuickBooks account for card payments';
+comment on column settings.qb_check_account is 'QuickBooks account for checks';
+comment on column settings.qb_gift_card_account is 'QuickBooks liability account for gift cards';
+comment on column settings.qb_store_credit_account is 'QuickBooks liability account for store credit';
+comment on column settings.qb_sales_tax_account is 'QuickBooks sales tax payable account';
+comment on column settings.qb_sales_account is 'QuickBooks income account for item sales (memo names the category)';
+comment on column settings.qb_stringing_account is 'QuickBooks income account for stringing';
+
+-- 2. report_daily_summary -------------------------------------------------------
+drop function if exists report_daily_summary(timestamptz, timestamptz, text);
+create or replace function report_daily_summary(p_from timestamptz, p_to timestamptz, p_time_zone text)
+returns table (
+  day     date,
+  line_no integer,
+  account text,
+  debit   numeric,
+  credit  numeric,
+  memo    text
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+declare
+  v settings%rowtype;
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+  if p_time_zone is null or not exists (select 1 from pg_timezone_names where name = p_time_zone) then
+    raise exception 'Unknown time zone: %', coalesce(p_time_zone, '(none)')
+      using errcode = '22023';
+  end if;
+  select * into v from settings where id;
+
+  return query
+  with s as (
+    select x.id, (x.sold_at at time zone p_time_zone)::date as d, x.tax
+      from sales x where x.sold_at >= p_from and x.sold_at < p_to
+  ),
+  r as (
+    select x.id, (x.refunded_at at time zone p_time_zone)::date as d, x.tax
+      from refunds x where x.refunded_at >= p_from and x.refunded_at < p_to
+  ),
+  -- Positive amounts are debits, negative credits.
+  amounts as (
+    select s.d, sp.method as what, sp.amount as amt
+      from sale_payments sp join s on s.id = sp.sale_id
+     where sp.method <> 'exchange'
+    union all
+    select r.d, rp.method, -rp.amount
+      from refund_payments rp join r on r.id = rp.refund_id
+     where rp.method <> 'exchange'
+    union all
+    select s.d,
+           case when sl.gift_card_id is not null then 'gift_card_sold'
+                when sl.product_id is null then 'stringing'
+                else 'sales:' || coalesce(c.name, '(no category)') end,
+           -(sl.qty * sl.unit_price)
+      from sale_lines sl join s on s.id = sl.sale_id
+      left join products p on p.id = sl.product_id
+      left join categories c on c.id = p.category_id
+    union all
+    select r.d,
+           case when sl.gift_card_id is not null then 'gift_card_sold'
+                when sl.product_id is null then 'stringing'
+                else 'sales:' || coalesce(c.name, '(no category)') end,
+           rl.qty * rl.unit_price
+      from refund_lines rl join r on r.id = rl.refund_id
+      join sale_lines sl on sl.id = rl.sale_line_id
+      left join products p on p.id = sl.product_id
+      left join categories c on c.id = p.category_id
+    union all
+    select s.d, 'tax', -s.tax from s
+    union all
+    select r.d, 'tax', r.tax from r
+  ),
+  named as (
+    select a.d,
+           case a.what
+             when 'cash'           then v.qb_cash_account
+             when 'credit'         then v.qb_card_account
+             when 'check'          then v.qb_check_account
+             when 'gift_card'      then v.qb_gift_card_account
+             when 'gift_card_sold' then v.qb_gift_card_account
+             when 'store_credit'   then v.qb_store_credit_account
+             when 'tax'            then v.qb_sales_tax_account
+             when 'stringing'      then v.qb_stringing_account
+             else v.qb_sales_account
+           end as acct,
+           case a.what
+             when 'cash'           then 'Cash'
+             when 'credit'         then 'Card'
+             when 'check'          then 'Checks'
+             when 'gift_card'      then 'Paid by gift card'
+             when 'gift_card_sold' then 'Gift cards sold'
+             when 'store_credit'   then 'Paid by store credit'
+             when 'tax'            then 'Sales tax'
+             when 'stringing'      then 'Stringing'
+             else 'Sales: ' || substr(a.what, 7)
+           end as note,
+           case a.what
+             when 'cash' then 1 when 'credit' then 2 when 'check' then 3
+             when 'gift_card' then 4 when 'store_credit' then 5
+             when 'stringing' then 7 when 'gift_card_sold' then 8 when 'tax' then 9
+             else 6
+           end as ord,
+           a.amt
+      from amounts a
+  ),
+  summed as (
+    select n.d, n.acct, n.note, min(n.ord) as ord, sum(n.amt) as total
+      from named n
+     group by n.d, n.acct, n.note
+    having sum(n.amt) <> 0
+  )
+  select x.d,
+         (row_number() over (partition by x.d order by x.ord, x.note))::int,
+         x.acct,
+         case when x.total > 0 then x.total end,
+         case when x.total < 0 then -x.total end,
+         x.note
+    from summed x
+   order by x.d, 2;
+end;
+$$;
+
+revoke all on function report_daily_summary(timestamptz, timestamptz, text) from public, anon;
+grant execute on function report_daily_summary(timestamptz, timestamptz, text) to authenticated;
+
+-- >>> supabase/migrations/0102_report_fixes.sql
+-- =============================================================================
+-- 0102_report_fixes.sql — stringing split and returned jobs (AceStock, Phase 4A review)
+--
+-- Fixes from the 4A code review:
+--   1. A job's strings price (string_job_strings_price) includes the shop's
+--      labour charge, so the stringing report gave almost everything to
+--      strings. string_jobs.labor_price now keeps the labour charge in that
+--      price, set whenever the strings price is (trigger below); jobs before
+--      now get today's labour charge, never more than their strings price.
+--   2. report_stringing_summary: strings = strings price less labour (never
+--      more than the charge; a customer's own string is labour only); a string
+--      change is all strings. strings_revenue and labor_revenue are now net of
+--      refunds, each refund split in its line's own proportion. Otherwise as
+--      0099.
+--   3. report_sales_by: a refunded string change is money back, not another
+--      returned job (only a first charge's return counts as a quantity).
+--      Otherwise as 0095.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. string_jobs.labor_price --------------------------------------------------
+alter table string_jobs add column if not exists labor_price numeric(12, 2);
+alter table string_jobs drop constraint if exists ck_string_jobs_labor_price;
+alter table string_jobs add constraint ck_string_jobs_labor_price
+  check (labor_price >= 0 and labor_price <> 'NaN');
+comment on column string_jobs.labor_price is
+  'The labour charge included in strings_price when it was set (0102); the strings are the rest';
+
+create or replace function set_string_job_labor_price()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'INSERT' or new.strings_price is distinct from old.strings_price then
+    new.labor_price := case
+      when new.strings_price is null then null
+      else least(coalesce((select stringing_labor from settings where id), 0), new.strings_price)
+    end;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function set_string_job_labor_price() from public, anon, authenticated;
+
+-- Named to run after trg_guard_string_job_strings, which sets strings_price.
+drop trigger if exists trg_string_job_labor_price on string_jobs;
+create trigger trg_string_job_labor_price
+  before insert or update on string_jobs
+  for each row execute function set_string_job_labor_price();
+
+update string_jobs j
+   set labor_price = least(coalesce((select stringing_labor from settings where id), 0), j.strings_price)
+ where j.labor_price is null and j.strings_price is not null;
+
+-- 2. report_sales_by ------------------------------------------------------------
+create or replace function report_sales_by(p_from timestamptz, p_to timestamptz, p_group text)
+returns table (
+  group_key      text,
+  label          text,
+  detail         text,
+  tickets        integer,
+  qty_sold       integer,
+  sales          numeric,
+  discounts      numeric,
+  qty_returned   integer,
+  returns        numeric,
+  net_qty        integer,
+  net_sales      numeric,
+  costed_sales   numeric,
+  cost           numeric,
+  margin         numeric,
+  margin_pct     numeric,
+  uncosted_qty   integer,
+  cost_estimated boolean
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+  if p_group is null or p_group not in ('category', 'brand', 'product', 'staff') then
+    raise exception 'A sales report is by category, brand, product or staff, not %', coalesce(p_group, '(nothing)')
+      using errcode = '22023';
+  end if;
+
+  return query
+  with moves as (
+    -- Sold in the period. Only a line's first charge counts as items sold; a
+    -- later string change adds money, not another job.
+    select s.id as sale_id, s.user_id, sl.product_id,
+           case when sl.kind = 'charge' then sl.qty else 0 end as qty,
+           sl.qty * sl.unit_price as amount,
+           sl.qty * (coalesce(sl.price_before_discount, sl.unit_price) - sl.unit_price) as discount,
+           sl.qty as cost_qty, sl.unit_cost, sl.unit_cost_estimated,
+           false as is_return
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+     where s.sold_at >= p_from and s.sold_at < p_to
+       and sl.gift_card_id is null
+    union all
+    -- Refunded in the period, against the line's original sale.
+    select s.id, s.user_id, sl.product_id,
+           case when rl.kind = 'return' and sl.kind = 'charge' then rl.qty else 0 end,
+           rl.qty * rl.unit_price,
+           0::numeric,
+           -rl.qty, sl.unit_cost, sl.unit_cost_estimated,
+           true
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join sale_lines sl on sl.id = rl.sale_line_id
+      join sales s on s.id = sl.sale_id
+     where r.refunded_at >= p_from and r.refunded_at < p_to
+       and sl.gift_card_id is null
+  ),
+  keyed as (
+    select m.*,
+           case
+             when p_group = 'staff'   then coalesce(m.user_id::text, '')
+             when m.product_id is null then 'stringing'
+             when p_group = 'category' then p.category_id::text
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '')
+             else p.id::text
+           end as k,
+           case
+             when p_group = 'staff'   then coalesce(pr.email, '(not recorded)')
+             when m.product_id is null then 'Stringing'
+             when p_group = 'category' then c.name
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '(no brand)')
+             else trim(coalesce(p.brand, '') || ' ' || p.name)
+           end as lbl,
+           case
+             when p_group = 'product' and m.product_id is not null then c.name
+           end as dtl
+      from moves m
+      left join products p   on p.id = m.product_id
+      left join categories c on c.id = p.category_id
+      left join profiles pr  on pr.id = m.user_id
+  ),
+  grouped as (
+    select k, min(lbl) as lbl, min(dtl) as dtl,
+           count(distinct sale_id) filter (where not is_return)::int                 as tickets,
+           coalesce(sum(qty) filter (where not is_return), 0)::int                   as qty_sold,
+           coalesce(sum(amount) filter (where not is_return), 0)                     as sales,
+           coalesce(sum(discount), 0)                                                as discounts,
+           coalesce(sum(qty) filter (where is_return), 0)::int                       as qty_returned,
+           coalesce(sum(amount) filter (where is_return), 0)                         as returns,
+           coalesce(sum(case when is_return then -amount else amount end)
+                    filter (where unit_cost is not null), 0)                         as costed_sales,
+           coalesce(sum(cost_qty * unit_cost), 0)                                    as cost,
+           count(*) filter (where unit_cost is not null) > 0                         as has_cost,
+           coalesce(sum(cost_qty) filter (where product_id is not null and unit_cost is null), 0)::int
+                                                                                     as uncosted_qty,
+           coalesce(bool_or(unit_cost_estimated), false)                             as cost_estimated
+      from keyed
+     group by k
+  )
+  select g.k, g.lbl, g.dtl, g.tickets, g.qty_sold, g.sales, g.discounts, g.qty_returned, g.returns,
+         g.qty_sold - g.qty_returned,
+         g.sales - g.returns,
+         g.costed_sales,
+         g.cost,
+         case when g.has_cost then g.costed_sales - g.cost end,
+         case when g.has_cost and g.costed_sales <> 0
+              then round(100 * (g.costed_sales - g.cost) / g.costed_sales, 1) end,
+         g.uncosted_qty,
+         g.cost_estimated
+    from grouped g
+   order by g.sales - g.returns desc, g.lbl;
+end;
+$$;
+
+revoke all on function report_sales_by(timestamptz, timestamptz, text) from public, anon;
+grant execute on function report_sales_by(timestamptz, timestamptz, text) to authenticated;
+
+-- 3. report_stringing_summary --------------------------------------------------
+create or replace function report_stringing_summary(p_from timestamptz, p_to timestamptz)
+returns table (
+  jobs_entered    integer,
+  rush_entered    integer,
+  jobs_completed  integer,
+  jobs_delivered  integer,
+  jobs_cancelled  integer,
+  jobs_waiting    integer,
+  revenue         numeric,
+  strings_revenue numeric,
+  labor_revenue   numeric,
+  refunds         numeric,
+  net_revenue     numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with charge_lines as (
+    -- Each stringing line sold in any period, with the part that was the
+    -- shop's strings: a first charge's strings are the job's strings price
+    -- less its labour (never more than the charge); a string change is all
+    -- strings.
+    select sl.id, s.sold_at, sl.qty * sl.unit_price as amount,
+           case when sl.kind = 'charge'
+                then least(greatest(coalesce(j.strings_price, 0) - coalesce(j.labor_price, 0), 0) * sl.qty,
+                           sl.qty * sl.unit_price)
+                else sl.qty * sl.unit_price
+           end as strings_part
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+      join string_jobs j on j.id = sl.string_job_id
+  ),
+  charges as (
+    select amount, strings_part from charge_lines
+     where sold_at >= p_from and sold_at < p_to
+  ),
+  given_back as (
+    -- Refunds split between strings and labour in the line's own proportion.
+    select rl.qty * rl.unit_price as amount,
+           case when c.amount = 0 then 0
+                else round(rl.qty * rl.unit_price * c.strings_part / c.amount, 2) end as strings_part
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join charge_lines c on c.id = rl.sale_line_id
+     where r.refunded_at >= p_from and r.refunded_at < p_to
+  ),
+  totals as (
+    select coalesce((select sum(amount) from charges), 0)                                        as rev,
+           coalesce((select sum(strings_part) from charges), 0)
+             - coalesce((select sum(strings_part) from given_back), 0)                           as strings_rev,
+           coalesce((select sum(amount) from given_back), 0)                                     as back
+  )
+  select
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to and j.is_rush)::int,
+    (select count(*) from string_jobs j where j.completed_at >= p_from and j.completed_at < p_to)::int,
+    (select count(*) from string_jobs j where j.delivered_at >= p_from and j.delivered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.cancelled_at >= p_from and j.cancelled_at < p_to)::int,
+    (select count(*) from string_jobs j where j.status = 'entered')::int,
+    t.rev,
+    t.strings_rev,
+    t.rev - t.back - t.strings_rev,
+    t.back,
+    t.rev - t.back
+  from totals t;
+end;
+$$;
+
+revoke all on function report_stringing_summary(timestamptz, timestamptz) from public, anon;
+grant execute on function report_stringing_summary(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0103_drop_cost_backfill.sql
+-- =============================================================================
+-- 0103_drop_cost_backfill.sql — the one-time cost backfill is gone (AceStock, Phase 4A review)
+--
+-- 0094 filled in sale lines sold before it with the product's cost at the
+-- time, marked "estimated", through fill_estimated_sale_line_costs(). Run
+-- again later, it would also mark newer lines whose product had no cost when
+-- they sold but has one now. The migration has run, so the function goes.
+--
+-- Re-runnable.
+-- =============================================================================
+
+drop function if exists fill_estimated_sale_line_costs();
+
+-- >>> supabase/migrations/0104_refund_method_and_top_ups.sql
+-- =============================================================================
+-- 0104_refund_method_and_top_ups.sql — two checks 0093 took away (AceStock, Phase 4A review)
+--
+-- 0093 stopped asking for a reason in several places. The code review found
+-- two of those checks did more than ask for a reason:
+--   1. A refund paid back a different way than the sale (a card sale refunded
+--      in cash) left no trace when no reason was typed. Now refunds keep
+--      method_changed_to — the payment types it sent more to than the sale
+--      took that way — whether or not a reason was typed. record_refund (and
+--      so record_exchange) and change_paid_string_job set it; refunds before
+--      now don't have it. report_price_changes lists these refunds as
+--      'payment_type_change' rows (no amount; who, when, the reason or
+--      "(none)").
+--   2. Anyone on staff could add gift card value or store credit. Now adding
+--      value (adjust_gift_card with a positive amount, add_store_credit) is
+--      for admins; staff can still take value off a gift card, and refunds,
+--      sales and exchanges are unchanged. Still no reason needed.
+-- Each function is otherwise as its latest version (record_refund,
+-- change_paid_string_job, adjust_gift_card, add_store_credit 0093;
+-- report_price_changes 0096).
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. refunds.method_changed_to ------------------------------------------------
+alter table refunds add column if not exists method_changed_to text[];
+comment on column refunds.method_changed_to is
+  'Payment types this refund sent more to than the sale took that way (0104); null when none or before 0104';
+
+-- 2. Functions ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.record_refund(p_sale_id uuid, p_lines jsonb, p_payments jsonb, p_reason text, p_note text, p_method_change_reason text DEFAULT NULL::text, p_approval_id uuid DEFAULT NULL::uuid)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_refund_id  uuid := gen_random_uuid();
+  v_customer   uuid;
+  v_rate       numeric := 0;
+  v_sale_tax   numeric := 0;
+  v_line       jsonb;
+  v_pay        jsonb;
+  v_sl_id      uuid;
+  v_qty        integer;
+  v_sl         record;
+  v_returned   integer;
+  v_sub        numeric := 0;
+  v_tax        numeric := 0;
+  v_total      numeric := 0;
+  v_paid       numeric := 0;
+  v_method     text;
+  v_amount     numeric;
+  v_gc         uuid;
+  v_changed    text[];
+  v_check_no   text;
+  v_unit_to     text;
+  v_unit_reason text;
+  v_unit        product_units%rowtype;
+  v_job         string_jobs%rowtype;
+  v_price       numeric;
+  v_taxable     numeric := 0;
+  v_load_cards  uuid[] := '{}';
+  v_card_left   numeric;
+  v_approver    uuid;
+  v_rest        numeric;
+  v_source      record;
+  v_take        numeric;
+  v_load_total  numeric := 0;
+  v_load_lines  uuid[] := '{}';
+  v_approved    record;
+begin
+  perform require_cents_each(p_payments, 'amount', 'Refund amount');
+  -- The jobs whose charges come back are locked before the sale, the order
+  -- change_paid_string_job takes them in (job, then its sales), so a refund
+  -- and a string change on the same job queue instead of deadlocking (0079).
+  perform 1 from string_jobs
+   where id in (select sl.string_job_id from sale_lines sl
+                 where sl.sale_id = p_sale_id and sl.string_job_id is not null
+                   and sl.id in (select nullif(l->>'sale_line_id', '')::uuid
+                                   from jsonb_array_elements(coalesce(p_lines, '[]'::jsonb)) l))
+   order by id for update;
+  -- Locking the sale serializes refunds of the same sale, so remaining
+  -- quantities, tax and per-method amounts below can't be raced.
+  select customer_id, coalesce(tax_rate, 0), coalesce(tax, 0)
+    into v_customer, v_rate, v_sale_tax
+    from sales where id = p_sale_id
+    for update;
+  if not found then raise exception 'Unknown sale %', p_sale_id; end if;
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then raise exception 'A refund needs at least one line'; end if;
+
+  insert into refunds (id, sale_id, reason, note)
+  values (v_refund_id, p_sale_id, nullif(trim(p_reason), ''), nullif(trim(p_note), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines)
+  loop
+    v_sl_id := (v_line->>'sale_line_id')::uuid;
+    v_qty   := (v_line->>'qty')::integer;
+    if v_qty is null or v_qty <= 0 then raise exception 'Return quantity must be positive'; end if;
+
+    select * into v_sl from sale_lines where id = v_sl_id and sale_id = p_sale_id;
+    if not found then raise exception 'Line % is not part of sale %', v_sl_id, p_sale_id; end if;
+    if v_sl.product_id is null and v_sl.string_job_id is null and v_sl.gift_card_id is null then
+      raise exception 'Only product, stringing and gift card lines can be returned';
+    end if;
+    if v_sl.gift_card_id is not null and v_qty <> v_sl.qty then
+      raise exception 'A gift card load is refunded whole';
+    end if;
+    if v_sl.string_job_id is not null and v_qty <> 1 then
+      raise exception 'A stringing charge is refunded whole (qty 1)';
+    end if;
+    if v_sl.product_unit_id is not null and v_qty <> 1 then
+      raise exception 'A racquet frame is returned one at a time (qty 1)';
+    end if;
+
+    select coalesce(sum(rl.qty), 0) into v_returned from refund_lines rl where rl.sale_line_id = v_sl_id and rl.kind = 'return';
+    if v_qty > v_sl.qty - v_returned then
+      raise exception 'Cannot return % of line (only % remaining)', v_qty, v_sl.qty - v_returned;
+    end if;
+
+    -- A stringing charge gives back what's left of it: its price less any
+    -- string-change give-backs already made against it (0043).
+    v_price := v_sl.unit_price;
+    if v_sl.string_job_id is not null then
+      v_price := v_price - coalesce((select sum(rl.qty * rl.unit_price) from refund_lines rl
+                                      where rl.sale_line_id = v_sl_id and rl.kind = 'string_change'), 0);
+      if v_price <= 0 then
+        raise exception 'Nothing is left to refund on this stringing charge: string changes already gave it back';
+      end if;
+    end if;
+
+    insert into refund_lines (refund_id, sale_line_id, qty, unit_price)
+    values (v_refund_id, v_sl_id, v_qty, v_price);
+
+    if v_sl.gift_card_id is not null then
+      -- Only a load the card still holds in full comes back off it.
+      perform 1 from gift_cards where id = v_sl.gift_card_id for update;
+      select coalesce(sum(amount), 0) into v_card_left from gift_card_txns where gift_card_id = v_sl.gift_card_id;
+      if v_card_left < v_qty * v_price then
+        raise exception 'Gift card % has $% left of this $% load: only an unused load can be refunded',
+          (select code from gift_cards where id = v_sl.gift_card_id), to_char(v_card_left, 'FM999999990.00'),
+          to_char(v_qty * v_price, 'FM999999990.00');
+      end if;
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id)
+      values (v_sl.gift_card_id, -(v_qty * v_price), 'load refund', p_sale_id);
+      if v_card_left - v_qty * v_price <= 0 then
+        update gift_cards set customer_id = null where id = v_sl.gift_card_id;
+      end if;
+      v_load_cards := v_load_cards || v_sl.gift_card_id;
+      v_load_total := v_load_total + v_qty * v_price;
+      v_load_lines := v_load_lines || v_sl.id;
+    elsif v_sl.string_job_id is not null then
+      -- The job stays on record, marked refunded. One not started yet is
+      -- cancelled; one strung and waiting is delivered first.
+      select * into v_job from string_jobs where id = v_sl.string_job_id for update;
+      if v_sl.kind = 'string_change' then
+        -- A string change's charge (0043) comes back once the job's own charge
+        -- has (0079), or on its own once the job is delivered (0084). Either
+        -- way it leaves the job as it is: refunding it alone would otherwise
+        -- cancel a job that's still paid for.
+        if v_job.refund_id is null and v_job.status <> 'delivered' then
+          raise exception 'This is a string change on job J%: refund the job''s own charge first, or deliver the job',
+            v_job.job_number;
+        end if;
+      else
+        if v_job.status = 'complete' then
+          raise exception 'String job J% is strung and waiting: deliver it before refunding its charge', v_job.job_number;
+        end if;
+        if v_job.status = 'entered' then
+          update string_jobs
+             set status = 'cancelled', cancelled_at = now(), cancelled_by = auth.uid()
+           where id = v_job.id;
+        end if;
+        if v_job.refund_id is null then
+          update string_jobs set refunded_at = now(), refund_id = v_refund_id where id = v_job.id;
+        end if;
+      end if;
+    elsif v_sl.product_unit_id is null then
+      -- Returned stock goes back on hand.
+      insert into inventory_txns (txn_type, product_id, qty, sale_id)
+      values ('return', v_sl.product_id, v_qty, p_sale_id);
+    else
+      -- A returned frame goes back in stock, or is retired if it's damaged.
+      v_unit_to     := coalesce(nullif(v_line->>'unit_status', ''), 'in_stock');
+      v_unit_reason := nullif(btrim(coalesce(v_line->>'unit_reason', '')), '');
+      if v_unit_to not in ('in_stock', 'retired') then
+        raise exception 'A returned frame goes back in stock or is retired (not "%")', v_unit_to;
+      end if;
+      if char_length(coalesce(v_unit_reason, '')) > 200 then
+        raise exception 'Keep the reason to 200 characters';
+      end if;
+
+      select * into v_unit from product_units where id = v_sl.product_unit_id for update;
+      if v_unit.status <> 'sold' or v_unit.sale_id is distinct from p_sale_id then
+        raise exception 'This frame isn''t sold on this sale any more (it''s %)', replace(v_unit.status, '_', ' ');
+      end if;
+      if exists (select 1 from string_jobs j join customer_rackets r on r.id = j.customer_racket_id
+                  where r.product_unit_id = v_unit.id and r.is_active and j.status in ('entered', 'complete')) then
+        raise exception 'This racquet has a string job open: deliver or cancel it before returning the frame';
+      end if;
+
+      perform set_config('acestock.unit_status_reason', coalesce(v_unit_reason, 'Returned'), true);
+      perform set_config('acestock.unit_refund_id', v_refund_id::text, true);
+      update product_units
+         set status = v_unit_to, sale_id = null, customer_id = null, updated_at = now()
+       where id = v_unit.id;
+      perform set_config('acestock.unit_status_reason', '', true);
+      perform set_config('acestock.unit_refund_id', '', true);
+
+      -- It's no longer the customer's racquet.
+      update customer_rackets set is_active = false where product_unit_id = v_unit.id and is_active;
+    end if;
+
+    v_sub := v_sub + v_qty * v_price;
+    if v_sl.taxable then
+      v_taxable := v_taxable + v_qty * v_price;
+    end if;
+  end loop;
+
+  -- A gift card load comes back only with an admin: signed in here, or their
+  -- one-time approval (used up by this refund).
+  if cardinality(v_load_cards) > 0 and not is_admin() then
+    if p_approval_id is null then
+      raise exception 'Refunding a gift card load needs an admin''s approval';
+    end if;
+    select a.refund_id is null and a.expires_at > now() as usable, a.approved_by, a.sale_id, a.amount,
+           a.sale_line_ids
+      into v_approved
+      from refund_approvals a where a.id = p_approval_id
+      for update;
+    if not found or not coalesce(v_approved.usable, false) then
+      raise exception 'The admin approval has expired or been used: ask again';
+    end if;
+    -- The approval covers one sale's loads, for the amount the admin saw.
+    if v_approved.sale_id is distinct from p_sale_id then
+      raise exception 'The admin approved a refund on another sale: ask again';
+    end if;
+    if abs(v_approved.amount - v_load_total) > 0.005 then
+      raise exception 'The admin approved refunding $% of gift card loads, not $%: ask again',
+        to_char(v_approved.amount, 'FM999999990.00'), to_char(v_load_total, 'FM999999990.00');
+    end if;
+    -- ...and the very loads they were shown, not another card for the same amount (0083).
+    if (select coalesce(array_agg(x order by x), '{}') from unnest(v_approved.sale_line_ids) x)
+       is distinct from (select coalesce(array_agg(x order by x), '{}') from unnest(v_load_lines) x) then
+      raise exception 'The admin approved refunding other gift card loads on this sale: ask again';
+    end if;
+    v_approver := v_approved.approved_by;
+    update refund_approvals set refund_id = v_refund_id where id = p_approval_id;
+    update refunds set approved_by = v_approver where id = v_refund_id;
+  elsif cardinality(v_load_cards) > 0 then
+    update refunds set approved_by = auth.uid() where id = v_refund_id;
+  end if;
+
+  -- Tax on everything taxable refunded so far (rounded once), minus tax
+  -- already refunded, never beyond what the sale charged. Only lines the sale
+  -- taxed count (stringing may be untaxed).
+  v_tax   := sale_refund_tax(p_sale_id, v_taxable, v_refund_id);
+  v_total := v_sub + v_tax;
+  update refunds set subtotal = v_sub, tax = v_tax where id = v_refund_id;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+      if v_amount is null or v_amount <= 0 then raise exception 'Refund amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid refund method "%"', v_method; end if;
+      v_check_no := null;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card refund needs a gift_card_id'; end if;
+        if v_gc = any (v_load_cards) then
+          raise exception 'A refunded load can''t go back onto the same gift card';
+        end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_amount, 'refund', p_sale_id);
+      elsif v_method = 'check' then
+        -- A refund check: allowed while the shop takes checks, or when the sale
+        -- itself was paid by check (even after checks were turned off).
+        if not coalesce((select accept_checks from settings where id = true), false)
+           and not exists (select 1 from sale_payments where sale_id = p_sale_id and method = 'check') then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+      elsif v_method = 'store_credit' then
+        if v_customer is null then raise exception 'Store credit refund needs a customer on the sale'; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (v_customer, v_amount, 'refund', p_sale_id);
+      end if;
+
+      insert into refund_payments (refund_id, method, amount, gift_card_id, check_number)
+      values (v_refund_id, v_method, v_amount, v_gc, v_check_no);
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) what isn't given back goes toward
+  -- the new items, as 'exchange' refund payments. Each one records the
+  -- payment type (a gift card by card) it came out of, up to what that type
+  -- can still give back, taken cash, credit, gift card, store credit, check
+  -- (0082). What no type covers stays an 'exchange' payment with no source.
+  if coalesce(current_setting('acestock.exchange_id', true), '') <> '' then
+    v_rest := v_total - v_paid;
+    if v_rest < -0.005 then
+      raise exception 'The money back ($%) is more than the return ($%)',
+        to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    for v_source in
+      select paid.method, paid.card, greatest(paid.amount - coalesce(back.amount, 0), 0) as left_amount
+        from (select coalesce(sp.source_method, sp.method) as method,
+                     case when coalesce(sp.source_method, sp.method) = 'gift_card'
+                          then coalesce(sp.source_gift_card_id, sp.gift_card_id) end as card,
+                     sum(sp.amount) as amount
+                from sale_payments sp
+               where sp.sale_id = p_sale_id and coalesce(sp.source_method, sp.method) <> 'exchange'
+               group by 1, 2) paid
+        left join (select coalesce(rp.source_method, rp.method) as method,
+                          case when coalesce(rp.source_method, rp.method) = 'gift_card'
+                               then coalesce(rp.source_gift_card_id, rp.gift_card_id) end as card,
+                          sum(rp.amount) as amount
+                     from refund_payments rp join refunds r on r.id = rp.refund_id
+                    where r.sale_id = p_sale_id
+                    group by 1, 2) back
+          on back.method = paid.method and back.card is not distinct from paid.card
+       order by array_position(array['cash', 'credit', 'gift_card', 'store_credit', 'check'], paid.method), paid.card
+    loop
+      exit when v_rest <= 0.005;
+      v_take := least(v_rest, v_source.left_amount);
+      if v_take > 0.005 then
+        insert into refund_payments (refund_id, method, amount, source_method, source_gift_card_id)
+        values (v_refund_id, 'exchange', v_take, v_source.method, v_source.card);
+        v_paid := v_paid + v_take;
+        v_rest := v_rest - v_take;
+      end if;
+    end loop;
+    if v_rest > 0.005 then
+      insert into refund_payments (refund_id, method, amount) values (v_refund_id, 'exchange', v_rest);
+      v_paid := v_paid + v_rest;
+    end if;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Refund payments (%) must equal the refund total (%)', v_paid, v_total;
+  end if;
+
+  -- A payment type this refund sends more to than the sale took that way (net
+  -- of earlier refunds) is a payment-type change; a reason, if given, is kept
+  -- with it (0093: no longer required).
+  v_changed := refund_method_overages(p_sale_id, v_refund_id);
+
+  if cardinality(v_changed) > 0 then
+    update refunds
+       set method_changed_to = v_changed,
+           method_change_reason = nullif(trim(p_method_change_reason), '')
+     where id = v_refund_id;
+  end if;
+
+  return v_refund_id;
+end;
+$function$;
+
+revoke all on function record_refund(p_sale_id uuid, p_lines jsonb, p_payments jsonb, p_reason text, p_note text, p_method_change_reason text, p_approval_id uuid) from public, anon;
+grant execute on function record_refund(p_sale_id uuid, p_lines jsonb, p_payments jsonb, p_reason text, p_note text, p_method_change_reason text, p_approval_id uuid) to authenticated;
+
+CREATE OR REPLACE FUNCTION public.change_paid_string_job(p_job_id uuid, p_main_product_id uuid, p_cross_product_id uuid, p_main_tension numeric, p_cross_tension numeric, p_payments jsonb, p_reason text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_quote      jsonb;
+  v_direction  text;
+  v_amount     numeric;
+  v_tax        numeric;
+  v_total      numeric;
+  v_customer   uuid;
+  v_pay        jsonb;
+  v_methods    text[] := '{}';
+  v_amounts    numeric[] := '{}';
+  v_paid       numeric := 0;
+  v_i          integer;
+  v_sale_id    uuid;
+  v_rate       numeric;
+  v_taxable    boolean;
+  v_count      integer;
+  v_balance    numeric;
+  v_alloc      jsonb;
+  v_refund_id  uuid;
+  v_refund_ids uuid[] := '{}';
+  v_sale_cust  uuid;
+  v_need       numeric;
+  v_take       numeric;
+  v_changed    text[];
+begin
+  perform require_cents_each(p_payments, 'amount', 'Payment amount');
+  perform require_staff();
+
+  -- Lock the job, then the sales that paid for it (refunds of a sale run one
+  -- at a time), so the quote below can't be raced.
+  perform 1 from string_jobs where id = p_job_id for update;
+  if not found then
+    raise exception 'Unknown string job %', p_job_id;
+  end if;
+  perform 1 from sales
+   where id in (select sale_id from sale_lines where string_job_id = p_job_id)
+   order by id for update;
+
+  v_quote     := string_change_quote(p_job_id, p_main_product_id, p_cross_product_id);
+  v_direction := v_quote->>'direction';
+  v_amount    := (v_quote->>'amount')::numeric;
+  v_tax       := (v_quote->>'tax')::numeric;
+  v_total     := (v_quote->>'total')::numeric;
+  v_customer  := (v_quote->>'customer_id')::uuid;
+
+  -- Payments: cash, credit and/or store credit, adding up to the total.
+  for v_pay in select * from jsonb_array_elements(coalesce(p_payments, '[]'::jsonb))
+  loop
+    if (v_pay->>'amount')::numeric is null or (v_pay->>'amount')::numeric <= 0 then
+      raise exception 'Payment amount must be positive';
+    end if;
+    if (v_pay->>'method') is null or (v_pay->>'method') not in ('cash', 'credit', 'store_credit') then
+      raise exception 'A string change is paid or given back as cash, credit or store credit';
+    end if;
+    v_methods := v_methods || (v_pay->>'method');
+    v_amounts := v_amounts || (v_pay->>'amount')::numeric;
+    v_paid := v_paid + (v_pay->>'amount')::numeric;
+  end loop;
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Payments (%) must equal the string change total (%)', v_paid, v_total;
+  end if;
+  if 'store_credit' = any (v_methods) and v_customer is null then
+    raise exception 'Store credit needs a customer';
+  end if;
+
+  -- Change the strings. The entry rules apply (catalog strings, tensions,
+  -- availability); the flag lets this paid job's price move by the difference.
+  perform set_config('acestock.string_change_job', p_job_id::text, true);
+  update string_jobs
+     set main_product_id  = p_main_product_id,
+         cross_product_id = p_cross_product_id,
+         main_tension     = p_main_tension,
+         cross_tension    = p_cross_tension,
+         price = coalesce(price, 0) + case v_direction when 'charge' then v_amount
+                                                       when 'give_back' then -v_amount
+                                                       else 0 end
+   where id = p_job_id;
+  perform set_config('acestock.string_change_job', '', true);
+
+  if v_direction = 'charge' then
+    if 'store_credit' = any (v_methods) then
+      perform 1 from customers where id = v_customer for update;
+      select coalesce(sum(amount), 0) into v_balance from store_credit_txns where customer_id = v_customer;
+      if v_balance < (select coalesce(sum(a), 0) from unnest(v_amounts, v_methods) as u(a, m) where m = 'store_credit') then
+        raise exception 'Store credit balance % is less than the store credit used', v_balance;
+      end if;
+    end if;
+
+    select coalesce(tax_rate, 0), coalesce(tax_stringing, false) into v_rate, v_taxable from settings where id;
+    v_sale_id := gen_random_uuid();
+    insert into sales (id, customer_id, subtotal, tax, tax_rate, note)
+    values (v_sale_id, v_customer, v_amount, v_tax, v_rate, 'String change');
+    insert into sale_lines (sale_id, string_job_id, qty, unit_price, kind, taxable)
+    values (v_sale_id, p_job_id, 1, v_amount, 'string_change', v_taxable);
+
+    for v_i in 1 .. coalesce(array_length(v_methods, 1), 0)
+    loop
+      insert into sale_payments (sale_id, method, amount) values (v_sale_id, v_methods[v_i], v_amounts[v_i]);
+      if v_methods[v_i] = 'store_credit' then
+        insert into store_credit_txns (customer_id, amount, reason, sale_id)
+        values (v_customer, -v_amounts[v_i], 'redeem', v_sale_id);
+      end if;
+    end loop;
+
+    select count(*) into v_count from sale_payments where sale_id = v_sale_id;
+    update sales
+       set payment_method = case when v_count = 1
+                                 then (select method from sale_payments where sale_id = v_sale_id limit 1)
+                                 else 'split' end
+     where id = v_sale_id;
+
+    return jsonb_build_object('direction', 'charge', 'amount', v_amount, 'tax', v_tax, 'total', v_total,
+                              'sale_id', v_sale_id);
+  end if;
+
+  if v_direction = 'give_back' then
+    -- One refund per paying sale (newest first); the payments are spread over
+    -- them in the order given.
+    v_i := 1;
+    for v_alloc in select * from jsonb_array_elements(v_quote->'allocations')
+    loop
+      v_refund_id := gen_random_uuid();
+      select customer_id into v_sale_cust from sales where id = (v_alloc->>'sale_id')::uuid;
+      insert into refunds (id, sale_id, subtotal, tax, reason)
+      values (v_refund_id, (v_alloc->>'sale_id')::uuid, (v_alloc->>'amount')::numeric, (v_alloc->>'tax')::numeric,
+              'String change');
+      insert into refund_lines (refund_id, sale_line_id, qty, unit_price, kind)
+      values (v_refund_id, (v_alloc->>'sale_line_id')::uuid, 1, (v_alloc->>'amount')::numeric, 'string_change');
+
+      v_need := (v_alloc->>'amount')::numeric + (v_alloc->>'tax')::numeric;
+      while v_need > 0.005 and v_i <= array_length(v_methods, 1)
+      loop
+        v_take := least(v_need, v_amounts[v_i]);
+        insert into refund_payments (refund_id, method, amount) values (v_refund_id, v_methods[v_i], v_take);
+        if v_methods[v_i] = 'store_credit' then
+          insert into store_credit_txns (customer_id, amount, reason, sale_id)
+          values (coalesce(v_sale_cust, v_customer), v_take, 'refund', (v_alloc->>'sale_id')::uuid);
+        end if;
+        v_need := v_need - v_take;
+        v_amounts[v_i] := v_amounts[v_i] - v_take;
+        if v_amounts[v_i] <= 0.005 then
+          v_i := v_i + 1;
+        end if;
+      end loop;
+
+      v_changed := refund_method_overages((v_alloc->>'sale_id')::uuid, v_refund_id);
+      if cardinality(v_changed) > 0 then
+        update refunds
+           set method_changed_to = v_changed,
+               method_change_reason = nullif(trim(p_reason), '')
+         where id = v_refund_id;
+      end if;
+      v_refund_ids := v_refund_ids || v_refund_id;
+    end loop;
+
+    return jsonb_build_object('direction', 'give_back', 'amount', v_amount, 'tax', v_tax, 'total', v_total,
+                              'refund_ids', to_jsonb(v_refund_ids));
+  end if;
+
+  return jsonb_build_object('direction', 'none', 'amount', 0, 'tax', 0, 'total', 0);
+end;
+$function$;
+
+revoke all on function change_paid_string_job(p_job_id uuid, p_main_product_id uuid, p_cross_product_id uuid, p_main_tension numeric, p_cross_tension numeric, p_payments jsonb, p_reason text) from public, anon;
+grant execute on function change_paid_string_job(p_job_id uuid, p_main_product_id uuid, p_cross_product_id uuid, p_main_tension numeric, p_cross_tension numeric, p_payments jsonb, p_reason text) to authenticated;
+
+CREATE OR REPLACE FUNCTION public.adjust_gift_card(p_gift_card_id uuid, p_amount numeric, p_reason text)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_bal numeric;
+begin
+  if p_amount is null or p_amount = 0 then
+    raise exception 'Adjustment amount must be non-zero';
+  end if;
+  perform require_cents(p_amount, 'Adjustment');
+  perform 1 from gift_cards where id = p_gift_card_id for update;
+  if not found then
+    raise exception 'Unknown gift card %', p_gift_card_id;
+  end if;
+
+  -- Adding value is an admin's to give (0104); taking value off stays open to staff.
+  if p_amount > 0 and auth.uid() is not null and not is_admin() then
+    raise exception 'Only an admin can add value to a gift card'
+      using errcode = '42501';
+  end if;
+
+  select coalesce(sum(amount), 0) into v_bal from gift_card_txns where gift_card_id = p_gift_card_id;
+  if v_bal + p_amount < 0 then
+    raise exception 'Adjustment would make the balance negative (balance %, adjustment %)', v_bal, p_amount;
+  end if;
+
+  insert into gift_card_txns (gift_card_id, amount, reason)
+  values (p_gift_card_id, p_amount, coalesce(nullif(trim(p_reason), ''), 'adjust'));
+
+  v_bal := v_bal + p_amount;
+  if v_bal <= 0 then
+    update gift_cards set customer_id = null where id = p_gift_card_id;
+  end if;
+  return v_bal;
+end;
+$function$;
+
+revoke all on function adjust_gift_card(p_gift_card_id uuid, p_amount numeric, p_reason text) from public, anon;
+grant execute on function adjust_gift_card(p_gift_card_id uuid, p_amount numeric, p_reason text) to authenticated;
+
+CREATE OR REPLACE FUNCTION public.add_store_credit(p_customer_id uuid, p_amount numeric, p_reason text)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+begin
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Store credit amount must be positive';
+  end if;
+  perform require_cents(p_amount, 'Store credit amount');
+  if not exists (select 1 from customers where id = p_customer_id) then
+    raise exception 'Unknown customer %', p_customer_id;
+  end if;
+  -- Store credit outside a refund is an admin's to give (0104).
+  if auth.uid() is not null and not is_admin() then
+    raise exception 'Only an admin can add store credit'
+      using errcode = '42501';
+  end if;
+  insert into store_credit_txns (customer_id, amount, reason)
+  values (p_customer_id, p_amount, coalesce(nullif(trim(p_reason), ''), 'adjust'));
+  return (select coalesce(sum(amount), 0) from store_credit_txns where customer_id = p_customer_id);
+end;
+$function$;
+
+revoke all on function add_store_credit(p_customer_id uuid, p_amount numeric, p_reason text) from public, anon;
+grant execute on function add_store_credit(p_customer_id uuid, p_amount numeric, p_reason text) to authenticated;
+
+-- 3. report_price_changes ------------------------------------------------------
+create or replace function report_price_changes(p_from timestamptz, p_to timestamptz)
+returns table (
+  kind        text,
+  sold_at     timestamptz,
+  sale_id     uuid,
+  made_by     text,
+  approved_by text,
+  item        text,
+  qty         integer,
+  from_price  numeric,
+  to_price    numeric,
+  amount      numeric,
+  reason      text
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with lines as (
+    select s.id as sid, s.sold_at as at, s.ticket_discount_reason,
+           coalesce(maker.email, '(not recorded)') as maker,
+           approver.email as approver,
+           sl.id as line_id, sl.qty as n, sl.unit_price, sl.list_price, sl.price_reason, sl.discount_reason,
+           coalesce(sl.price_before_discount, sl.unit_price) as before_discount,
+           coalesce(sl.line_discount_each, 0) as line_each,
+           coalesce(sl.ticket_discount_each, 0) as ticket_each,
+           case
+             when sl.product_id is not null then trim(coalesce(p.brand, '') || ' ' || p.name)
+             when sl.string_job_id is not null then 'Stringing'
+             else 'Gift card'
+           end as item_name
+      from sales s
+      join sale_lines sl on sl.sale_id = s.id
+      left join products p on p.id = sl.product_id
+      left join profiles maker on maker.id = s.user_id
+      left join profiles approver on approver.id = s.discount_approved_by
+     where s.sold_at >= p_from and s.sold_at < p_to
+  ),
+  changes as (
+    select 'price_change'::text as k, 1 as ord, l.*, l.list_price as was, l.before_discount as now_price,
+           l.price_reason as why, null::text as ok_by
+      from lines l
+     where l.list_price is not null and l.before_discount <> l.list_price
+    union all
+    select 'line_discount', 2, l.*, l.before_discount, l.before_discount - l.line_each,
+           l.discount_reason, l.approver
+      from lines l
+     where l.line_each > 0
+    union all
+    select 'ticket_discount', 3, l.*, l.before_discount - l.line_each, l.unit_price,
+           l.ticket_discount_reason, l.approver
+      from lines l
+     where l.ticket_each > 0
+  )
+  select x.k, x.at, x.sid, x.maker, x.ok_by, x.item_name, x.n, x.was, x.now_price, x.taken, x.why
+    from (
+      select c.k, c.at, c.sid, c.maker, c.ok_by, c.item_name, c.n, c.was, c.now_price,
+             c.n * (c.was - c.now_price) as taken,
+             coalesce(nullif(trim(c.why), ''), '(none)') as why,
+             c.line_id, c.ord
+        from changes c
+      union all
+      -- A refund paid back a different way than the sale was paid (0104): no
+      -- amount taken off, but who did it and when are on record.
+      select 'payment_type_change', r.refunded_at, r.sale_id,
+             coalesce(refunder.email, '(not recorded)'), null::text,
+             'Refund paid by ' || array_to_string(array(
+               select case m when 'credit' then 'card' when 'store_credit' then 'store credit'
+                             when 'gift_card' then 'gift card' else m end
+                 from unnest(r.method_changed_to) m), ', '),
+             null::integer, null::numeric, null::numeric, null::numeric,
+             coalesce(nullif(trim(r.method_change_reason), ''), '(none)'),
+             null::uuid, 4
+        from refunds r
+        left join profiles refunder on refunder.id = r.user_id
+       where r.method_changed_to is not null
+         and r.refunded_at >= p_from and r.refunded_at < p_to
+    ) x
+   order by x.at, x.sid, x.item_name, x.line_id nulls last, x.ord;
+end;
+$$;
+
+revoke all on function report_price_changes(timestamptz, timestamptz) from public, anon;
+grant execute on function report_price_changes(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0105_price_moved_check.sql
+-- =============================================================================
+-- 0105_price_moved_check.sql — a catalog price that moves during checkout (AceStock, Phase 4A review)
+--
+-- Before 0093, record_sale refused a line whose price differed from the
+-- catalog without a reason. That also caught a catalog price changing while
+-- the cashier was on the payment screen. Since 0093 the old price is quietly
+-- saved as a price change nobody made.
+--
+-- Now each line may carry list_price: the list price the register showed (from
+-- quote_sale). If it's given and the catalog's price is different now,
+-- record_sale refuses the sale ("A price changed in the catalog while this
+-- ticket was open"), and the register goes back to the ticket with the new
+-- price. Lines without list_price (older screens, exchanges) work as before.
+-- No reason is ever asked for. Otherwise as record_sale 0093.
+--
+-- Re-runnable.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION public.record_sale(p_lines jsonb, p_customer_id uuid, p_payments jsonb, p_note text, p_ticket jsonb DEFAULT NULL::jsonb, p_approval_id uuid DEFAULT NULL::uuid)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_sale_id     uuid := gen_random_uuid();
+  v_line        jsonb;
+  v_pay         jsonb;
+  v_product     uuid;
+  v_unit        uuid;
+  v_serialized  boolean;
+  v_job         uuid;
+  v_job_status  text;
+  v_job_paid    uuid;
+  v_gc          uuid;
+  v_qty         integer;
+  v_price       numeric;
+  v_line_total  numeric;
+  v_index       integer;
+  v_totals      jsonb;
+  v_taxed       boolean;
+  v_priced      jsonb;
+  v_list        numeric;
+  v_reason      text;
+  v_subtotal    numeric;
+  v_total       numeric;
+  v_paid        numeric := 0;
+  v_method      text;
+  v_amount      numeric;
+  v_bal         numeric;
+  v_prev        numeric;
+  v_onhand      numeric;
+  v_count       integer;
+  v_rate        numeric;
+  v_block       boolean := false;
+  v_checks      boolean := false;
+  v_check_no    text;
+  v_tax         numeric;
+  v_unit_status text;
+  v_unit_prod   uuid;
+  v_unit_price  numeric;
+  v_line_each   numeric;
+  v_ticket_each numeric;
+  v_line_disc   numeric;
+  v_disc_reason text;
+  v_ticket      numeric := nullif(nullif(p_ticket->>'discount', '')::numeric, 0);
+  v_problem     text;
+  v_approved_by uuid;
+  v_exempt_id   text;
+  v_credit      numeric;
+begin
+  perform require_cents_each(p_lines, 'unit_price', 'Price');
+  perform require_cents_each(p_payments, 'amount', 'Payment amount');
+  if p_lines is null or jsonb_array_length(p_lines) = 0 then
+    raise exception 'A sale needs at least one line';
+  end if;
+  if p_customer_id is not null
+     and not exists (select 1 from customers where id = p_customer_id) then
+    raise exception 'Unknown customer_id %', p_customer_id;
+  end if;
+
+  select block_oversell, accept_checks into v_block, v_checks from settings where id = true;
+
+  -- Lock everything whose balance or state this sale checks, in a fixed order,
+  -- so a concurrent sale waits here and then sees this sale's effects.
+  if v_block then
+    perform 1 from products
+     where id in (select nullif(l->>'product_id', '')::uuid from jsonb_array_elements(p_lines) l)
+     order by id for update;
+  end if;
+  perform 1 from product_units
+   where id in (select nullif(l->>'product_unit_id', '')::uuid from jsonb_array_elements(p_lines) l)
+   order by id for update;
+  perform 1 from string_jobs
+   where id in (select nullif(l->>'string_job_id', '')::uuid from jsonb_array_elements(p_lines) l)
+   order by id for update;
+  perform 1 from gift_cards
+   where id in (
+     select nullif(l->>'gift_card_id', '')::uuid from jsonb_array_elements(p_lines) l
+     union
+     select nullif(p->>'gift_card_id', '')::uuid from jsonb_array_elements(coalesce(p_payments, '[]'::jsonb)) p)
+   order by id for update;
+  if p_customer_id is not null and exists (
+       select 1 from jsonb_array_elements(coalesce(p_payments, '[]'::jsonb)) p
+       where p->>'method' = 'store_credit') then
+    perform 1 from customers where id = p_customer_id for update;
+  end if;
+  if p_approval_id is not null then
+    perform 1 from discount_approvals where id = p_approval_id for update;
+  end if;
+  -- Read after the locks above, like everything else this sale checks.
+  v_exempt_id := customer_tax_exempt_id(p_customer_id);
+
+  -- The totals, and which lines are taxed, come from sale_totals: the same
+  -- function quote_sale uses, so the total the register showed before payment
+  -- is the total this sale requires.
+  v_totals   := sale_totals(p_lines, p_ticket, v_exempt_id is not null);
+  v_subtotal := (v_totals->>'subtotal')::numeric;
+  v_tax      := (v_totals->>'tax')::numeric;
+  v_rate     := (v_totals->>'tax_rate')::numeric;
+  v_total    := (v_totals->>'total')::numeric;
+
+  insert into sales (id, customer_id, subtotal, note, ticket_discount, ticket_discount_reason, tax_exempt_id)
+  values (v_sale_id, p_customer_id, 0, nullif(trim(p_note), ''),
+          v_ticket, v_totals->>'ticket_discount_reason', v_exempt_id);
+
+  for v_line, v_index in select value, ordinality - 1 from jsonb_array_elements(p_lines) with ordinality
+  loop
+    v_product := nullif(v_line->>'product_id', '')::uuid;
+    v_unit    := nullif(v_line->>'product_unit_id', '')::uuid;
+    v_job     := nullif(v_line->>'string_job_id', '')::uuid;
+    v_gc      := nullif(v_line->>'gift_card_id', '')::uuid;
+    v_qty     := (v_line->>'qty')::integer;
+    v_price   := (v_line->>'unit_price')::numeric;
+    v_priced  := v_totals->'lines'->v_index;
+    v_taxed   := (v_priced->>'taxable')::boolean;
+    v_list    := (v_priced->>'list_price')::numeric;
+    v_reason  := v_priced->>'price_reason';
+    -- The register sends the list price it showed (0105). If the catalog
+    -- price has moved since, a different price would be saved as a price
+    -- change nobody made: refuse, so the register shows the new price.
+    if (v_line->>'list_price') is not null
+       and (v_line->>'list_price')::numeric is distinct from v_list then
+      raise exception 'A price changed in the catalog while this ticket was open: check the ticket and take payment again'
+        using errcode = 'P0001', hint = 'price_moved';
+    end if;
+    v_unit_price  := (v_priced->>'unit_price')::numeric;
+    v_line_each   := nullif((v_priced->>'line_discount_each')::numeric, 0);
+    v_ticket_each := nullif((v_priced->>'ticket_discount_each')::numeric, 0);
+    v_line_disc   := nullif(nullif(v_line->>'discount', '')::numeric, 0);
+    v_disc_reason := v_priced->>'discount_reason';
+
+    perform require_sale_line(v_line);
+
+    v_line_total := v_qty * v_unit_price;
+
+    if v_product is not null then
+      select is_serialized into v_serialized from products where id = v_product;
+      if v_serialized is null then
+        raise exception 'Unknown product_id % in sale line', v_product;
+      end if;
+
+      if v_serialized then
+        -- Serialized: sell one specific physical unit; no stock ledger txn.
+        if v_unit is null then
+          raise exception 'Product % is serialized; a product_unit_id is required', v_product;
+        end if;
+        if v_qty <> 1 then
+          raise exception 'Serialized items sell one unit per line (qty must be 1)';
+        end if;
+        select status, product_id into v_unit_status, v_unit_prod
+          from product_units where id = v_unit;
+        if v_unit_status is null then raise exception 'Unknown product_unit_id %', v_unit; end if;
+        if v_unit_prod <> v_product then raise exception 'Unit % does not belong to product %', v_unit, v_product; end if;
+        if v_unit_status <> 'in_stock' then raise exception 'Unit % is not in stock (status %)', v_unit, v_unit_status; end if;
+
+        insert into sale_lines (sale_id, product_id, product_unit_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+        values (v_sale_id, v_product, v_unit, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+        update product_units
+           set status = 'sold', sale_id = v_sale_id, customer_id = p_customer_id, updated_at = now()
+         where id = v_unit;
+      else
+        -- Fungible: quantity ledger, optional oversell block.
+        if v_block then
+          select coalesce(sum(qty), 0) into v_onhand from inventory_txns where product_id = v_product;
+          if v_onhand < v_qty then
+            raise exception 'Not enough stock for product % (% on hand, % requested)', v_product, v_onhand, v_qty;
+          end if;
+        end if;
+        insert into sale_lines (sale_id, product_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+        values (v_sale_id, v_product, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+        insert into inventory_txns (txn_type, product_id, qty, sale_id) values ('sell', v_product, -v_qty, v_sale_id);
+      end if;
+
+    elsif v_job is not null then
+      if v_qty <> 1 then
+        raise exception 'A string job is charged once per line (qty must be 1)';
+      end if;
+      select status, paid_sale_id into v_job_status, v_job_paid from string_jobs where id = v_job;
+      if not found then
+        raise exception 'Unknown string_job_id % in sale line', v_job;
+      end if;
+      if v_job_status = 'cancelled' then
+        raise exception 'String job % was cancelled and can''t be charged', v_job;
+      end if;
+      if v_job_paid = v_sale_id then
+        raise exception 'String job % is on this ticket more than once', v_job;
+      end if;
+      if v_job_paid is not null then
+        raise exception 'String job % is already paid (sale %)', v_job, v_job_paid;
+      end if;
+      insert into sale_lines (sale_id, string_job_id, qty, unit_price, taxable, list_price, price_reason,
+                              price_before_discount, line_discount, line_discount_each, ticket_discount_each, discount_reason)
+      values (v_sale_id, v_job, v_qty, v_unit_price, v_taxed, v_list, v_reason,
+              case when v_unit_price <> v_price then v_price end, v_line_disc, v_line_each, v_ticket_each, v_disc_reason);
+      -- The job's price becomes what was actually charged (a register discount
+      -- sticks); the line keeps the job's price before the sale as its list price.
+      update string_jobs set paid_sale_id = v_sale_id, price = v_unit_price where id = v_job;
+
+    else
+      if not exists (select 1 from gift_cards where id = v_gc) then
+        raise exception 'Unknown gift_card_id % in sale line', v_gc;
+      end if;
+      select coalesce(sum(amount), 0) into v_prev from gift_card_txns where gift_card_id = v_gc;
+      insert into sale_lines (sale_id, gift_card_id, qty, unit_price, taxable) values (v_sale_id, v_gc, v_qty, v_price, v_taxed);
+      insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, v_line_total, 'load', v_sale_id);
+      if v_prev <= 0 then update gift_cards set customer_id = p_customer_id where id = v_gc; end if;
+    end if;
+  end loop;
+
+  -- Discounts, checked after each line's own rules: anything over the staff
+  -- limit needs an admin (signed in, or their approval, used up by this sale).
+  v_problem := discount_approval_problem(v_totals, p_approval_id);
+  if v_problem is not null then
+    raise exception '%', v_problem;
+  end if;
+  if (v_totals->>'max_discount_percent')::numeric > (v_totals->>'staff_discount_cap')::numeric then
+    if is_admin() then
+      v_approved_by := auth.uid();
+    else
+      select approved_by into v_approved_by from discount_approvals where id = p_approval_id;
+      update discount_approvals set sale_id = v_sale_id where id = p_approval_id;
+    end if;
+    update sales set discount_approved_by = v_approved_by where id = v_sale_id;
+  end if;
+
+  -- In an exchange (record_exchange, 0077) the returned items' credit pays
+  -- first, as an 'exchange' payment; the payments cover the rest.
+  v_credit := nullif(current_setting('acestock.exchange_credit', true), '')::numeric;
+  if v_credit is not null and v_credit > 0 then
+    if v_credit > v_total + 0.005 then
+      raise exception 'The return ($%) is more than the new items ($%): give the difference back on the return',
+        to_char(v_credit, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+    end if;
+    insert into sale_payments (sale_id, method, amount) values (v_sale_id, 'exchange', v_credit);
+    v_paid := v_credit;
+  end if;
+
+  if p_payments is not null then
+    for v_pay in select * from jsonb_array_elements(p_payments)
+    loop
+      v_method := v_pay->>'method';
+      v_amount := (v_pay->>'amount')::numeric;
+      v_gc     := nullif(v_pay->>'gift_card_id', '')::uuid;
+
+      if v_amount is null or v_amount <= 0 then raise exception 'Payment amount must be positive'; end if;
+      if v_method not in ('cash', 'credit', 'gift_card', 'store_credit', 'check') then raise exception 'Invalid payment method "%"', v_method; end if;
+
+      if v_method = 'gift_card' then
+        if v_gc is null then raise exception 'Gift card payment needs a gift_card_id'; end if;
+        select coalesce(sum(amount), 0) into v_bal from gift_card_txns where gift_card_id = v_gc;
+        if v_bal < v_amount then raise exception 'Gift card balance % is less than %', v_bal, v_amount; end if;
+        insert into gift_card_txns (gift_card_id, amount, reason, sale_id) values (v_gc, -v_amount, 'redeem', v_sale_id);
+        insert into sale_payments (sale_id, method, amount, gift_card_id) values (v_sale_id, 'gift_card', v_amount, v_gc);
+        select coalesce(sum(amount), 0) into v_bal from gift_card_txns where gift_card_id = v_gc;
+        if v_bal <= 0 then update gift_cards set customer_id = null where id = v_gc; end if;
+      elsif v_method = 'check' then
+        if not coalesce(v_checks, false) then
+          raise exception 'This shop doesn''t take checks: turn them on in Settings first';
+        end if;
+        v_check_no := require_check_number(v_pay->>'check_number');
+        insert into sale_payments (sale_id, method, amount, check_number) values (v_sale_id, 'check', v_amount, v_check_no);
+      elsif v_method = 'store_credit' then
+        if p_customer_id is null then raise exception 'Store credit needs a customer on the sale'; end if;
+        select coalesce(sum(amount), 0) into v_bal from store_credit_txns where customer_id = p_customer_id;
+        if v_bal < v_amount then raise exception 'Store credit balance % is less than %', v_bal, v_amount; end if;
+        insert into store_credit_txns (customer_id, amount, reason, sale_id) values (p_customer_id, -v_amount, 'redeem', v_sale_id);
+        insert into sale_payments (sale_id, method, amount) values (v_sale_id, 'store_credit', v_amount);
+      else
+        insert into sale_payments (sale_id, method, amount) values (v_sale_id, v_method, v_amount);
+      end if;
+
+      v_paid := v_paid + v_amount;
+    end loop;
+  end if;
+
+  if abs(v_paid - v_total) > 0.005 then
+    raise exception 'Payments ($%) must equal the sale total ($%). The total may have changed: go back and check the ticket.',
+      to_char(v_paid, 'FM999999990.00'), to_char(v_total, 'FM999999990.00');
+  end if;
+
+  select count(*) into v_count from sale_payments where sale_id = v_sale_id;
+  update sales
+     set subtotal = v_subtotal,
+         tax = v_tax,
+         tax_rate = v_rate,
+         payment_method = case
+           when v_count = 0 then null
+           when v_count = 1 then (select method from sale_payments where sale_id = v_sale_id limit 1)
+           else 'split'
+         end
+   where id = v_sale_id;
+
+  return v_sale_id;
+end;
+$function$;
+
+revoke all on function record_sale(p_lines jsonb, p_customer_id uuid, p_payments jsonb, p_note text, p_ticket jsonb, p_approval_id uuid) from public, anon;
+grant execute on function record_sale(p_lines jsonb, p_customer_id uuid, p_payments jsonb, p_note text, p_ticket jsonb, p_approval_id uuid) to authenticated;
+
 commit;

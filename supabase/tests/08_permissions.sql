@@ -87,8 +87,8 @@ select throws_ok(
 
 select lives_ok($$ select receive_stock('00000000-0000-0000-0000-0000000000b1', 5, 8, null, null) $$,
                 'staff can still receive stock through receive_stock');
-select lives_ok($$ select add_store_credit('00000000-0000-0000-0000-0000000000c1', 5, 'goodwill') $$,
-                'staff can still issue store credit through add_store_credit');
+select throws_ok($$ select add_store_credit('00000000-0000-0000-0000-0000000000c1', 5, 'goodwill') $$,
+                 '42501', 'Only an admin can add store credit', 'store credit outside a refund is an admin''s to give (0104)');
 select is((select balance from gift_card_balance where gift_card_id = '00000000-0000-0000-0000-0000000000e1'),
           40::numeric, 'staff can read balances through the views');
 

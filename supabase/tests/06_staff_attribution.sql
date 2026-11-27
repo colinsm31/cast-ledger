@@ -20,9 +20,14 @@ select is((select user_id from inventory_txns where id = (select id from receive
 select is((select user_id from inventory_txns where id = (select id from adjusted)),
           '00000000-0000-0000-0000-0000000000a1'::uuid, 'adjust_stock records the staff member');
 
+-- Adding store credit is an admin's (0104).
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a2');
 select add_store_credit('00000000-0000-0000-0000-0000000000c1', 15, 'goodwill');
 select is((select user_id from store_credit_txns where reason = 'goodwill'),
-          '00000000-0000-0000-0000-0000000000a1'::uuid, 'add_store_credit records the staff member');
+          '00000000-0000-0000-0000-0000000000a2'::uuid, 'add_store_credit records who added it');
+select tests.clear_authentication();
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 
 select adjust_gift_card('00000000-0000-0000-0000-0000000000e1', -5, 'correction');
 select is((select user_id from gift_card_txns where reason = 'correction'),
