@@ -5,7 +5,6 @@ begin;
 select plan(17);
 
 update settings set time_zone = 'America/Chicago', cash_needs_drawer = true, accept_checks = true where id;
-insert into drawers (id, name) values ('00000000-0000-0000-0000-0000000009d2', 'Back counter');
 create function tests.as_register(p_drawer uuid) returns void language sql as $$
   select set_config('request.headers', case when p_drawer is null then '{}'
                                             else json_build_object('x-acestock-drawer', p_drawer)::text end, true);
@@ -18,7 +17,7 @@ select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select throws_ok(
   $$ select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]', null,
                         '[{"method":"cash","amount":21.65}]', null) $$,
-  '22023', 'Open the cash drawer on the Cash drawer screen before taking cash',
+  '22023', 'Open Main drawer on the Cash drawer screen before taking cash',
   'with no drawer open, cash is refused');
 select lives_ok(
   $$ select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]', null,
@@ -51,6 +50,9 @@ select results_eq(
   'expected cash is float + cash taken − cash given back; checks are listed apart');
 
 -- Two drawers open: the register says which ---------------------------------------
+select tests.clear_authentication();
+insert into drawers (id, name) values ('00000000-0000-0000-0000-0000000009d2', 'Back counter');
+select tests.authenticate_as('00000000-0000-0000-0000-0000000000a1');
 select open_drawer('00000000-0000-0000-0000-0000000009d2', '{}');
 select throws_ok(
   $$ select record_sale('[{"product_id":"00000000-0000-0000-0000-0000000000b1","qty":1,"unit_price":20}]', null,
@@ -88,8 +90,8 @@ select throws_ok(
                              from sale_lines sl join sales s on s.id = sl.sale_id
                             where s.payment_method = 'credit' limit 1),
                           '[{"method":"cash","amount":21.65}]', null, null) $$,
-  '22023', 'Open the cash drawer on the Cash drawer screen before giving cash back',
-  'with every drawer closed, cash can''t be given back either');
+  '22023', 'Choose this register''s drawer on the Cash drawer screen before giving cash back',
+  'with two drawers in use and none chosen, cash can''t be given back either');
 select results_eq(
   $$ select expected_cash, counted_cash, counted_cash - expected_cash from drawer_sessions
       where drawer_id = (select id from drawers where name = 'Main drawer') $$,

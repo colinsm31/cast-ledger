@@ -24,7 +24,8 @@
 # moved to an inactive customer when a job is entered for it, and a cash sale
 # rung while its drawer is being closed (it's counted, or refused, never lost),
 # a paid-out recorded while its drawer is being closed (likewise), and a sale
-# rung while its day is being closed (it's in the day's report, or refused).
+# rung while its day is being closed (it's in the day's report, or refused),
+# and two paid-outs that each take the whole drawer (only one can).
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -495,6 +496,17 @@ n=$(race "select close_drawer((select id from drawer_sessions where drawer_id = 
 check "a paid-out recorded while its drawer is closed" "$n" \
   "$(psql_run -c "select count(*) || ' paid-out(s) on the closed drawer' from drawer_movements m
     join drawer_sessions ds on ds.id = m.drawer_session_id where ds.drawer_id = '${DRAWER}'")"
+
+# 25. Two paid-outs at once, each for everything the drawer should hold
+#     (0113): they take the drawer one at a time, so the second is refused.
+psql_run -c "select open_drawer('${DRAWER}', '{\"20\": 5}')" >/dev/null
+PAY_OUT_ALL="select record_drawer_movement((select id from drawer_sessions where drawer_id = '${DRAWER}' and closed_at is null),
+  'paid_out', 100, '${RUN_TAG}')"
+n=$(race "${PAY_OUT_ALL}")
+check "two paid-outs that each empty the drawer" "$n" \
+  "$(psql_run -c "select 'expected ' || expected_cash from drawer_cash_summary(
+     (select id from drawer_sessions where drawer_id = '${DRAWER}' and closed_at is null))")"
+psql_run -c "select close_drawer((select id from drawer_sessions where drawer_id = '${DRAWER}' and closed_at is null), '{}')" >/dev/null
 
 # 24. A sale rung while its day is being closed (0112): it waits for the close
 #     and is refused, so the Z report never misses a sale of that day.
