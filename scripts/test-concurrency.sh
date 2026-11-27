@@ -22,7 +22,8 @@
 # to another customer while a job is entered for it, two senders claiming
 # the same queued customer message (it must be sent once), and a racquet being
 # moved to an inactive customer when a job is entered for it, and a cash sale
-# rung while its drawer is being closed (it's counted, or refused, never lost).
+# rung while its drawer is being closed (it's counted, or refused, never lost),
+# and a paid-out recorded while its drawer is being closed (likewise).
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -83,6 +84,7 @@ cleanup() {
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}',
                                                              '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from sales           where id in (select id from run_sales);
+    delete from drawer_movements where drawer_session_id in (select id from drawer_sessions where drawer_id = '${DRAWER}');
     delete from drawer_sessions where drawer_id = '${DRAWER}';
     delete from drawers         where id = '${DRAWER}';
     delete from customer_rackets where id in ('${RACKET}', '${RACKET_2}', '${RACKET_3}', '${RACKET_4}',
@@ -481,6 +483,16 @@ n=$(race "select close_drawer((select id from drawer_sessions where drawer_id = 
 check "a cash sale rung while its drawer is closed" "$n" \
   "$(psql_run -c "select 'expected ' || expected_cash || ', ' || (select count(*) from sales where drawer_session_id = ds.id) ||
     ' sale(s) in the drawer' from drawer_sessions ds where drawer_id = '${DRAWER}'")"
+
+# 23. A paid-out recorded while its drawer is being closed (0110): it waits
+#     for the close and is refused, so the closing count never misses it.
+psql_run -c "select open_drawer('${DRAWER}', '{\"20\": 5}')" >/dev/null
+n=$(race "select close_drawer((select id from drawer_sessions where drawer_id = '${DRAWER}' and closed_at is null), '{\"20\": 5}')" \
+         "select record_drawer_movement((select id from drawer_sessions where drawer_id = '${DRAWER}' and closed_at is null),
+           'paid_out', 5, '${RUN_TAG}')")
+check "a paid-out recorded while its drawer is closed" "$n" \
+  "$(psql_run -c "select count(*) || ' paid-out(s) on the closed drawer' from drawer_movements m
+    join drawer_sessions ds on ds.id = m.drawer_session_id where ds.drawer_id = '${DRAWER}'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then

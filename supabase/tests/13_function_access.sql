@@ -34,6 +34,8 @@ select is(
     -- read-only: calls require_staff()
     'quote_sale',
     'receive_stock', 'receive_units',
+    -- writes: calls require_staff() (0110)
+    'record_drawer_movement',
     -- writes: calls require_staff() (0077)
     'record_exchange',
     'record_refund', 'record_sale',
