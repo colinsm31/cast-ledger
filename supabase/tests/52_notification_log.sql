@@ -73,7 +73,7 @@ select throws_like($$ select finish_notification(gen_random_uuid(), 'sent') $$, 
 -- ---------------------------------------------------------------------------
 select tests.clear_authentication();
 select ok(has_function_privilege('service_role', 'claim_notifications(uuid, uuid, integer, uuid)', 'execute')
-          and has_function_privilege('service_role', 'finish_notification(uuid, text, text, text, boolean)', 'execute'),
+          and has_function_privilege('service_role', 'finish_notification(uuid, text, text, text, boolean, integer)', 'execute'),
           'the service role can claim and finish');
 
 select is((select count(*)::int from claim_notifications('00000000-0000-0000-0000-000000000f06')), 0,

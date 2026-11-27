@@ -61,6 +61,28 @@ Deno.test('parseRequest takes a message, a job, a sale, or none', () => {
   assertEquals(parseRequest({ sale_id: 42 }), { error: 'sale_id must be an id' });
 });
 
+Deno.test('a message the claim skipped or gave up on is reported, not sent (0106)', async () => {
+  const { deps, finished } = fakeDeps(
+    [
+      message({ status: 'skipped', error: 'The customer opted out of emails, so the message wasn\'t sent' }),
+      message({ id: 'n2', status: 'failed', error: 'Gave up after 5 tries; use Send again to try once more' }),
+    ],
+    () => Promise.reject(new Error('nothing should be sent')),
+  );
+  const results = await sendQueued({ ...NONE, stringJobId: JOB }, deps);
+  assertEquals(results, [
+    { id: 'n1', status: 'skipped', error: 'The customer opted out of emails, so the message wasn\'t sent' },
+    { id: 'n2', status: 'failed', error: 'Gave up after 5 tries; use Send again to try once more' },
+  ]);
+  assertEquals(finished, []);
+});
+
+Deno.test('each answer says which try it is for (0106)', async () => {
+  const { deps, finished } = fakeDeps([message({ attempts: 3 })], () => Promise.resolve('resend-3'));
+  await sendQueued({ ...NONE, stringJobId: JOB }, deps);
+  assertEquals(finished, [['n1', 'sent', 'resend-3', null, 3]]);
+});
+
 Deno.test('emails are sent and texts skipped until texting is set up', async () => {
   const sent: ClaimedMessage[] = [];
   const { deps, finished, claims } = fakeDeps(
@@ -74,8 +96,8 @@ Deno.test('emails are sent and texts skipped until texting is set up', async () 
   assertEquals(claims, [{ ...NONE, stringJobId: JOB }]);
   assertEquals(sent.map((m) => m.id), ['n1']);
   assertEquals(finished, [
-    ['n1', 'sent', 'resend-1', null],
-    ['n2', 'skipped', null, NO_TEXTING_MESSAGE],
+    ['n1', 'sent', 'resend-1', null, 1],
+    ['n2', 'skipped', null, NO_TEXTING_MESSAGE, 1],
   ]);
   assertEquals(summarize(results), { sent: 1, failed: 0, skipped: 1 });
 });
@@ -84,7 +106,7 @@ Deno.test('test mode: without the email secrets nothing leaves', async () => {
   const { deps, finished } = fakeDeps([message({})]);
   const results = await sendQueued(NONE, deps);
   assertEquals(results, [{ id: 'n1', status: 'skipped', error: TEST_MODE_MESSAGE }]);
-  assertEquals(finished, [['n1', 'skipped', null, TEST_MODE_MESSAGE]]);
+  assertEquals(finished, [['n1', 'skipped', null, TEST_MODE_MESSAGE, 1]]);
 });
 
 Deno.test('a refused email is recorded as failed and the rest still go', async () => {
@@ -93,7 +115,7 @@ Deno.test('a refused email is recorded as failed and the rest still go', async (
   );
   const results = await sendQueued(NONE, deps);
   assertEquals(summarize(results), { sent: 1, failed: 1, skipped: 0 });
-  assertEquals(finished[0], ['n1', 'failed', null, 'Invalid to address']);
+  assertEquals(finished[0], ['n1', 'failed', null, 'Invalid to address', 1]);
 });
 
 function fakeFetch(status: number, body: unknown, seen: { url?: string; init?: RequestInit }) {

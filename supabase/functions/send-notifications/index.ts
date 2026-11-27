@@ -22,6 +22,9 @@
 //
 // Request:  POST { "notification_id"?: uuid, "string_job_id"?: uuid, "sale_id"?: uuid }
 //           (none: the oldest queued)
+//           or, from the database's 5-minute schedule (0107), a request with the
+//           header x-acestock-sweep: the Vault's sweep secret, checked with
+//           notification_sweep_allowed; it sends the oldest waiting.
 // Response: 200 { sent, failed, skipped, results: [{ id, status, error? }] } | 4xx/5xx { error }
 
 import { createClient } from 'jsr:@supabase/supabase-js@2.118.0';
