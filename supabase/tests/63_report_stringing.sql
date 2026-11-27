@@ -18,6 +18,11 @@ update settings set stringing_labor = 18 where id;
 update string_jobs set entered_at = '2026-10-20 10:00Z',
                        strings_price = string_job_strings_price(main_product_id, cross_product_id)
  where id = '00000000-0000-0000-0000-0000000000e1';
+-- The fixture rang e1's charge before its price was set; save the split the
+-- register would have saved then ($38 strings price, $18 labour), since the
+-- split is kept on the line (0117).
+update sale_lines set strings_amount = 20, labor_amount = 10
+ where id = '00000000-0000-0000-0000-0000000007c3';
 -- One open job per racquet: each job gets its own.
 insert into customer_rackets (id, customer_id, model) values
   ('00000000-0000-0000-0000-0000000000fa', '00000000-0000-0000-0000-0000000000c1', 'Frame 2'),
