@@ -22,6 +22,8 @@ select is(
     'cancel_string_job', 'change_paid_string_job',
     -- writes: call require_staff() (0071)
     'check_in_demo', 'check_out_demo',
+    -- writes: calls require_staff() (0112)
+    'close_day',
     -- writes: calls require_staff() (0108)
     'close_drawer',
     'ensure_gift_card',
@@ -39,6 +41,8 @@ select is(
     -- writes: calls require_staff() (0077)
     'record_exchange',
     'record_refund', 'record_sale',
+    -- writes: calls require_staff(), then admins only (0112)
+    'reopen_day',
     'require_staff',
     -- writes: calls require_staff() (0086)
     'resend_notification',

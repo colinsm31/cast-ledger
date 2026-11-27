@@ -23,7 +23,8 @@
 # the same queued customer message (it must be sent once), and a racquet being
 # moved to an inactive customer when a job is entered for it, and a cash sale
 # rung while its drawer is being closed (it's counted, or refused, never lost),
-# and a paid-out recorded while its drawer is being closed (likewise).
+# a paid-out recorded while its drawer is being closed (likewise), and a sale
+# rung while its day is being closed (it's in the day's report, or refused).
 #
 # Usage:  ./scripts/test-concurrency.sh            (local stack from `supabase start`)
 #         DB_URL=postgresql://... ./scripts/test-concurrency.sh
@@ -84,6 +85,7 @@ cleanup() {
                                    or customer_racket_id in ('${RACKET_3}', '${RACKET_4}', '${RACKET_5}', '${RACKET_6}',
                                                              '${RACKET_7}', '${RACKET_8}', '${RACKET_9}');
     delete from sales           where id in (select id from run_sales);
+    delete from day_closes      where closed_by is null and business_day = '${RACE_DAY:-1900-01-01}';
     delete from drawer_movements where drawer_session_id in (select id from drawer_sessions where drawer_id = '${DRAWER}');
     delete from drawer_sessions where drawer_id = '${DRAWER}';
     delete from drawers         where id = '${DRAWER}';
@@ -493,6 +495,18 @@ n=$(race "select close_drawer((select id from drawer_sessions where drawer_id = 
 check "a paid-out recorded while its drawer is closed" "$n" \
   "$(psql_run -c "select count(*) || ' paid-out(s) on the closed drawer' from drawer_movements m
     join drawer_sessions ds on ds.id = m.drawer_session_id where ds.drawer_id = '${DRAWER}'")"
+
+# 24. A sale rung while its day is being closed (0112): it waits for the close
+#     and is refused, so the Z report never misses a sale of that day.
+RACE_DAY=$(psql_run -c "select shop_day(now())")
+n=$(race "select close_day('${RACE_DAY}')" \
+         "select record_sale('[{\"product_id\":\"${PRODUCT}\",\"qty\":1,\"unit_price\":20}]'::jsonb, null,
+           '[{\"method\":\"credit\",\"amount\":${SPEND_TOTAL}}]'::jsonb, '${RUN_TAG}')")
+check "a sale rung while its day is closed" "$n" \
+  "$(psql_run -c "select (select count(*) from day_closes where business_day = '${RACE_DAY}' and reopened_at is null) ||
+    ' close(s), ' || (select count(*) from sales where note = '${RUN_TAG}' and payment_method = 'credit'
+                       and (sold_at at time zone (select time_zone from settings where id))::date = '${RACE_DAY}') ||
+    ' card sale(s) that day'")"
 
 rm -rf "$RACE_DIR"
 if (( failures > 0 )); then
