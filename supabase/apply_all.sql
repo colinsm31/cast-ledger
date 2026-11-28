@@ -24185,4 +24185,2342 @@ revoke all on function request_notification_sweep() from public, anon, authentic
 -- 4. The schedule ----------------------------------------------------------------
 select cron.schedule('acestock-send-notifications', '*/5 * * * *', 'select public.request_notification_sweep()');
 
+-- >>> supabase/migrations/0108_drawer_sessions.sql
+-- =============================================================================
+-- 0108_drawer_sessions.sql — cash drawers opened with a float and closed with a
+-- count (AceStock, Phase 4B)
+--
+-- Adds:
+--   1. settings.time_zone — the shop's time zone, set by an admin in Settings.
+--      A drawer's business day (and, later, the day close) is counted in it.
+--   2. drawers — the shop's named cash drawers (admins add and rename them;
+--      everyone signed in reads them). One "Main drawer" to start.
+--   3. drawer_sessions — one drawer from open to close: the starting float and
+--      the closing count, each counted by denomination; who and when. One open
+--      session per drawer at a time.
+--   4. drawer_count_total(counts) — what a denomination count adds up to, and
+--      a check that it's well formed. Counts are a JSON object of
+--      "100" "50" "20" "10" "5" "1" "0.25" "0.10" "0.05" "0.01" → how many
+--      (whole numbers), plus "other" → an amount (rolled coin and the like).
+--   5. open_drawer(drawer, counts) / close_drawer(session, counts, note).
+--
+-- Staff read drawers and sessions; sessions change only through the two
+-- functions. Re-runnable.
+-- =============================================================================
+
+-- 1. Shop time zone -------------------------------------------------------------
+alter table settings add column if not exists time_zone text;
+comment on column settings.time_zone is
+  'The shop''s time zone (e.g. America/Chicago); business days are counted in it (0108). Null until an admin sets it';
+
+create or replace function is_time_zone(p_name text)
+returns boolean
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select exists (select 1 from pg_timezone_names where name = p_name);
+$$;
+revoke all on function is_time_zone(text) from public, anon;
+grant execute on function is_time_zone(text) to authenticated;
+
+-- A check constraint can't run a query, so a trigger checks the name.
+create or replace function check_settings_time_zone()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if new.time_zone is not null and not is_time_zone(new.time_zone) then
+    raise exception 'Unknown time zone: %', new.time_zone using errcode = '22023';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function check_settings_time_zone() from public, anon, authenticated;
+
+drop trigger if exists trg_settings_time_zone on settings;
+create trigger trg_settings_time_zone before insert or update of time_zone on settings
+  for each row execute function check_settings_time_zone();
+
+-- The shop's business day for a moment; refuses until the time zone is set.
+create or replace function shop_day(p_at timestamptz)
+returns date
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_zone text;
+begin
+  select time_zone into v_zone from settings where id;
+  if v_zone is null then
+    raise exception 'An admin needs to set the shop''s time zone in Settings first'
+      using errcode = '22023';
+  end if;
+  return (p_at at time zone v_zone)::date;
+end;
+$$;
+revoke all on function shop_day(timestamptz) from public, anon;
+grant execute on function shop_day(timestamptz) to authenticated;
+
+-- 2. Drawers --------------------------------------------------------------------
+create table if not exists drawers (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null check (char_length(btrim(name)) between 1 and 50),
+  is_active   boolean not null default true,
+  created_at  timestamptz not null default now()
+);
+comment on table drawers is 'The shop''s named cash drawers (0108)';
+create unique index if not exists uq_drawers_name on drawers (lower(btrim(name)));
+
+alter table drawers enable row level security;
+drop policy if exists drawers_staff_select on drawers;
+drop policy if exists drawers_admin_insert on drawers;
+drop policy if exists drawers_admin_update on drawers;
+create policy drawers_staff_select on drawers for select to authenticated using (is_staff());
+create policy drawers_admin_insert on drawers for insert to authenticated with check (is_admin());
+create policy drawers_admin_update on drawers for update to authenticated using (is_admin()) with check (is_admin());
+revoke all on drawers from anon, authenticated;
+grant select, insert, update (name, is_active) on drawers to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on drawers;
+create trigger trg_enforce_staff_writer before insert or update or delete on drawers
+  for each statement execute function enforce_staff_writer();
+
+insert into drawers (name)
+select 'Main drawer' where not exists (select 1 from drawers);
+
+-- 3. Drawer sessions ------------------------------------------------------------
+create table if not exists drawer_sessions (
+  id              uuid primary key default gen_random_uuid(),
+  drawer_id       uuid not null references drawers (id),
+  business_day    date not null,
+  opened_at       timestamptz not null default now(),
+  opened_by       uuid default auth.uid() references profiles (id),
+  float_counts    jsonb not null,
+  float_amount    numeric(12, 2) not null check (float_amount >= 0),
+  closed_at       timestamptz,
+  closed_by       uuid references profiles (id),
+  counted_counts  jsonb,
+  counted_cash    numeric(12, 2) check (counted_cash >= 0),
+  close_note      text check (char_length(close_note) <= 500),
+  constraint ck_drawer_sessions_closed check (
+    (closed_at is null and counted_counts is null and counted_cash is null and closed_by is null)
+    or (closed_at is not null and counted_counts is not null and counted_cash is not null)
+  )
+);
+comment on table drawer_sessions is 'A cash drawer from open (float) to close (count), by denomination (0108)';
+create unique index if not exists uq_drawer_sessions_open on drawer_sessions (drawer_id) where closed_at is null;
+create index if not exists idx_drawer_sessions_day on drawer_sessions (business_day);
+
+alter table drawer_sessions enable row level security;
+drop policy if exists drawer_sessions_staff_select on drawer_sessions;
+create policy drawer_sessions_staff_select on drawer_sessions for select to authenticated using (is_staff());
+revoke all on drawer_sessions from anon, authenticated;
+grant select on drawer_sessions to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on drawer_sessions;
+create trigger trg_enforce_staff_writer before insert or update or delete on drawer_sessions
+  for each statement execute function enforce_staff_writer();
+
+-- 4. drawer_count_total -----------------------------------------------------------
+create or replace function drawer_count_total(p_counts jsonb)
+returns numeric
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_key   text;
+  v_value jsonb;
+  v_total numeric := 0;
+begin
+  if p_counts is null or jsonb_typeof(p_counts) <> 'object' then
+    raise exception 'Count the drawer by denomination' using errcode = '22023';
+  end if;
+  for v_key, v_value in select key, value from jsonb_each(p_counts) loop
+    if jsonb_typeof(v_value) <> 'number' or (v_value #>> '{}')::numeric < 0 then
+      raise exception 'Each count must be a number of 0 or more' using errcode = '22023';
+    end if;
+    if v_key = 'other' then
+      if (v_value #>> '{}')::numeric <> round((v_value #>> '{}')::numeric, 2) then
+        raise exception 'Other cash must be in dollars and cents' using errcode = '22023';
+      end if;
+      v_total := v_total + (v_value #>> '{}')::numeric;
+    elsif v_key in ('100', '50', '20', '10', '5', '1', '0.25', '0.10', '0.05', '0.01') then
+      if (v_value #>> '{}')::numeric <> trunc((v_value #>> '{}')::numeric) then
+        raise exception 'Count whole bills and coins' using errcode = '22023';
+      end if;
+      v_total := v_total + v_key::numeric * (v_value #>> '{}')::numeric;
+    else
+      raise exception 'Unknown denomination: %', v_key using errcode = '22023';
+    end if;
+  end loop;
+  if v_total > 999999 then
+    raise exception 'That count is too large' using errcode = '22023';
+  end if;
+  return round(v_total, 2);
+end;
+$$;
+revoke all on function drawer_count_total(jsonb) from public, anon;
+grant execute on function drawer_count_total(jsonb) to authenticated;
+
+-- 5. open_drawer / close_drawer ---------------------------------------------------
+create or replace function open_drawer(p_drawer_id uuid, p_counts jsonb)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_drawer drawers%rowtype;
+  v_id     uuid;
+begin
+  perform require_staff();
+  select * into v_drawer from drawers where id = p_drawer_id for update;
+  if not found then
+    raise exception 'Drawer not found' using errcode = 'P0002';
+  end if;
+  if not v_drawer.is_active then
+    raise exception '% isn''t in use', v_drawer.name using errcode = '22023';
+  end if;
+  if exists (select 1 from drawer_sessions where drawer_id = p_drawer_id and closed_at is null) then
+    raise exception '% is already open', v_drawer.name using errcode = '23505';
+  end if;
+
+  insert into drawer_sessions (drawer_id, business_day, float_counts, float_amount)
+  values (p_drawer_id, shop_day(now()), p_counts, drawer_count_total(p_counts))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function open_drawer(uuid, jsonb) from public, anon;
+grant execute on function open_drawer(uuid, jsonb) to authenticated;
+
+create or replace function close_drawer(p_session_id uuid, p_counts jsonb, p_note text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_session drawer_sessions%rowtype;
+begin
+  perform require_staff();
+  select * into v_session from drawer_sessions where id = p_session_id for update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_session.closed_at is not null then
+    raise exception 'This drawer has already been closed' using errcode = '22023';
+  end if;
+
+  update drawer_sessions
+     set closed_at = now(),
+         closed_by = auth.uid(),
+         counted_counts = p_counts,
+         counted_cash = drawer_count_total(p_counts),
+         close_note = nullif(btrim(p_note), '')
+   where id = p_session_id;
+end;
+$$;
+revoke all on function close_drawer(uuid, jsonb, text) from public, anon;
+grant execute on function close_drawer(uuid, jsonb, text) to authenticated;
+
+-- >>> supabase/migrations/0109_cash_to_drawer.sql
+-- =============================================================================
+-- 0109_cash_to_drawer.sql — cash taken or given back goes to a drawer;
+-- expected vs counted at close (AceStock, Phase 4B)
+--
+-- Adds:
+--   1. settings.cash_needs_drawer (on): cash can't be taken or given back
+--      unless the register's drawer is open. Card, check, gift card and store
+--      credit work either way.
+--   2. sales.drawer_session_id / refunds.drawer_session_id, filled when the
+--      row is written (so record_sale, record_refund, record_exchange and
+--      change_paid_string_job are unchanged): the open session of the drawer
+--      the register names in its x-acestock-drawer request header, or else
+--      the only open session, if there's exactly one.
+--   3. A check on each cash payment and cash refund that its sale or refund
+--      has a drawer (when cash_needs_drawer is on), saying what to do if not.
+--   4. drawer_cash_summary(session): the float, cash taken and given back,
+--      the cash expected in the drawer, and checks taken and given back.
+--   5. drawer_sessions.expected_cash, saved by close_drawer, so over/short
+--      (counted − expected) stays as it was at the close.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. Setting --------------------------------------------------------------------
+alter table settings add column if not exists cash_needs_drawer boolean not null default true;
+comment on column settings.cash_needs_drawer is
+  'Cash can only be taken or given back while the register''s drawer is open (0109)';
+
+-- 2. Which drawer a sale or refund's cash goes to --------------------------------
+alter table sales   add column if not exists drawer_session_id uuid references drawer_sessions (id);
+alter table refunds add column if not exists drawer_session_id uuid references drawer_sessions (id);
+create index if not exists idx_sales_drawer_session on sales (drawer_session_id);
+create index if not exists idx_refunds_drawer_session on refunds (drawer_session_id);
+comment on column sales.drawer_session_id is 'The drawer session open at the register when the sale was rung (0109)';
+comment on column refunds.drawer_session_id is 'The drawer session open at the register when the refund was given (0109)';
+
+-- The drawer the register named in its request, if any (a uuid, or null).
+create or replace function requested_drawer_id()
+returns uuid
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_value text;
+begin
+  v_value := nullif(current_setting('request.headers', true), '')::json ->> 'x-acestock-drawer';
+  if v_value ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return v_value::uuid;
+  end if;
+  return null;
+end;
+$$;
+revoke all on function requested_drawer_id() from public, anon, authenticated;
+
+-- The open session the register's cash goes to: its named drawer's, else the
+-- only one open; null if neither. The session is locked (key share) until the
+-- sale or refund commits, so a close running at the same moment either waits
+-- for it (and counts it) or finishes first (and the session is no longer open).
+create or replace function register_drawer_session()
+returns uuid
+language plpgsql
+volatile
+set search_path = public, pg_temp
+as $$
+declare
+  v_drawer uuid := requested_drawer_id();
+  v_ids    uuid[];
+begin
+  if v_drawer is not null then
+    select array_agg(id) into v_ids
+      from (select id from drawer_sessions where drawer_id = v_drawer and closed_at is null for key share) s;
+  else
+    select array_agg(id) into v_ids
+      from (select id from drawer_sessions where closed_at is null limit 2 for key share) s;
+  end if;
+  return case when cardinality(v_ids) = 1 then v_ids[1] end;
+end;
+$$;
+revoke all on function register_drawer_session() from public, anon, authenticated;
+
+create or replace function set_drawer_session()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  new.drawer_session_id := coalesce(new.drawer_session_id, register_drawer_session());
+  return new;
+end;
+$$;
+revoke all on function set_drawer_session() from public, anon, authenticated;
+
+drop trigger if exists trg_sales_drawer_session on sales;
+create trigger trg_sales_drawer_session before insert on sales
+  for each row execute function set_drawer_session();
+drop trigger if exists trg_refunds_drawer_session on refunds;
+create trigger trg_refunds_drawer_session before insert on refunds
+  for each row execute function set_drawer_session();
+
+-- 3. Cash needs a drawer ------------------------------------------------------------
+create or replace function check_cash_drawer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_session uuid;
+  v_action  text;
+  v_drawer  drawers%rowtype;
+  v_open    integer;
+begin
+  if new.method <> 'cash' or not coalesce((select cash_needs_drawer from settings where id), false) then
+    return new;
+  end if;
+  if tg_table_name = 'sale_payments' then
+    select drawer_session_id into v_session from sales where id = new.sale_id;
+    v_action := 'taking cash';
+  else
+    select drawer_session_id into v_session from refunds where id = new.refund_id;
+    v_action := 'giving cash back';
+  end if;
+  if v_session is not null then
+    return new;
+  end if;
+
+  select * into v_drawer from drawers where id = requested_drawer_id();
+  if found then
+    raise exception 'Open % on the Cash drawer screen before %', v_drawer.name, v_action using errcode = '22023';
+  end if;
+  select count(*) into v_open from drawer_sessions where closed_at is null;
+  if v_open > 1 then
+    raise exception 'Choose this register''s drawer on the Cash drawer screen before %', v_action using errcode = '22023';
+  end if;
+  raise exception 'Open the cash drawer on the Cash drawer screen before %', v_action using errcode = '22023';
+end;
+$$;
+revoke all on function check_cash_drawer() from public, anon, authenticated;
+
+drop trigger if exists trg_sale_payments_cash_drawer on sale_payments;
+create trigger trg_sale_payments_cash_drawer before insert on sale_payments
+  for each row execute function check_cash_drawer();
+drop trigger if exists trg_refund_payments_cash_drawer on refund_payments;
+create trigger trg_refund_payments_cash_drawer before insert on refund_payments
+  for each row execute function check_cash_drawer();
+
+-- 4. drawer_cash_summary ------------------------------------------------------------
+drop function if exists drawer_cash_summary(uuid);
+create or replace function drawer_cash_summary(p_session_id uuid)
+returns table (
+  float_amount  numeric,
+  cash_sales    numeric,
+  cash_refunds  numeric,
+  expected_cash numeric,
+  check_sales   numeric,
+  check_refunds numeric
+)
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  with paid as (
+    select sp.method, sp.amount
+      from sale_payments sp join sales s on s.id = sp.sale_id
+     where s.drawer_session_id = p_session_id and sp.method in ('cash', 'check')
+  ),
+  given_back as (
+    select rp.method, rp.amount
+      from refund_payments rp join refunds r on r.id = rp.refund_id
+     where r.drawer_session_id = p_session_id and rp.method in ('cash', 'check')
+  ),
+  totals as (
+    select ds.float_amount,
+           coalesce((select sum(amount) from paid where method = 'cash'), 0) as cash_sales,
+           coalesce((select sum(amount) from given_back where method = 'cash'), 0) as cash_refunds,
+           coalesce((select sum(amount) from paid where method = 'check'), 0) as check_sales,
+           coalesce((select sum(amount) from given_back where method = 'check'), 0) as check_refunds
+      from drawer_sessions ds
+     where ds.id = p_session_id
+  )
+  select t.float_amount, t.cash_sales, t.cash_refunds,
+         t.float_amount + t.cash_sales - t.cash_refunds,
+         t.check_sales, t.check_refunds
+    from totals t;
+$$;
+revoke all on function drawer_cash_summary(uuid) from public, anon;
+grant execute on function drawer_cash_summary(uuid) to authenticated;
+
+-- 5. Expected cash saved at the close -------------------------------------------------
+alter table drawer_sessions add column if not exists expected_cash numeric(12, 2);
+comment on column drawer_sessions.expected_cash is
+  'Cash the drawer should have held at the close: float + cash taken − cash given back (0109)';
+
+-- close_drawer — same as 0108, and saves the expected cash.
+create or replace function close_drawer(p_session_id uuid, p_counts jsonb, p_note text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_session drawer_sessions%rowtype;
+begin
+  perform require_staff();
+  select * into v_session from drawer_sessions where id = p_session_id for update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_session.closed_at is not null then
+    raise exception 'This drawer has already been closed' using errcode = '22023';
+  end if;
+
+  update drawer_sessions
+     set closed_at = now(),
+         closed_by = auth.uid(),
+         counted_counts = p_counts,
+         counted_cash = drawer_count_total(p_counts),
+         expected_cash = (select s.expected_cash from drawer_cash_summary(p_session_id) s),
+         close_note = nullif(btrim(p_note), '')
+   where id = p_session_id;
+end;
+$$;
+revoke all on function close_drawer(uuid, jsonb, text) from public, anon;
+grant execute on function close_drawer(uuid, jsonb, text) to authenticated;
+
+-- >>> supabase/migrations/0110_paid_ins_and_outs.sql
+-- =============================================================================
+-- 0110_paid_ins_and_outs.sql — cash put into or taken out of a drawer outside a
+-- sale (AceStock, Phase 4B)
+--
+-- Adds:
+--   1. drawer_movements (append-only): a paid-in (e.g. change brought from the
+--      bank) or paid-out (e.g. stamps bought with drawer cash) on an open
+--      drawer session, with an optional reason; who and when.
+--   2. record_drawer_movement(session, kind, amount, reason) — only on an open
+--      drawer, and a paid-out can't take more than the drawer should hold. A
+--      reason is never required (0093).
+--   3. drawer_cash_summary(session) gains paid_in and paid_out, and expected
+--      cash counts them: float + cash taken − cash given back + paid-ins −
+--      paid-outs. close_drawer saves that, unchanged.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. drawer_movements -------------------------------------------------------------
+create table if not exists drawer_movements (
+  id                uuid primary key default gen_random_uuid(),
+  drawer_session_id uuid not null references drawer_sessions (id),
+  kind              text not null check (kind in ('paid_in', 'paid_out')),
+  amount            numeric(12, 2) not null check (amount > 0),
+  reason            text check (char_length(reason) <= 200),
+  user_id           uuid default auth.uid() references profiles (id),
+  created_at        timestamptz not null default now()
+);
+comment on table drawer_movements is 'Cash paid into or out of a drawer outside a sale; append-only (0110)';
+create index if not exists idx_drawer_movements_session on drawer_movements (drawer_session_id);
+
+alter table drawer_movements enable row level security;
+drop policy if exists drawer_movements_staff_select on drawer_movements;
+create policy drawer_movements_staff_select on drawer_movements for select to authenticated using (is_staff());
+revoke all on drawer_movements from anon, authenticated;
+grant select on drawer_movements to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on drawer_movements;
+create trigger trg_enforce_staff_writer before insert or update or delete on drawer_movements
+  for each statement execute function enforce_staff_writer();
+
+-- 3 (first, as record_drawer_movement uses it). drawer_cash_summary ------------
+drop function if exists drawer_cash_summary(uuid);
+create or replace function drawer_cash_summary(p_session_id uuid)
+returns table (
+  float_amount  numeric,
+  cash_sales    numeric,
+  cash_refunds  numeric,
+  paid_in       numeric,
+  paid_out      numeric,
+  expected_cash numeric,
+  check_sales   numeric,
+  check_refunds numeric
+)
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  with paid as (
+    select sp.method, sp.amount
+      from sale_payments sp join sales s on s.id = sp.sale_id
+     where s.drawer_session_id = p_session_id and sp.method in ('cash', 'check')
+  ),
+  given_back as (
+    select rp.method, rp.amount
+      from refund_payments rp join refunds r on r.id = rp.refund_id
+     where r.drawer_session_id = p_session_id and rp.method in ('cash', 'check')
+  ),
+  moved as (
+    select m.kind, m.amount from drawer_movements m where m.drawer_session_id = p_session_id
+  ),
+  totals as (
+    select ds.float_amount,
+           coalesce((select sum(amount) from paid where method = 'cash'), 0) as cash_sales,
+           coalesce((select sum(amount) from given_back where method = 'cash'), 0) as cash_refunds,
+           coalesce((select sum(amount) from moved where kind = 'paid_in'), 0) as paid_in,
+           coalesce((select sum(amount) from moved where kind = 'paid_out'), 0) as paid_out,
+           coalesce((select sum(amount) from paid where method = 'check'), 0) as check_sales,
+           coalesce((select sum(amount) from given_back where method = 'check'), 0) as check_refunds
+      from drawer_sessions ds
+     where ds.id = p_session_id
+  )
+  select t.float_amount, t.cash_sales, t.cash_refunds, t.paid_in, t.paid_out,
+         t.float_amount + t.cash_sales - t.cash_refunds + t.paid_in - t.paid_out,
+         t.check_sales, t.check_refunds
+    from totals t;
+$$;
+revoke all on function drawer_cash_summary(uuid) from public, anon;
+grant execute on function drawer_cash_summary(uuid) to authenticated;
+
+-- 2. record_drawer_movement ---------------------------------------------------------
+create or replace function record_drawer_movement(
+  p_session_id uuid,
+  p_kind       text,
+  p_amount     numeric,
+  p_reason     text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_closed_at timestamptz;
+  v_expected  numeric;
+  v_id        uuid;
+begin
+  perform require_staff();
+  if p_kind is null or p_kind not in ('paid_in', 'paid_out') then
+    raise exception 'Choose paid in or paid out' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Enter an amount over $0' using errcode = '22023';
+  end if;
+  if p_amount <> round(p_amount, 2) then
+    raise exception 'Use at most 2 decimal places' using errcode = '22023';
+  end if;
+  if char_length(btrim(p_reason)) > 200 then
+    raise exception 'Keep the reason to 200 characters' using errcode = '22023';
+  end if;
+
+  -- A share lock: waits for a close in progress, and keeps the drawer open
+  -- until this is recorded.
+  select closed_at into v_closed_at from drawer_sessions where id = p_session_id for share;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_closed_at is not null then
+    raise exception 'This drawer has been closed' using errcode = '22023';
+  end if;
+  if p_kind = 'paid_out' then
+    select s.expected_cash into v_expected from drawer_cash_summary(p_session_id) s;
+    if p_amount > v_expected then
+      raise exception 'The drawer should only hold %', to_char(v_expected, 'FM$999,999,990.00')
+        using errcode = '22023';
+    end if;
+  end if;
+
+  insert into drawer_movements (drawer_session_id, kind, amount, reason)
+  values (p_session_id, p_kind, p_amount, nullif(btrim(p_reason), ''))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function record_drawer_movement(uuid, text, numeric, text) from public, anon;
+grant execute on function record_drawer_movement(uuid, text, numeric, text) to authenticated;
+
+-- >>> supabase/migrations/0111_daily_report.sql
+-- =============================================================================
+-- 0111_daily_report.sql — the daily (X / Z) report (AceStock, Phase 4B)
+--
+-- Adds:
+--   1. daily_money_amounts(from, to, time zone) — each day's money, signed as
+--      in the QuickBooks summary (0101): what was taken by each payment type
+--      (+) and given back (−); items, stringing and gift cards sold (−) and
+--      returned (+); tax charged (−) and refunded (+). Each row says whether
+--      it came from a sale or a refund. Moved out of report_daily_summary,
+--      which now reads it (same output; test 65 unchanged).
+--   2. report_day(day) — one business day (the shop's time zone, 0108) as a
+--      JSON report for printing: sales and refunds (counts, items, gift cards,
+--      tax, totals), exchange credit, totals by payment type (taken, given
+--      back, net), sales by category, and each drawer opened that day (float,
+--      cash in and out, paid-ins and -outs, expected, counted, over/short).
+--      Any staff member can print it (they close the day); it reads with the
+--      caller's rights.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. daily_money_amounts ----------------------------------------------------------
+drop function if exists daily_money_amounts(timestamptz, timestamptz, text);
+create or replace function daily_money_amounts(p_from timestamptz, p_to timestamptz, p_time_zone text)
+returns table (
+  d      date,
+  source text,
+  what   text,
+  amt    numeric
+)
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  with s as (
+    select x.id, (x.sold_at at time zone p_time_zone)::date as d, x.tax
+      from sales x where x.sold_at >= p_from and x.sold_at < p_to
+  ),
+  r as (
+    select x.id, (x.refunded_at at time zone p_time_zone)::date as d, x.tax
+      from refunds x where x.refunded_at >= p_from and x.refunded_at < p_to
+  )
+  -- Positive amounts are debits, negative credits.
+  select s.d, 'sale', sp.method, sp.amount
+    from sale_payments sp join s on s.id = sp.sale_id
+   where sp.method <> 'exchange'
+  union all
+  select r.d, 'refund', rp.method, -rp.amount
+    from refund_payments rp join r on r.id = rp.refund_id
+   where rp.method <> 'exchange'
+  union all
+  select s.d, 'sale',
+         case when sl.gift_card_id is not null then 'gift_card_sold'
+              when sl.product_id is null then 'stringing'
+              else 'sales:' || coalesce(c.name, '(no category)') end,
+         -(sl.qty * sl.unit_price)
+    from sale_lines sl join s on s.id = sl.sale_id
+    left join products p on p.id = sl.product_id
+    left join categories c on c.id = p.category_id
+  union all
+  select r.d, 'refund',
+         case when sl.gift_card_id is not null then 'gift_card_sold'
+              when sl.product_id is null then 'stringing'
+              else 'sales:' || coalesce(c.name, '(no category)') end,
+         rl.qty * rl.unit_price
+    from refund_lines rl join r on r.id = rl.refund_id
+    join sale_lines sl on sl.id = rl.sale_line_id
+    left join products p on p.id = sl.product_id
+    left join categories c on c.id = p.category_id
+  union all
+  select s.d, 'sale', 'tax', -s.tax from s
+  union all
+  select r.d, 'refund', 'tax', r.tax from r;
+$$;
+revoke all on function daily_money_amounts(timestamptz, timestamptz, text) from public, anon;
+grant execute on function daily_money_amounts(timestamptz, timestamptz, text) to authenticated;
+
+-- report_daily_summary — same as 0101, reading daily_money_amounts --------------
+drop function if exists report_daily_summary(timestamptz, timestamptz, text);
+create or replace function report_daily_summary(p_from timestamptz, p_to timestamptz, p_time_zone text)
+returns table (
+  day     date,
+  line_no integer,
+  account text,
+  debit   numeric,
+  credit  numeric,
+  memo    text
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+declare
+  v settings%rowtype;
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+  if p_time_zone is null or not exists (select 1 from pg_timezone_names where name = p_time_zone) then
+    raise exception 'Unknown time zone: %', coalesce(p_time_zone, '(none)')
+      using errcode = '22023';
+  end if;
+  select * into v from settings where id;
+
+  return query
+  with amounts as (
+    select a.d, a.what, a.amt from daily_money_amounts(p_from, p_to, p_time_zone) a
+  ),
+  named as (
+    select a.d,
+           case a.what
+             when 'cash'           then v.qb_cash_account
+             when 'credit'         then v.qb_card_account
+             when 'check'          then v.qb_check_account
+             when 'gift_card'      then v.qb_gift_card_account
+             when 'gift_card_sold' then v.qb_gift_card_account
+             when 'store_credit'   then v.qb_store_credit_account
+             when 'tax'            then v.qb_sales_tax_account
+             when 'stringing'      then v.qb_stringing_account
+             else v.qb_sales_account
+           end as acct,
+           case a.what
+             when 'cash'           then 'Cash'
+             when 'credit'         then 'Card'
+             when 'check'          then 'Checks'
+             when 'gift_card'      then 'Paid by gift card'
+             when 'gift_card_sold' then 'Gift cards sold'
+             when 'store_credit'   then 'Paid by store credit'
+             when 'tax'            then 'Sales tax'
+             when 'stringing'      then 'Stringing'
+             else 'Sales: ' || substr(a.what, 7)
+           end as note,
+           case a.what
+             when 'cash' then 1 when 'credit' then 2 when 'check' then 3
+             when 'gift_card' then 4 when 'store_credit' then 5
+             when 'stringing' then 7 when 'gift_card_sold' then 8 when 'tax' then 9
+             else 6
+           end as ord,
+           a.amt
+      from amounts a
+  ),
+  summed as (
+    select n.d, n.acct, n.note, min(n.ord) as ord, sum(n.amt) as total
+      from named n
+     group by n.d, n.acct, n.note
+    having sum(n.amt) <> 0
+  )
+  select x.d,
+         (row_number() over (partition by x.d order by x.ord, x.note))::int,
+         x.acct,
+         case when x.total > 0 then x.total end,
+         case when x.total < 0 then -x.total end,
+         x.note
+    from summed x
+   order by x.d, 2;
+end;
+$$;
+
+revoke all on function report_daily_summary(timestamptz, timestamptz, text) from public, anon;
+grant execute on function report_daily_summary(timestamptz, timestamptz, text) to authenticated;
+
+-- 2. report_day ------------------------------------------------------------------
+drop function if exists report_day(date);
+create or replace function report_day(p_day date)
+returns jsonb
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_zone   text;
+  v_from   timestamptz;
+  v_to     timestamptz;
+  v_result jsonb;
+begin
+  perform require_staff();
+  if p_day is null then
+    raise exception 'Choose a day' using errcode = '22023';
+  end if;
+  select time_zone into v_zone from settings where id;
+  if v_zone is null then
+    raise exception 'An admin needs to set the shop''s time zone in Settings first' using errcode = '22023';
+  end if;
+  v_from := p_day::timestamp at time zone v_zone;
+  v_to := (p_day + 1)::timestamp at time zone v_zone;
+
+  with a as (
+    select * from daily_money_amounts(v_from, v_to, v_zone)
+  ),
+  is_item as (
+    select a.*, (a.what = 'stringing' or a.what like 'sales:%') as item from a
+  ),
+  methods(method, label, ord) as (
+    values ('cash', 'Cash', 1), ('credit', 'Card', 2), ('check', 'Check', 3),
+           ('gift_card', 'Gift card', 4), ('store_credit', 'Store credit', 5)
+  ),
+  payments as (
+    select m.method, m.label, m.ord,
+           coalesce(sum(a.amt) filter (where a.source = 'sale'), 0) as taken,
+           coalesce(-sum(a.amt) filter (where a.source = 'refund'), 0) as given_back
+      from methods m left join a on a.what = m.method
+     group by m.method, m.label, m.ord
+  ),
+  categories as (
+    select case when what = 'stringing' then 'Stringing' else substr(what, 7) end as name,
+           -coalesce(sum(amt) filter (where source = 'sale'), 0) as sold,
+           coalesce(sum(amt) filter (where source = 'refund'), 0) as returned
+      from is_item where item
+     group by 1
+  ),
+  sessions as (
+    select dr.name as drawer_name, ds.opened_at, ds.closed_at, ds.counted_cash,
+           -- An open drawer's expected cash is worked out now; a closed one's as saved.
+           coalesce(ds.expected_cash, x.expected_cash) as expected,
+           x.float_amount, x.cash_sales, x.cash_refunds, x.paid_in, x.paid_out
+      from drawer_sessions ds
+      join drawers dr on dr.id = ds.drawer_id
+      cross join lateral drawer_cash_summary(ds.id) x
+     where ds.business_day = p_day
+  )
+  select jsonb_build_object(
+    'day', p_day,
+    'time_zone', v_zone,
+    'sales', jsonb_build_object(
+      'count', (select count(*) from sales where sold_at >= v_from and sold_at < v_to),
+      'items', coalesce((select -sum(amt) from is_item where source = 'sale' and item), 0),
+      'gift_cards', coalesce((select -sum(amt) from a where source = 'sale' and what = 'gift_card_sold'), 0),
+      'tax', coalesce((select -sum(amt) from a where source = 'sale' and what = 'tax'), 0)),
+    'refunds', jsonb_build_object(
+      'count', (select count(*) from refunds where refunded_at >= v_from and refunded_at < v_to),
+      'items', coalesce((select sum(amt) from is_item where source = 'refund' and item), 0),
+      'gift_cards', coalesce((select sum(amt) from a where source = 'refund' and what = 'gift_card_sold'), 0),
+      'tax', coalesce((select sum(amt) from a where source = 'refund' and what = 'tax'), 0)),
+    'exchanges', jsonb_build_object(
+      'count', (select count(*) from exchanges where created_at >= v_from and created_at < v_to),
+      'credit', coalesce((select sum(credit) from exchanges where created_at >= v_from and created_at < v_to), 0)),
+    'payments', coalesce((
+      select jsonb_agg(jsonb_build_object('method', method, 'label', label, 'taken', taken,
+                                          'given_back', given_back, 'net', taken - given_back) order by ord)
+        from payments where taken <> 0 or given_back <> 0), '[]'::jsonb),
+    'categories', coalesce((
+      select jsonb_agg(jsonb_build_object('name', name, 'sold', sold, 'returned', returned, 'net', sold - returned)
+                       order by name)
+        from categories), '[]'::jsonb),
+    'drawers', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'drawer', drawer_name, 'opened_at', opened_at, 'closed_at', closed_at,
+               'float', float_amount, 'cash_sales', cash_sales, 'cash_refunds', cash_refunds,
+               'paid_in', paid_in, 'paid_out', paid_out, 'expected', expected,
+               'counted', counted_cash, 'over_short', counted_cash - expected)
+             order by drawer_name, opened_at)
+        from sessions), '[]'::jsonb)
+  ) into v_result;
+  return v_result;
+end;
+$$;
+revoke all on function report_day(date) from public, anon;
+grant execute on function report_day(date) to authenticated;
+
+-- >>> supabase/migrations/0112_day_close.sql
+-- =============================================================================
+-- 0112_day_close.sql — closing a business day, and keeping it closed
+-- (AceStock, Phase 4B)
+--
+-- Adds:
+--   1. day_closes — each close of a business day: who and when, and the daily
+--      report as it stood (report_day, 0111), so the Z report reprints the
+--      same. A day reopened by an admin keeps its row (reopened_at/by, an
+--      optional reason); closing it again adds a new row. One open close per
+--      day.
+--   2. close_day(day) — any staff member, once every drawer opened on or
+--      before that day is closed; not a day still to come.
+--   3. reopen_day(day, reason) — admins only; the reason is optional (0093).
+--   4. A closed day is locked: no new sale, refund (or exchange), gift card
+--      or store credit change, drawer opened, or paid-in/out dated that day
+--      in the shop's time zone. Stock, string jobs, customers and products
+--      aren't affected, and a sale from a closed day can still be refunded
+--      (the refund is dated today).
+--   Closing takes a lock that every locked write shares, so a write either
+--   finishes first and is in the day's report, or waits and is refused.
+--
+-- Re-runnable.
+-- =============================================================================
+
+-- 1. day_closes ---------------------------------------------------------------------
+create table if not exists day_closes (
+  id            uuid primary key default gen_random_uuid(),
+  business_day  date not null,
+  closed_at     timestamptz not null default now(),
+  closed_by     uuid default auth.uid() references profiles (id),
+  report        jsonb not null,
+  reopened_at   timestamptz,
+  reopened_by   uuid references profiles (id),
+  reopen_reason text check (char_length(reopen_reason) <= 500)
+);
+comment on table day_closes is 'Each close of a business day, with its daily report as closed (0112)';
+create unique index if not exists uq_day_closes_closed on day_closes (business_day) where reopened_at is null;
+
+alter table day_closes enable row level security;
+drop policy if exists day_closes_staff_select on day_closes;
+create policy day_closes_staff_select on day_closes for select to authenticated using (is_staff());
+revoke all on day_closes from anon, authenticated;
+grant select on day_closes to authenticated;
+
+drop trigger if exists trg_enforce_staff_writer on day_closes;
+create trigger trg_enforce_staff_writer before insert or update or delete on day_closes
+  for each statement execute function enforce_staff_writer();
+
+-- The lock closing takes (exclusive) and locked writes share.
+create or replace function day_close_lock_key()
+returns bigint
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select hashtextextended('acestock.day_close', 0);
+$$;
+revoke all on function day_close_lock_key() from public, anon, authenticated;
+
+-- 2. close_day ----------------------------------------------------------------------
+create or replace function close_day(p_day date)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_open text;
+  v_id   uuid;
+begin
+  perform require_staff();
+  if p_day is null then
+    raise exception 'Choose a day' using errcode = '22023';
+  end if;
+  if p_day > shop_day(now()) then
+    raise exception 'A day can''t be closed before it has started' using errcode = '22023';
+  end if;
+  perform pg_advisory_xact_lock(day_close_lock_key());
+
+  if exists (select 1 from day_closes where business_day = p_day and reopened_at is null) then
+    raise exception 'That day is already closed' using errcode = '22023';
+  end if;
+  select string_agg(dr.name, ', ' order by dr.name) into v_open
+    from drawer_sessions ds join drawers dr on dr.id = ds.drawer_id
+   where ds.closed_at is null and ds.business_day <= p_day;
+  if v_open is not null then
+    raise exception 'Count and close every drawer first (still open: %)', v_open using errcode = '22023';
+  end if;
+
+  insert into day_closes (business_day, report)
+  values (p_day, report_day(p_day))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function close_day(date) from public, anon;
+grant execute on function close_day(date) to authenticated;
+
+-- 3. reopen_day -----------------------------------------------------------------------
+create or replace function reopen_day(p_day date, p_reason text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  perform require_staff();
+  if auth.uid() is not null and not is_admin() then
+    raise exception 'Only an admin can reopen a closed day' using errcode = '42501';
+  end if;
+  if char_length(btrim(p_reason)) > 500 then
+    raise exception 'Keep the reason to 500 characters' using errcode = '22023';
+  end if;
+  perform pg_advisory_xact_lock(day_close_lock_key());
+
+  update day_closes
+     set reopened_at = now(),
+         reopened_by = auth.uid(),
+         reopen_reason = nullif(btrim(p_reason), '')
+   where business_day = p_day and reopened_at is null;
+  if not found then
+    raise exception 'That day isn''t closed' using errcode = '22023';
+  end if;
+end;
+$$;
+revoke all on function reopen_day(date, text) from public, anon;
+grant execute on function reopen_day(date, text) to authenticated;
+
+-- 4. Closed days are locked -------------------------------------------------------
+-- Whether a business day is closed now.
+create or replace function is_day_closed(p_day date)
+returns boolean
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select exists (select 1 from day_closes where business_day = p_day and reopened_at is null);
+$$;
+revoke all on function is_day_closed(date) from public, anon;
+grant execute on function is_day_closed(date) to authenticated;
+
+-- Refuses a row dated on a closed day. The trigger's argument names the row's
+-- date: a timestamp column (its day in the shop's time zone) or a date column.
+create or replace function guard_closed_day()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_zone  text;
+  v_value text := to_jsonb(new) ->> tg_argv[0];
+  v_day   date;
+begin
+  select time_zone into v_zone from settings where id;
+  if v_zone is null or v_value is null then
+    return new;  -- no days can be closed without the shop's time zone
+  end if;
+  perform pg_advisory_xact_lock_shared(day_close_lock_key());
+  if v_value ~ '^\d{4}-\d{2}-\d{2}$' then
+    v_day := v_value::date;
+  else
+    v_day := (v_value::timestamptz at time zone v_zone)::date;
+  end if;
+  if is_day_closed(v_day) then
+    raise exception 'That business day (%) has been closed. An admin can reopen it on the End of Day screen',
+      to_char(v_day, 'FMDy FMMon FMDD')
+      using errcode = '22023';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_closed_day() from public, anon, authenticated;
+
+drop trigger if exists trg_sales_closed_day on sales;
+create trigger trg_sales_closed_day before insert on sales
+  for each row execute function guard_closed_day('sold_at');
+drop trigger if exists trg_refunds_closed_day on refunds;
+create trigger trg_refunds_closed_day before insert on refunds
+  for each row execute function guard_closed_day('refunded_at');
+drop trigger if exists trg_gift_card_txns_closed_day on gift_card_txns;
+create trigger trg_gift_card_txns_closed_day before insert on gift_card_txns
+  for each row execute function guard_closed_day('created_at');
+drop trigger if exists trg_store_credit_txns_closed_day on store_credit_txns;
+create trigger trg_store_credit_txns_closed_day before insert on store_credit_txns
+  for each row execute function guard_closed_day('created_at');
+drop trigger if exists trg_drawer_sessions_closed_day on drawer_sessions;
+create trigger trg_drawer_sessions_closed_day before insert on drawer_sessions
+  for each row execute function guard_closed_day('business_day');
+drop trigger if exists trg_drawer_movements_closed_day on drawer_movements;
+create trigger trg_drawer_movements_closed_day before insert on drawer_movements
+  for each row execute function guard_closed_day('created_at');
+
+-- >>> supabase/migrations/0113_drawer_review_fixes.sql
+-- =============================================================================
+-- 0113_drawer_review_fixes.sql — drawer fixes from the 4B review (AceStock)
+--
+--   1. A register's drawer counts only while it's a drawer in use: a drawer id
+--      that's out of use, or no longer exists, is ignored (review 1).
+--   2. A register that names no drawer only falls back to an open drawer when
+--      the shop has just one drawer in use, so its cash can't land in another
+--      register's drawer (review 3).
+--   3. A drawer can't be taken out of use while it's open, so it can always be
+--      counted and closed, and the day closed (review 2).
+--   4. Paid-ins and paid-outs take the drawer one at a time (a no-key-update
+--      lock: sales still go on), so two paid-outs at once can't both pass the
+--      "enough cash" check (review 11).
+--
+-- register_drawer_session and check_cash_drawer are as in 0109 except where
+-- marked; record_drawer_movement as in 0110 except its lock. Re-runnable.
+-- =============================================================================
+
+-- The drawer the register names, if it's a drawer in use (review 1).
+create or replace function requested_drawer_id()
+returns uuid
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_value text;
+  v_id    uuid;
+begin
+  v_value := nullif(current_setting('request.headers', true), '')::json ->> 'x-acestock-drawer';
+  if v_value !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return null;
+  end if;
+  select id into v_id from drawers where id = v_value::uuid and is_active;
+  return v_id;
+end;
+$$;
+revoke all on function requested_drawer_id() from public, anon, authenticated;
+
+-- The open session the register's cash goes to: its named drawer's, else the
+-- only drawer in use's (review 2); null if neither. Locked as in 0109.
+create or replace function register_drawer_session()
+returns uuid
+language plpgsql
+volatile
+set search_path = public, pg_temp
+as $$
+declare
+  v_drawer uuid := requested_drawer_id();
+  v_ids    uuid[];
+begin
+  if v_drawer is null then
+    select array_agg(id) into v_ids from (select id from drawers where is_active limit 2) d;
+    if cardinality(v_ids) = 1 then
+      v_drawer := v_ids[1];
+    end if;
+  end if;
+  if v_drawer is null then
+    return null;
+  end if;
+  select array_agg(id) into v_ids
+    from (select id from drawer_sessions where drawer_id = v_drawer and closed_at is null for key share) s;
+  return v_ids[1];
+end;
+$$;
+revoke all on function register_drawer_session() from public, anon, authenticated;
+
+create or replace function check_cash_drawer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_session uuid;
+  v_action  text;
+  v_drawer  drawers%rowtype;
+begin
+  if new.method <> 'cash' or not coalesce((select cash_needs_drawer from settings where id), false) then
+    return new;
+  end if;
+  if tg_table_name = 'sale_payments' then
+    select drawer_session_id into v_session from sales where id = new.sale_id;
+    v_action := 'taking cash';
+  else
+    select drawer_session_id into v_session from refunds where id = new.refund_id;
+    v_action := 'giving cash back';
+  end if;
+  if v_session is not null then
+    return new;
+  end if;
+
+  -- The register's drawer: the one it names, else the only one in use (review 2).
+  select * into v_drawer from drawers where id = requested_drawer_id();
+  if not found and (select count(*) from drawers where is_active) = 1 then
+    select * into v_drawer from drawers where is_active;
+  end if;
+  if v_drawer.id is not null then
+    raise exception 'Open % on the Cash drawer screen before %', v_drawer.name, v_action using errcode = '22023';
+  end if;
+  if exists (select 1 from drawers where is_active) then
+    raise exception 'Choose this register''s drawer on the Cash drawer screen before %', v_action using errcode = '22023';
+  end if;
+  raise exception 'Add a cash drawer in Settings before %', v_action using errcode = '22023';
+end;
+$$;
+revoke all on function check_cash_drawer() from public, anon, authenticated;
+
+-- 3. A drawer stays in use while it's open (review 2).
+create or replace function guard_open_drawer_in_use()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if old.is_active and not new.is_active
+     and exists (select 1 from drawer_sessions where drawer_id = new.id and closed_at is null) then
+    raise exception 'Count and close % before taking it out of use', new.name using errcode = '22023';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_open_drawer_in_use() from public, anon, authenticated;
+
+drop trigger if exists trg_drawers_open_in_use on drawers;
+create trigger trg_drawers_open_in_use before update of is_active on drawers
+  for each row execute function guard_open_drawer_in_use();
+
+-- 4. record_drawer_movement — same as 0110, with a no-key-update lock.
+create or replace function record_drawer_movement(
+  p_session_id uuid,
+  p_kind       text,
+  p_amount     numeric,
+  p_reason     text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_closed_at timestamptz;
+  v_expected  numeric;
+  v_id        uuid;
+begin
+  perform require_staff();
+  if p_kind is null or p_kind not in ('paid_in', 'paid_out') then
+    raise exception 'Choose paid in or paid out' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Enter an amount over $0' using errcode = '22023';
+  end if;
+  if p_amount <> round(p_amount, 2) then
+    raise exception 'Use at most 2 decimal places' using errcode = '22023';
+  end if;
+  if char_length(btrim(p_reason)) > 200 then
+    raise exception 'Keep the reason to 200 characters' using errcode = '22023';
+  end if;
+
+  -- One paid-in or paid-out at a time per drawer (review 11), and none while
+  -- it's being closed; sales (key share) aren't held up.
+  select closed_at into v_closed_at from drawer_sessions where id = p_session_id for no key update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_closed_at is not null then
+    raise exception 'This drawer has been closed' using errcode = '22023';
+  end if;
+  if p_kind = 'paid_out' then
+    select s.expected_cash into v_expected from drawer_cash_summary(p_session_id) s;
+    if p_amount > v_expected then
+      raise exception 'The drawer should only hold %', to_char(v_expected, 'FM$999,999,990.00')
+        using errcode = '22023';
+    end if;
+  end if;
+
+  insert into drawer_movements (drawer_session_id, kind, amount, reason)
+  values (p_session_id, p_kind, p_amount, nullif(btrim(p_reason), ''))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function record_drawer_movement(uuid, text, numeric, text) from public, anon;
+grant execute on function record_drawer_movement(uuid, text, numeric, text) to authenticated;
+
+-- >>> supabase/migrations/0114_drawers_wait_for_time_zone.sql
+-- =============================================================================
+-- 0114_drawers_wait_for_time_zone.sql — setting up can't stop cash sales
+-- (AceStock, 4B review 7)
+--
+-- "Cash needs an open drawer" is on by default (0109), but a drawer can't be
+-- opened until an admin sets the shop's time zone. Released as it was, every
+-- cash sale and cash refund would be refused until then. Now the check starts
+-- once the time zone is set; until then cash goes through, in no drawer.
+--
+-- check_cash_drawer is as in 0113 apart from that. Re-runnable.
+-- =============================================================================
+
+create or replace function check_cash_drawer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_session uuid;
+  v_action  text;
+  v_drawer  drawers%rowtype;
+begin
+  -- Drawers start once the shop's time zone is set (a drawer can't be opened
+  -- without it), so a new install or release never stops cash sales.
+  if new.method <> 'cash'
+     or not coalesce((select cash_needs_drawer and time_zone is not null from settings where id), false) then
+    return new;
+  end if;
+  if tg_table_name = 'sale_payments' then
+    select drawer_session_id into v_session from sales where id = new.sale_id;
+    v_action := 'taking cash';
+  else
+    select drawer_session_id into v_session from refunds where id = new.refund_id;
+    v_action := 'giving cash back';
+  end if;
+  if v_session is not null then
+    return new;
+  end if;
+
+  -- The register's drawer: the one it names, else the only one in use (review 2).
+  select * into v_drawer from drawers where id = requested_drawer_id();
+  if not found and (select count(*) from drawers where is_active) = 1 then
+    select * into v_drawer from drawers where is_active;
+  end if;
+  if v_drawer.id is not null then
+    raise exception 'Open % on the Cash drawer screen before %', v_drawer.name, v_action using errcode = '22023';
+  end if;
+  if exists (select 1 from drawers where is_active) then
+    raise exception 'Choose this register''s drawer on the Cash drawer screen before %', v_action using errcode = '22023';
+  end if;
+  raise exception 'Add a cash drawer in Settings before %', v_action using errcode = '22023';
+end;
+$$;
+revoke all on function check_cash_drawer() from public, anon, authenticated;
+
+-- >>> supabase/migrations/0115_day_close_review_fixes.sql
+-- =============================================================================
+-- 0115_day_close_review_fixes.sql — closing the right day, and keeping it
+-- closed (AceStock, 4B review 4, 6, 9, 10, 13)
+--
+--   1. unclosed_days(days) — the days in the last `days` (31) with sales,
+--      refunds or drawers and no close, plus today if it isn't closed; End of
+--      Day offers each, oldest first, so a close after midnight can pick the
+--      day it means (review 4, 6).
+--   2. Each close saves the exact moments its day ran from and to, and the
+--      lock checks those: changing the time zone later can't move or lift a
+--      closed day (review 9). The shop's time zone can't be cleared once set,
+--      or changed while a drawer is open.
+--   3. A drawer left open from an earlier day takes no new cash, paid-ins or
+--      paid-outs until it's counted and closed (review 10), so each drawer's
+--      count belongs to one business day.
+--
+-- register_drawer_session (0113), check_cash_drawer (0114) and
+-- record_drawer_movement (0113) are as before except where marked; close_day
+-- and guard_closed_day as in 0112 except where marked. Re-runnable.
+-- =============================================================================
+
+-- 2. The time each close covers -----------------------------------------------------
+alter table day_closes add column if not exists closed_from timestamptz;
+alter table day_closes add column if not exists closed_to   timestamptz;
+update day_closes c
+   set closed_from = c.business_day::timestamp at time zone s.time_zone,
+       closed_to = (c.business_day + 1)::timestamp at time zone s.time_zone
+  from settings s
+ where s.id and c.closed_from is null and s.time_zone is not null;
+comment on column day_closes.closed_from is 'When the closed business day began, in the shop''s time zone at the close (0115)';
+comment on column day_closes.closed_to is 'When it ended (exclusive)';
+
+create or replace function close_day(p_day date)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_open text;
+  v_zone text;
+  v_id   uuid;
+begin
+  perform require_staff();
+  if p_day is null then
+    raise exception 'Choose a day' using errcode = '22023';
+  end if;
+  if p_day > shop_day(now()) then
+    raise exception 'A day can''t be closed before it has started' using errcode = '22023';
+  end if;
+  perform pg_advisory_xact_lock(day_close_lock_key());
+
+  if exists (select 1 from day_closes where business_day = p_day and reopened_at is null) then
+    raise exception 'That day is already closed' using errcode = '22023';
+  end if;
+  select string_agg(dr.name, ', ' order by dr.name) into v_open
+    from drawer_sessions ds join drawers dr on dr.id = ds.drawer_id
+   where ds.closed_at is null and ds.business_day <= p_day;
+  if v_open is not null then
+    raise exception 'Count and close every drawer first (still open: %)', v_open using errcode = '22023';
+  end if;
+
+  -- The moments the day ran from and to, kept with the close (review 9).
+  select time_zone into v_zone from settings where id;
+  insert into day_closes (business_day, report, closed_from, closed_to)
+  values (p_day, report_day(p_day),
+          p_day::timestamp at time zone v_zone, (p_day + 1)::timestamp at time zone v_zone)
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function close_day(date) from public, anon;
+grant execute on function close_day(date) to authenticated;
+
+-- Refuses a row dated in a closed day: a timestamp inside a close's window, or
+-- a business day that's closed (review 9: no time zone needed).
+create or replace function guard_closed_day()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_value text := to_jsonb(new) ->> tg_argv[0];
+  v_day   date;
+begin
+  if v_value is null then
+    return new;
+  end if;
+  perform pg_advisory_xact_lock_shared(day_close_lock_key());
+  if v_value ~ '^\d{4}-\d{2}-\d{2}$' then
+    select business_day into v_day from day_closes
+     where reopened_at is null and business_day = v_value::date;
+  else
+    select business_day into v_day from day_closes
+     where reopened_at is null and v_value::timestamptz >= closed_from and v_value::timestamptz < closed_to;
+  end if;
+  if v_day is not null then
+    raise exception 'That business day (%) has been closed. An admin can reopen it on the End of Day screen',
+      to_char(v_day, 'FMDy FMMon FMDD')
+      using errcode = '22023';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function guard_closed_day() from public, anon, authenticated;
+
+-- The time zone can't be cleared once set, or changed while a drawer is open.
+create or replace function check_settings_time_zone()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if new.time_zone is not null and not is_time_zone(new.time_zone) then
+    raise exception 'Unknown time zone: %', new.time_zone using errcode = '22023';
+  end if;
+  if tg_op = 'UPDATE' and new.time_zone is distinct from old.time_zone then
+    if old.time_zone is not null and new.time_zone is null then
+      raise exception 'The shop''s time zone can''t be cleared once it''s set' using errcode = '22023';
+    end if;
+    if exists (select 1 from drawer_sessions where closed_at is null) then
+      raise exception 'Count and close every drawer before changing the time zone' using errcode = '22023';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+revoke all on function check_settings_time_zone() from public, anon, authenticated;
+
+-- 3. A drawer left open from an earlier day ----------------------------------------
+-- Raises if the drawer's open session began on an earlier business day.
+create or replace function refuse_stale_drawer(p_drawer_id uuid)
+returns void
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_day  date;
+  v_name text;
+begin
+  if (select time_zone from settings where id) is null then
+    return;
+  end if;
+  select ds.business_day, dr.name into v_day, v_name
+    from drawer_sessions ds join drawers dr on dr.id = ds.drawer_id
+   where ds.drawer_id = p_drawer_id and ds.closed_at is null;
+  if v_day < shop_day(now()) then
+    raise exception '% was opened on %. Count and close it, then open it again for today',
+      v_name, to_char(v_day, 'FMDy FMMon FMDD')
+      using errcode = '22023';
+  end if;
+end;
+$$;
+revoke all on function refuse_stale_drawer(uuid) from public, anon, authenticated;
+
+create or replace function register_drawer_session()
+returns uuid
+language plpgsql
+volatile
+set search_path = public, pg_temp
+as $$
+declare
+  v_drawer uuid := requested_drawer_id();
+  v_ids    uuid[];
+begin
+  if v_drawer is null then
+    select array_agg(id) into v_ids from (select id from drawers where is_active limit 2) d;
+    if cardinality(v_ids) = 1 then
+      v_drawer := v_ids[1];
+    end if;
+  end if;
+  if v_drawer is null then
+    return null;
+  end if;
+  select array_agg(id) into v_ids
+    from (select id from drawer_sessions where drawer_id = v_drawer and closed_at is null for key share) s;
+  -- A drawer left open from an earlier day takes no new cash (review 10).
+  if v_ids[1] is not null and (select time_zone from settings where id) is not null
+     and (select business_day from drawer_sessions where id = v_ids[1]) < shop_day(now()) then
+    return null;
+  end if;
+  return v_ids[1];
+end;
+$$;
+revoke all on function register_drawer_session() from public, anon, authenticated;
+
+create or replace function check_cash_drawer()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_session uuid;
+  v_action  text;
+  v_drawer  drawers%rowtype;
+begin
+  if new.method <> 'cash'
+     or not coalesce((select cash_needs_drawer and time_zone is not null from settings where id), false) then
+    return new;
+  end if;
+  if tg_table_name = 'sale_payments' then
+    select drawer_session_id into v_session from sales where id = new.sale_id;
+    v_action := 'taking cash';
+  else
+    select drawer_session_id into v_session from refunds where id = new.refund_id;
+    v_action := 'giving cash back';
+  end if;
+  if v_session is not null then
+    return new;
+  end if;
+
+  -- The register's drawer: the one it names, else the only one in use (review 2).
+  select * into v_drawer from drawers where id = requested_drawer_id();
+  if not found and (select count(*) from drawers where is_active) = 1 then
+    select * into v_drawer from drawers where is_active;
+  end if;
+  if v_drawer.id is not null then
+    perform refuse_stale_drawer(v_drawer.id);
+    raise exception 'Open % on the Cash drawer screen before %', v_drawer.name, v_action using errcode = '22023';
+  end if;
+  if exists (select 1 from drawers where is_active) then
+    raise exception 'Choose this register''s drawer on the Cash drawer screen before %', v_action using errcode = '22023';
+  end if;
+  raise exception 'Add a cash drawer in Settings before %', v_action using errcode = '22023';
+end;
+$$;
+revoke all on function check_cash_drawer() from public, anon, authenticated;
+
+create or replace function record_drawer_movement(
+  p_session_id uuid,
+  p_kind       text,
+  p_amount     numeric,
+  p_reason     text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_closed_at timestamptz;
+  v_expected  numeric;
+  v_id        uuid;
+begin
+  perform require_staff();
+  if p_kind is null or p_kind not in ('paid_in', 'paid_out') then
+    raise exception 'Choose paid in or paid out' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Enter an amount over $0' using errcode = '22023';
+  end if;
+  if p_amount <> round(p_amount, 2) then
+    raise exception 'Use at most 2 decimal places' using errcode = '22023';
+  end if;
+  if char_length(btrim(p_reason)) > 200 then
+    raise exception 'Keep the reason to 200 characters' using errcode = '22023';
+  end if;
+
+  select closed_at into v_closed_at from drawer_sessions where id = p_session_id for no key update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_closed_at is not null then
+    raise exception 'This drawer has been closed' using errcode = '22023';
+  end if;
+  perform refuse_stale_drawer((select drawer_id from drawer_sessions where id = p_session_id));
+  if p_kind = 'paid_out' then
+    select s.expected_cash into v_expected from drawer_cash_summary(p_session_id) s;
+    if p_amount > v_expected then
+      raise exception 'The drawer should only hold %', to_char(v_expected, 'FM$999,999,990.00')
+        using errcode = '22023';
+    end if;
+  end if;
+
+  insert into drawer_movements (drawer_session_id, kind, amount, reason)
+  values (p_session_id, p_kind, p_amount, nullif(btrim(p_reason), ''))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function record_drawer_movement(uuid, text, numeric, text) from public, anon;
+grant execute on function record_drawer_movement(uuid, text, numeric, text) to authenticated;
+
+-- 1. unclosed_days --------------------------------------------------------------------
+drop function if exists unclosed_days(integer);
+create or replace function unclosed_days(p_days integer default 31)
+returns setof date
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_zone  text;
+  v_today date;
+  v_from  date;
+begin
+  perform require_staff();
+  select time_zone into v_zone from settings where id;
+  if v_zone is null then
+    return;
+  end if;
+  v_today := shop_day(now());
+  v_from := v_today - greatest(least(coalesce(p_days, 31), 366), 1) + 1;
+  return query
+  select d from (
+    select v_today as d
+    union select (sold_at at time zone v_zone)::date from sales
+     where sold_at >= v_from::timestamp at time zone v_zone
+    union select (refunded_at at time zone v_zone)::date from refunds
+     where refunded_at >= v_from::timestamp at time zone v_zone
+    union select business_day from drawer_sessions where business_day >= v_from
+  ) days
+   where d between v_from and v_today
+     and not exists (select 1 from day_closes c where c.business_day = days.d and c.reopened_at is null)
+   order by d;
+end;
+$$;
+revoke all on function unclosed_days(integer) from public, anon;
+grant execute on function unclosed_days(integer) to authenticated;
+
+-- >>> supabase/migrations/0116_report_totals_and_messages.sql
+-- =============================================================================
+-- 0116_report_totals_and_messages.sql — daily report totals on the server, and
+-- plain messages (AceStock, 4B review 14, 18)
+--
+--   1. report_day adds each side's total and the net (items, tax, total),
+--      rounded once here, so the screens add nothing up and the Z copy saved
+--      at a close carries them. A day still to come is refused.
+--   2. close_drawer refuses a note over 500 characters with a plain message
+--      (it was a raw check error); record_drawer_movement refuses an amount
+--      too large to store (it was "numeric field overflow").
+--
+-- report_day as in 0111, close_drawer as in 0109, record_drawer_movement as
+-- in 0115, except where marked. Re-runnable.
+-- =============================================================================
+
+drop function if exists report_day(date);
+create or replace function report_day(p_day date)
+returns jsonb
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_zone   text;
+  v_from   timestamptz;
+  v_to     timestamptz;
+  v_result jsonb;
+begin
+  perform require_staff();
+  if p_day is null then
+    raise exception 'Choose a day' using errcode = '22023';
+  end if;
+  select time_zone into v_zone from settings where id;
+  if v_zone is null then
+    raise exception 'An admin needs to set the shop''s time zone in Settings first' using errcode = '22023';
+  end if;
+  if p_day > shop_day(now()) then
+    raise exception 'That day hasn''t happened yet' using errcode = '22023';
+  end if;
+  v_from := p_day::timestamp at time zone v_zone;
+  v_to := (p_day + 1)::timestamp at time zone v_zone;
+
+  with a as (
+    select * from daily_money_amounts(v_from, v_to, v_zone)
+  ),
+  is_item as (
+    select a.*, (a.what = 'stringing' or a.what like 'sales:%') as item from a
+  ),
+  methods(method, label, ord) as (
+    values ('cash', 'Cash', 1), ('credit', 'Card', 2), ('check', 'Check', 3),
+           ('gift_card', 'Gift card', 4), ('store_credit', 'Store credit', 5)
+  ),
+  payments as (
+    select m.method, m.label, m.ord,
+           coalesce(sum(a.amt) filter (where a.source = 'sale'), 0) as taken,
+           coalesce(-sum(a.amt) filter (where a.source = 'refund'), 0) as given_back
+      from methods m left join a on a.what = m.method
+     group by m.method, m.label, m.ord
+  ),
+  categories as (
+    select case when what = 'stringing' then 'Stringing' else substr(what, 7) end as name,
+           -coalesce(sum(amt) filter (where source = 'sale'), 0) as sold,
+           coalesce(sum(amt) filter (where source = 'refund'), 0) as returned
+      from is_item where item
+     group by 1
+  ),
+  sessions as (
+    select dr.name as drawer_name, ds.opened_at, ds.closed_at, ds.counted_cash,
+           -- An open drawer's expected cash is worked out now; a closed one's as saved.
+           coalesce(ds.expected_cash, x.expected_cash) as expected,
+           x.float_amount, x.cash_sales, x.cash_refunds, x.paid_in, x.paid_out
+      from drawer_sessions ds
+      join drawers dr on dr.id = ds.drawer_id
+      cross join lateral drawer_cash_summary(ds.id) x
+     where ds.business_day = p_day
+  )
+  select jsonb_build_object(
+    'day', p_day,
+    'time_zone', v_zone,
+    'sales', jsonb_build_object(
+      'count', (select count(*) from sales where sold_at >= v_from and sold_at < v_to),
+      'items', coalesce((select -sum(amt) from is_item where source = 'sale' and item), 0),
+      'gift_cards', coalesce((select -sum(amt) from a where source = 'sale' and what = 'gift_card_sold'), 0),
+      'tax', coalesce((select -sum(amt) from a where source = 'sale' and what = 'tax'), 0)),
+    'refunds', jsonb_build_object(
+      'count', (select count(*) from refunds where refunded_at >= v_from and refunded_at < v_to),
+      'items', coalesce((select sum(amt) from is_item where source = 'refund' and item), 0),
+      'gift_cards', coalesce((select sum(amt) from a where source = 'refund' and what = 'gift_card_sold'), 0),
+      'tax', coalesce((select sum(amt) from a where source = 'refund' and what = 'tax'), 0)),
+    'exchanges', jsonb_build_object(
+      'count', (select count(*) from exchanges where created_at >= v_from and created_at < v_to),
+      'credit', coalesce((select sum(credit) from exchanges where created_at >= v_from and created_at < v_to), 0)),
+    'payments', coalesce((
+      select jsonb_agg(jsonb_build_object('method', method, 'label', label, 'taken', taken,
+                                          'given_back', given_back, 'net', taken - given_back) order by ord)
+        from payments where taken <> 0 or given_back <> 0), '[]'::jsonb),
+    'categories', coalesce((
+      select jsonb_agg(jsonb_build_object('name', name, 'sold', sold, 'returned', returned, 'net', sold - returned)
+                       order by name)
+        from categories), '[]'::jsonb),
+    'drawers', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'drawer', drawer_name, 'opened_at', opened_at, 'closed_at', closed_at,
+               'float', float_amount, 'cash_sales', cash_sales, 'cash_refunds', cash_refunds,
+               'paid_in', paid_in, 'paid_out', paid_out, 'expected', expected,
+               'counted', counted_cash, 'over_short', counted_cash - expected)
+             order by drawer_name, opened_at)
+        from sessions), '[]'::jsonb)
+  ) into v_result;
+
+  -- Totals, rounded here so every screen and the saved Z copy agree (review 18).
+  v_result := jsonb_set(v_result, '{sales,total}', to_jsonb(round(
+    (v_result #>> '{sales,items}')::numeric + (v_result #>> '{sales,gift_cards}')::numeric
+    + (v_result #>> '{sales,tax}')::numeric, 2)));
+  v_result := jsonb_set(v_result, '{refunds,total}', to_jsonb(round(
+    (v_result #>> '{refunds,items}')::numeric + (v_result #>> '{refunds,gift_cards}')::numeric
+    + (v_result #>> '{refunds,tax}')::numeric, 2)));
+  v_result := v_result || jsonb_build_object('net', jsonb_build_object(
+    'items', (v_result #>> '{sales,items}')::numeric - (v_result #>> '{refunds,items}')::numeric,
+    'tax', (v_result #>> '{sales,tax}')::numeric - (v_result #>> '{refunds,tax}')::numeric,
+    'total', (v_result #>> '{sales,total}')::numeric - (v_result #>> '{refunds,total}')::numeric));
+  return v_result;
+end;
+$$;
+revoke all on function report_day(date) from public, anon;
+grant execute on function report_day(date) to authenticated;
+
+create or replace function close_drawer(p_session_id uuid, p_counts jsonb, p_note text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_session drawer_sessions%rowtype;
+begin
+  perform require_staff();
+  select * into v_session from drawer_sessions where id = p_session_id for update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_session.closed_at is not null then
+    raise exception 'This drawer has already been closed' using errcode = '22023';
+  end if;
+  if char_length(btrim(p_note)) > 500 then
+    raise exception 'Keep the note to 500 characters' using errcode = '22023';
+  end if;
+
+  update drawer_sessions
+     set closed_at = now(),
+         closed_by = auth.uid(),
+         counted_counts = p_counts,
+         counted_cash = drawer_count_total(p_counts),
+         expected_cash = (select s.expected_cash from drawer_cash_summary(p_session_id) s),
+         close_note = nullif(btrim(p_note), '')
+   where id = p_session_id;
+end;
+$$;
+revoke all on function close_drawer(uuid, jsonb, text) from public, anon;
+grant execute on function close_drawer(uuid, jsonb, text) to authenticated;
+
+create or replace function record_drawer_movement(
+  p_session_id uuid,
+  p_kind       text,
+  p_amount     numeric,
+  p_reason     text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_closed_at timestamptz;
+  v_expected  numeric;
+  v_id        uuid;
+begin
+  perform require_staff();
+  if p_kind is null or p_kind not in ('paid_in', 'paid_out') then
+    raise exception 'Choose paid in or paid out' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 then
+    raise exception 'Enter an amount over $0' using errcode = '22023';
+  end if;
+  if p_amount > 999999.99 then
+    raise exception 'That amount is too large' using errcode = '22023';
+  end if;
+  if p_amount <> round(p_amount, 2) then
+    raise exception 'Use at most 2 decimal places' using errcode = '22023';
+  end if;
+  if char_length(btrim(p_reason)) > 200 then
+    raise exception 'Keep the reason to 200 characters' using errcode = '22023';
+  end if;
+
+  select closed_at into v_closed_at from drawer_sessions where id = p_session_id for no key update;
+  if not found then
+    raise exception 'Drawer session not found' using errcode = 'P0002';
+  end if;
+  if v_closed_at is not null then
+    raise exception 'This drawer has been closed' using errcode = '22023';
+  end if;
+  perform refuse_stale_drawer((select drawer_id from drawer_sessions where id = p_session_id));
+  if p_kind = 'paid_out' then
+    select s.expected_cash into v_expected from drawer_cash_summary(p_session_id) s;
+    if p_amount > v_expected then
+      raise exception 'The drawer should only hold %', to_char(v_expected, 'FM$999,999,990.00')
+        using errcode = '22023';
+    end if;
+  end if;
+
+  insert into drawer_movements (drawer_session_id, kind, amount, reason)
+  values (p_session_id, p_kind, p_amount, nullif(btrim(p_reason), ''))
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke all on function record_drawer_movement(uuid, text, numeric, text) from public, anon;
+grant execute on function record_drawer_movement(uuid, text, numeric, text) to authenticated;
+
+-- >>> supabase/migrations/0117_stringing_split_on_sale_line.sql
+-- =============================================================================
+-- 0117_stringing_split_on_sale_line.sql — a stringing charge's strings and
+-- labour, saved when it's rung (AceStock, 4B review 5)
+--
+-- The stringing report worked out a charge's strings part from the job's
+-- strings price and labour as they are now. A string change overwrites both,
+-- so after one, the first charge's split was wrong (e.g. $18 labour + $20
+-- string, then a $30 string: it read $40 strings / $8 labour, not $30 / $18).
+--
+--   1. sale_lines.strings_amount / labor_amount: set when a stringing line is
+--      written. A first charge's strings are the job's strings price less its
+--      labour then (never more than the charge); a string-change charge is all
+--      strings.
+--   2. Older lines are filled in: a first charge from the job's strings price
+--      before its string changes, marked split_estimated.
+--   3. report_stringing_summary reads the saved split; a string change's
+--      give-back counts as strings, not split by proportion.
+--
+-- report_stringing_summary as in 0102 except where marked. Re-runnable.
+-- =============================================================================
+
+-- 1. The split on the line ----------------------------------------------------------
+alter table sale_lines add column if not exists strings_amount  numeric(12, 2);
+alter table sale_lines add column if not exists labor_amount    numeric(12, 2);
+alter table sale_lines add column if not exists split_estimated boolean not null default false;
+comment on column sale_lines.strings_amount is 'A stringing line''s strings part when it was rung (0117); null for other lines';
+comment on column sale_lines.labor_amount is 'A stringing line''s labour part when it was rung (0117)';
+comment on column sale_lines.split_estimated is 'The split was filled in for a line rung before 0117';
+
+create or replace function set_sale_line_strings_split()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  v_job string_jobs%rowtype;
+begin
+  if new.string_job_id is null then
+    return new;
+  end if;
+  if new.kind = 'string_change' then
+    new.strings_amount := new.qty * new.unit_price;
+  else
+    select * into v_job from string_jobs where id = new.string_job_id;
+    new.strings_amount := least(greatest(coalesce(v_job.strings_price, 0) - coalesce(v_job.labor_price, 0), 0) * new.qty,
+                                new.qty * new.unit_price);
+  end if;
+  new.labor_amount := new.qty * new.unit_price - new.strings_amount;
+  return new;
+end;
+$$;
+revoke all on function set_sale_line_strings_split() from public, anon, authenticated;
+
+drop trigger if exists trg_sale_lines_strings_split on sale_lines;
+create trigger trg_sale_lines_strings_split before insert on sale_lines
+  for each row execute function set_sale_line_strings_split();
+
+-- 2. Older lines --------------------------------------------------------------------
+-- Fills in the split on stringing lines rung before 0117 (run once below).
+create or replace function fill_sale_line_strings_split()
+returns void
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  update sale_lines
+     set strings_amount = qty * unit_price, labor_amount = 0
+   where string_job_id is not null and kind = 'string_change' and strings_amount is null;
+
+  with changes as (
+    -- What string changes added to each job's strings price (charges less give-backs).
+    select sl.string_job_id as job_id, sum(sl.qty * sl.unit_price) as amount
+      from sale_lines sl where sl.kind = 'string_change' group by sl.string_job_id
+    union all
+    select sl.string_job_id, -sum(rl.qty * rl.unit_price)
+      from refund_lines rl join sale_lines sl on sl.id = rl.sale_line_id
+     where rl.kind = 'string_change' group by sl.string_job_id
+  ),
+  first_price as (
+    select j.id, coalesce(j.strings_price, 0) - coalesce((select sum(c.amount) from changes c where c.job_id = j.id), 0)
+             as strings_price,
+           coalesce(j.labor_price, 0) as labor_price
+      from string_jobs j
+  )
+  update sale_lines sl
+     set strings_amount = least(greatest(f.strings_price - f.labor_price, 0) * sl.qty, sl.qty * sl.unit_price),
+         labor_amount = sl.qty * sl.unit_price
+                        - least(greatest(f.strings_price - f.labor_price, 0) * sl.qty, sl.qty * sl.unit_price),
+         split_estimated = true
+    from first_price f
+   where f.id = sl.string_job_id and sl.kind = 'charge' and sl.strings_amount is null;
+end;
+$$;
+revoke all on function fill_sale_line_strings_split() from public, anon, authenticated;
+
+select fill_sale_line_strings_split();
+
+-- 3. report_stringing_summary -------------------------------------------------------
+create or replace function report_stringing_summary(p_from timestamptz, p_to timestamptz)
+returns table (
+  jobs_entered    integer,
+  rush_entered    integer,
+  jobs_completed  integer,
+  jobs_delivered  integer,
+  jobs_cancelled  integer,
+  jobs_waiting    integer,
+  revenue         numeric,
+  strings_revenue numeric,
+  labor_revenue   numeric,
+  refunds         numeric,
+  net_revenue     numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with charge_lines as (
+    -- Each stringing line sold in any period, with the strings part saved on
+    -- the line when it was rung (0117).
+    select sl.id, s.sold_at, sl.qty * sl.unit_price as amount, coalesce(sl.strings_amount, 0) as strings_part
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+     where sl.string_job_id is not null
+  ),
+  charges as (
+    select amount, strings_part from charge_lines
+     where sold_at >= p_from and sold_at < p_to
+  ),
+  given_back as (
+    -- A string change's give-back is all strings; other refunds split in the
+    -- line's own proportion.
+    select rl.qty * rl.unit_price as amount,
+           case when rl.kind = 'string_change' then rl.qty * rl.unit_price
+                when c.amount = 0 then 0
+                else round(rl.qty * rl.unit_price * c.strings_part / c.amount, 2) end as strings_part
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join charge_lines c on c.id = rl.sale_line_id
+     where r.refunded_at >= p_from and r.refunded_at < p_to
+  ),
+  totals as (
+    select coalesce((select sum(amount) from charges), 0)                                        as rev,
+           coalesce((select sum(strings_part) from charges), 0)
+             - coalesce((select sum(strings_part) from given_back), 0)                           as strings_rev,
+           coalesce((select sum(amount) from given_back), 0)                                     as back
+  )
+  select
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.entered_at >= p_from and j.entered_at < p_to and j.is_rush)::int,
+    (select count(*) from string_jobs j where j.completed_at >= p_from and j.completed_at < p_to)::int,
+    (select count(*) from string_jobs j where j.delivered_at >= p_from and j.delivered_at < p_to)::int,
+    (select count(*) from string_jobs j where j.cancelled_at >= p_from and j.cancelled_at < p_to)::int,
+    (select count(*) from string_jobs j where j.status = 'entered')::int,
+    t.rev,
+    t.strings_rev,
+    t.rev - t.back - t.strings_rev,
+    t.back,
+    t.rev - t.back
+  from totals t;
+end;
+$$;
+
+revoke all on function report_stringing_summary(timestamptz, timestamptz) from public, anon;
+grant execute on function report_stringing_summary(timestamptz, timestamptz) to authenticated;
+
+-- >>> supabase/migrations/0118_report_sort_tie_breakers.sql
+-- =============================================================================
+-- 0118_report_sort_tie_breakers.sql — report rows in one fixed order
+-- (AceStock, 4B review 15)
+--
+-- The Reports page loads a long report 1,000 rows at a time. Four reports
+-- sorted on columns that can tie (two products with the same name, two
+-- customers with the same name and no code), so a row could move between
+-- pages and be skipped or shown twice while sales came in. Each now ends its
+-- sort on its unique key. (The price-changes and daily-summary reports already
+-- sort uniquely; stringing sorts by stringer, which is unique.)
+--
+-- Only the last sort column changes in each function. Re-runnable.
+-- =============================================================================
+
+-- report_sales_by — as in 0102, with a last tie-breaker.
+create or replace function report_sales_by(p_from timestamptz, p_to timestamptz, p_group text)
+returns table (
+  group_key      text,
+  label          text,
+  detail         text,
+  tickets        integer,
+  qty_sold       integer,
+  sales          numeric,
+  discounts      numeric,
+  qty_returned   integer,
+  returns        numeric,
+  net_qty        integer,
+  net_sales      numeric,
+  costed_sales   numeric,
+  cost           numeric,
+  margin         numeric,
+  margin_pct     numeric,
+  uncosted_qty   integer,
+  cost_estimated boolean
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+  if p_group is null or p_group not in ('category', 'brand', 'product', 'staff') then
+    raise exception 'A sales report is by category, brand, product or staff, not %', coalesce(p_group, '(nothing)')
+      using errcode = '22023';
+  end if;
+
+  return query
+  with moves as (
+    -- Sold in the period. Only a line's first charge counts as items sold; a
+    -- later string change adds money, not another job.
+    select s.id as sale_id, s.user_id, sl.product_id,
+           case when sl.kind = 'charge' then sl.qty else 0 end as qty,
+           sl.qty * sl.unit_price as amount,
+           sl.qty * (coalesce(sl.price_before_discount, sl.unit_price) - sl.unit_price) as discount,
+           sl.qty as cost_qty, sl.unit_cost, sl.unit_cost_estimated,
+           false as is_return
+      from sale_lines sl
+      join sales s on s.id = sl.sale_id
+     where s.sold_at >= p_from and s.sold_at < p_to
+       and sl.gift_card_id is null
+    union all
+    -- Refunded in the period, against the line's original sale.
+    select s.id, s.user_id, sl.product_id,
+           case when rl.kind = 'return' and sl.kind = 'charge' then rl.qty else 0 end,
+           rl.qty * rl.unit_price,
+           0::numeric,
+           -rl.qty, sl.unit_cost, sl.unit_cost_estimated,
+           true
+      from refund_lines rl
+      join refunds r on r.id = rl.refund_id
+      join sale_lines sl on sl.id = rl.sale_line_id
+      join sales s on s.id = sl.sale_id
+     where r.refunded_at >= p_from and r.refunded_at < p_to
+       and sl.gift_card_id is null
+  ),
+  keyed as (
+    select m.*,
+           case
+             when p_group = 'staff'   then coalesce(m.user_id::text, '')
+             when m.product_id is null then 'stringing'
+             when p_group = 'category' then p.category_id::text
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '')
+             else p.id::text
+           end as k,
+           case
+             when p_group = 'staff'   then coalesce(pr.email, '(not recorded)')
+             when m.product_id is null then 'Stringing'
+             when p_group = 'category' then c.name
+             when p_group = 'brand'    then coalesce(nullif(trim(p.brand), ''), '(no brand)')
+             else trim(coalesce(p.brand, '') || ' ' || p.name)
+           end as lbl,
+           case
+             when p_group = 'product' and m.product_id is not null then c.name
+           end as dtl
+      from moves m
+      left join products p   on p.id = m.product_id
+      left join categories c on c.id = p.category_id
+      left join profiles pr  on pr.id = m.user_id
+  ),
+  grouped as (
+    select k, min(lbl) as lbl, min(dtl) as dtl,
+           count(distinct sale_id) filter (where not is_return)::int                 as tickets,
+           coalesce(sum(qty) filter (where not is_return), 0)::int                   as qty_sold,
+           coalesce(sum(amount) filter (where not is_return), 0)                     as sales,
+           coalesce(sum(discount), 0)                                                as discounts,
+           coalesce(sum(qty) filter (where is_return), 0)::int                       as qty_returned,
+           coalesce(sum(amount) filter (where is_return), 0)                         as returns,
+           coalesce(sum(case when is_return then -amount else amount end)
+                    filter (where unit_cost is not null), 0)                         as costed_sales,
+           coalesce(sum(cost_qty * unit_cost), 0)                                    as cost,
+           count(*) filter (where unit_cost is not null) > 0                         as has_cost,
+           coalesce(sum(cost_qty) filter (where product_id is not null and unit_cost is null), 0)::int
+                                                                                     as uncosted_qty,
+           coalesce(bool_or(unit_cost_estimated), false)                             as cost_estimated
+      from keyed
+     group by k
+  )
+  select g.k, g.lbl, g.dtl, g.tickets, g.qty_sold, g.sales, g.discounts, g.qty_returned, g.returns,
+         g.qty_sold - g.qty_returned,
+         g.sales - g.returns,
+         g.costed_sales,
+         g.cost,
+         case when g.has_cost then g.costed_sales - g.cost end,
+         case when g.has_cost and g.costed_sales <> 0
+              then round(100 * (g.costed_sales - g.cost) / g.costed_sales, 1) end,
+         g.uncosted_qty,
+         g.cost_estimated
+    from grouped g
+   order by g.sales - g.returns desc, g.lbl, g.k;
+end;
+$$;
+
+revoke all on function report_sales_by(timestamptz, timestamptz, text) from public, anon;
+grant execute on function report_sales_by(timestamptz, timestamptz, text) to authenticated;
+
+-- report_inventory_value — as in 0097, with a last tie-breaker.
+create or replace function report_inventory_value()
+returns table (
+  product_id         uuid,
+  product            text,
+  category           text,
+  brand              text,
+  is_serialized      boolean,
+  on_hand            numeric,
+  cost               numeric,
+  sell_price         numeric,
+  value_at_cost      numeric,
+  retail_value       numeric,
+  demo_frames        integer,
+  demo_value_at_cost numeric
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+
+  return query
+  with demo as (
+    select u.product_id as pid, count(*)::int as frames
+      from product_units u
+     where u.status in ('demo', 'assigned')
+     group by u.product_id
+  )
+  select p.id,
+         trim(coalesce(p.brand, '') || ' ' || p.name),
+         c.name,
+         nullif(trim(p.brand), ''),
+         p.is_serialized,
+         ps.on_hand,
+         p.cost,
+         p.sell_price,
+         greatest(ps.on_hand, 0) * p.cost,
+         greatest(ps.on_hand, 0) * p.sell_price,
+         coalesce(d.frames, 0),
+         case when d.frames is not null then d.frames * p.cost end
+    from products p
+    join product_stock ps on ps.product_id = p.id
+    left join categories c on c.id = p.category_id
+    left join demo d on d.pid = p.id
+   where ps.on_hand <> 0 or d.frames is not null
+   order by c.sort_order nulls last, c.name, nullif(trim(p.brand), '') nulls last, p.name, p.id;
+end;
+$$;
+
+revoke all on function report_inventory_value() from public, anon;
+grant execute on function report_inventory_value() to authenticated;
+
+-- report_balances — as in 0098, with a last tie-breaker.
+create or replace function report_balances(p_as_of timestamptz)
+returns table (
+  kind          text,
+  holder_id     uuid,
+  code          text,
+  customer      text,
+  balance       numeric,
+  last_activity timestamptz,
+  is_active     boolean
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  if p_as_of is null then
+    raise exception 'Choose the moment to report balances at'
+      using errcode = '22023';
+  end if;
+
+  return query
+  with cards as (
+    select t.gift_card_id as id, sum(t.amount) as bal, max(t.created_at) as last_at
+      from gift_card_txns t
+     where t.created_at < p_as_of
+     group by t.gift_card_id
+    having sum(t.amount) <> 0
+  ),
+  credit as (
+    select t.customer_id as id, sum(t.amount) as bal, max(t.created_at) as last_at
+      from store_credit_txns t
+     where t.created_at < p_as_of
+     group by t.customer_id
+    having sum(t.amount) <> 0
+  )
+  select 'gift_card'::text, gc.id, gc.code,
+         case when cu.id is not null then cu.last_name || ', ' || cu.first_name end,
+         c.bal, c.last_at, gc.is_active
+    from cards c
+    join gift_cards gc on gc.id = c.id
+    left join customers cu on cu.id = gc.customer_id
+  union all
+  select 'store_credit'::text, cu.id, null::text,
+         cu.last_name || ', ' || cu.first_name,
+         c.bal, c.last_at, cu.is_active
+    from credit c
+    join customers cu on cu.id = c.id
+  order by 1, 4 nulls last, 3, 2;
+end;
+$$;
+
+revoke all on function report_balances(timestamptz) from public, anon;
+grant execute on function report_balances(timestamptz) to authenticated;
+
+-- report_demos — as in 0100, with a last tie-breaker.
+create or replace function report_demos(p_from timestamptz, p_to timestamptz)
+returns table (
+  product_id     uuid,
+  racquet        text,
+  loans          integer,
+  led_to_sale    integer,
+  conversion_pct numeric,
+  returned       integer,
+  retired        integer,
+  avg_days_out   numeric,
+  out_now        integer,
+  overdue_now    integer
+)
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+#variable_conflict use_column
+begin
+  perform require_admin();
+  perform require_report_range(p_from, p_to);
+
+  return query
+  with loans as (
+    select u.product_id as pid, l.*
+      from demo_loans l
+      join product_units u on u.id = l.product_unit_id
+  ),
+  by_model as (
+    select pid,
+           count(*) filter (where out_at >= p_from and out_at < p_to)::int                         as lent,
+           count(*) filter (where out_at >= p_from and out_at < p_to and sale_id is not null)::int as sold,
+           count(*) filter (where back_at >= p_from and back_at < p_to)::int                       as back,
+           count(*) filter (where back_at >= p_from and back_at < p_to and back_status = 'retired')::int
+                                                                                                   as gone,
+           avg(extract(epoch from (back_at - out_at)) / 86400)
+             filter (where back_at >= p_from and back_at < p_to)                                   as days,
+           count(*) filter (where back_at is null)::int                                            as open,
+           count(*) filter (where back_at is null and due_back_at < now())::int                    as late
+      from loans
+     group by pid
+  )
+  select b.pid,
+         trim(coalesce(p.brand, '') || ' ' || p.name),
+         b.lent,
+         b.sold,
+         case when b.lent > 0 then round(100.0 * b.sold / b.lent, 1) end,
+         b.back,
+         b.gone,
+         round(b.days::numeric, 1),
+         b.open,
+         b.late
+    from by_model b
+    join products p on p.id = b.pid
+   where b.lent + b.back + b.open > 0
+   order by b.lent desc, b.open desc, 2, 1;
+end;
+$$;
+
+revoke all on function report_demos(timestamptz, timestamptz) from public, anon;
+grant execute on function report_demos(timestamptz, timestamptz) to authenticated;
+
 commit;

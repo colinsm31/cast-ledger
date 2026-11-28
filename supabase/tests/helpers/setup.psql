@@ -81,14 +81,15 @@ grant execute on all functions in schema tests to authenticated, anon;
 --   string        ...0000b1   $20, in the real Strings category, Natural 16,
 --                             fungible, UPC 012345678905, 10 on hand
 --   racquet       ...0000b2   $250, serialized, UPC 098765432109, none on hand
---   tax rate 8.25%, stringing not taxed, overselling allowed
+--   tax rate 8.25%, stringing not taxed, overselling allowed, cash taken
+--   without an open drawer (0109; the drawer tests turn the check on)
 -- -----------------------------------------------------------------------------
 select tests.create_staff('00000000-0000-0000-0000-0000000000a1', 'staff@test.local', 'staff');
 select tests.create_staff('00000000-0000-0000-0000-0000000000a2', 'admin@test.local', 'admin');
 
 update settings
    set tax_rate = 8.25, tax_stringing = false, block_oversell = false, stringing_labor = 0,
-       staff_discount_cap = 100
+       staff_discount_cap = 100, cash_needs_drawer = false
  where id;
 
 insert into categories (id, name, sort_order, serialized_default) values
